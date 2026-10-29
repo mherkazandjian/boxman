@@ -490,6 +490,167 @@ class VMsMixin:
                 f"({', '.join(problems)} failed) — see the preceding "
                 f"per-step errors for the cause.")
 
+    #: the command that declares an install done (``boxman control
+    #: finish-install``), named by every line that says media stay
+    FINISH_INSTALL = "boxman control finish-install --vms {vm}"
+
+    def eject_install_media(self, full_vm_names=None,
+                            dry_run: bool = False,
+                            declared_done: bool = False,
+                            outcomes: dict | None = None) -> list[str]:
+        """
+        Eject the install-only media of every VM whose install is done (G7).
+
+        Asked of every VM that declares ``install_only`` cdroms, on every
+        ``provision``, ``up`` and ``update``: boxman does not wait for an
+        install, so the run that starts one has usually ended before it is
+        done, and a later run is where its media go. A VM whose install is
+        not known to be done keeps them, with one line saying why -- the
+        same line mid-install and for a guest that runs no agent, which is
+        why it names ``boxman control finish-install``.
+
+        Args:
+            full_vm_names: restrict to these domains; None for every VM.
+            dry_run: report what would be ejected, eject nothing.
+            declared_done: the user declared the install done
+                (:meth:`finish_install`): eject without asking the agent,
+                and say so for a VM that has nothing left to eject.
+            outcomes: filled with each VM's
+                :class:`~boxman.providers.libvirt.install_media.InstallMediaOutcome`,
+                by full name, for a caller that acts on them.
+
+        Returns:
+            One line per VM whose media could not be ejected, or whose
+            drives could not be read; empty when nothing went wrong. A VM
+            still installing is not a problem.
+        """
+        problems: list[str] = []
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        for cluster_name, cluster in self._vm_clusters.items():
+            for vm_name, vm_info in (cluster.get('vms') or {}).items():
+                full = f"{prj_name}_{cluster_name}_{vm_name}"
+                if full_vm_names is not None and full not in full_vm_names:
+                    continue
+                sources = self._install_only_sources(vm_info or {})
+                if not sources:
+                    continue
+                session = self.session_for_cluster(cluster_name)
+                if not hasattr(session, 'eject_install_media'):
+                    continue
+                label = f"{cluster_name}/{vm_name}"
+                try:
+                    outcome = session.eject_install_media(
+                        full, sources, dry_run=dry_run,
+                        declared_done=declared_done)
+                except BoxmanError as exc:
+                    self.logger.error(
+                        f"vm {label}: could not look for its install-only "
+                        f"media: {exc}")
+                    problems.append(
+                        f"vm {label}: install-only media not checked: {exc}")
+                    continue
+                if outcomes is not None:
+                    outcomes[full] = outcome
+                if not outcome.held:
+                    if declared_done:
+                        self.logger.info(
+                            f"vm {label}: no install-only medium is left in "
+                            f"its drives; nothing to eject")
+                    continue
+                held = ', '.join(f"{target} ({source})"
+                                 for target, source in outcome.held)
+                if outcome.waiting:
+                    finish = self.FINISH_INSTALL.format(
+                        vm=f"{cluster_name}_{vm_name}")
+                    self.logger.info(
+                        f"vm {label}: keeping its install-only media "
+                        f"{held}: the install is not known to be done, as "
+                        f"{outcome.waiting}. They go on the first up or "
+                        f"update that finds the installed system's guest "
+                        f"agent reporting its root on the boot disk; once "
+                        f"the install is done, a guest without an agent can "
+                        f"be told so: {finish}")
+                    continue
+                why = ("its install is declared done" if declared_done
+                       else "its install is done")
+                if outcome.would_eject:
+                    self.logger.info(
+                        f"[dry-run] vm {label}: would eject its install-only "
+                        f"media {held}, now that {why}")
+                    continue
+                for target, source in outcome.ejected:
+                    self.logger.info(
+                        f"vm {label}: ejected install-only medium {source} "
+                        f"from {target}: {why}")
+                for target, source, reason in outcome.failed:
+                    self.logger.error(
+                        f"vm {label}: could not eject install-only medium "
+                        f"{source} from {target}: {reason}")
+                    problems.append(
+                        f"vm {label}: install-only medium {source} is still "
+                        f"in {target}: {reason}")
+        return problems
+
+    def finish_install(self, cli_args) -> None:
+        """
+        ``boxman control finish-install``: declare the selected VMs'
+        installs done, and eject their install-only media now.
+
+        For a guest whose installed system runs no guest agent, which
+        ``up`` and ``update`` would otherwise wait on for ever, and for
+        anyone who knows better than the agent. The media leave whatever
+        the agent says and whatever the domain's state: live and from the
+        persistent definition of a running guest, from the persistent
+        definition alone of one that is shut off. A VM with nothing left to
+        eject is a no-op, and says so; once it has run, the next ``up`` and
+        ``update`` find no install-only medium attached, so they log nothing
+        about it and no longer treat the VM as installing (``update
+        --restart`` restarts it).
+
+        A VM named with ``--vms`` that has no install-only media, or that no
+        VM is called, is refused, with nothing done: declaring the install
+        of such a VM done means nothing. Without ``--vms`` (all), the VMs
+        that have none are left out.
+
+        Raises:
+            ConfigError: a named VM is unknown or has no install-only media,
+                or no selected VM has any.
+            ProvisionError: a medium could not be ejected.
+        """
+        self._update_sessions_with_runtime()
+        dry_run = getattr(cli_args, 'dry_run', False)
+        targets = self._select_vm_targets(cli_args)
+
+        vms_raw = getattr(cli_args, 'vms', None) or 'all'
+        named = (set() if str(vms_raw).strip().lower() == 'all' else
+                 {v.strip() for v in str(vms_raw).split(',') if v.strip()})
+        found = {name for _full, cluster_name, vm_name, _wd in targets
+                 for name in (vm_name, f"{cluster_name}_{vm_name}")}
+        problems = [f"there is no VM '{name}'"
+                    for name in sorted(named - found)]
+
+        chosen = []
+        for full, cluster_name, vm_name, _workdir in targets:
+            vm_info = self.config['clusters'][cluster_name]['vms'][vm_name] or {}
+            if self._install_only_sources(vm_info):
+                chosen.append(full)
+            elif named:
+                problems.append(
+                    f"vm {cluster_name}/{vm_name} has no install-only media "
+                    f"(no cdroms: entry with install_only: true), so it has "
+                    f"no install to declare done")
+        if not problems and not chosen:
+            problems.append("no selected VM has install-only media")
+        if problems:
+            raise ConfigError(
+                "control finish-install: " + "; ".join(problems)
+                + " -- nothing was ejected")
+
+        # logged where they happen; raised here, together
+        failed = self.eject_install_media(chosen, dry_run=dry_run,
+                                          declared_done=True)
+        self._raise_for_control_failures(failed, 'finish-install')
+
     def _destroy_vm_and_disks(
         self, cluster_name: str, cluster: dict[str, Any], vm_name: str, vm_info: dict[str, Any]
     ) -> None:
@@ -1386,12 +1547,22 @@ class VMsMixin:
         result_queue: Queue,
         dry_run: bool = False,
         allow_restart: bool = False,
+        force_restart: bool = False,
+        install_done: bool = False,
     ) -> None:
         """
         Diff and apply updates to a single existing VM. Runs in its own process.
 
         Results are put into result_queue as:
             (vm_name, {'status': 'no_change'|'updated'|'needs_restart'|'failed', 'details': str})
+
+        A VM whose drives still hold an install-only medium is mid-install
+        (G7), and *allow_restart* does not restart it: its changes are
+        applied as without ``--restart`` -- the live ones now, the others
+        written to the persistent config for the next boot -- and the skip
+        is reported, with the two ways past it. *force_restart* restarts it
+        anyway. *install_done*: a dry run's eject pass found the install
+        done, so the real run would eject the media before this diff.
         """
         from boxman.providers.libvirt.vm_differ import VMStateDiffer
 
@@ -1434,6 +1605,24 @@ class VMsMixin:
                 diff['shared_folders_restart_pending'] or
                 diff.get('cdroms_restart_pending')
             )
+
+            # Mid-install: restarting the guest now could restart its
+            # installer, or cut a first-boot script short, and nothing has
+            # said the install is done. So --restart skips it, and says so.
+            installing = ([] if install_done
+                          else list(diff.get('install_media_held') or []))
+            restart_skipped = bool(allow_restart and installing
+                                   and not force_restart)
+            restart_forced = bool(allow_restart and installing
+                                  and force_restart)
+            if restart_skipped:
+                allow_restart = False
+            skip_reason = (
+                f"{vm_name} is still installing (its install-only media in "
+                f"{', '.join(installing)} are attached), and update does not "
+                f"restart a guest mid-install; re-run with --force-restart to "
+                f"restart it anyway, or declare the install done first: "
+                f"{self.FINISH_INSTALL.format(vm=f'{cluster_name}_{vm_name}')}")
 
             # A declaration whose target still holds a different disk that
             # boxman owns is a conflict, not a warning: reconciliation
@@ -1548,9 +1737,20 @@ class VMsMixin:
                     f"{diff['desired_memballoon']}")
             self.logger.info(f"VM {vm_name}: changes detected: {'; '.join(changes)}")
             if dry_run:
+                details = list(changes)
+                if restart_skipped:
+                    details.append(
+                        f"a restart these changes need would be skipped: "
+                        f"{skip_reason}")
+                elif restart_forced:
+                    details.append(
+                        f"a restart these changes need would go ahead "
+                        f"although {vm_name} is still installing (its "
+                        f"install-only media in {', '.join(installing)} are "
+                        f"attached): --force-restart")
                 result_queue.put((vm_name, {
                     'status': 'dry_run',
-                    'details': '; '.join(changes)
+                    'details': '; '.join(details)
                 }))
                 return
 
@@ -1740,6 +1940,11 @@ class VMsMixin:
 
             # handle restart if needed
             if restart_needed and vm_running and allow_restart:
+                if restart_forced:
+                    self.logger.warning(
+                        f"VM {vm_name}: restarting it although it is still "
+                        f"installing (install-only media in "
+                        f"{', '.join(installing)}): --force-restart")
                 self.logger.info(
                     f"VM {vm_name}: restarting to apply changes "
                     f"(live max ceiling cannot be raised)")
@@ -1838,6 +2043,13 @@ class VMsMixin:
                         'to apply them, or re-run update with --restart')
                 if detach_deferred:
                     tail = f" — {detach_deferred}"
+                if restart_skipped and vm_running:
+                    tail = (" — written to the persistent config"
+                            + (", but the disk detach has not been performed"
+                               if pending_detach else "")
+                            + f"; the restart was skipped: {skip_reason}")
+                    self.logger.warning(
+                        f"VM {vm_name}: restart skipped: {skip_reason}")
                 result_queue.put((vm_name, {
                     'status': 'needs_restart',
                     'details': '; '.join(changes) + tail
@@ -1895,7 +2107,10 @@ class VMsMixin:
         # Deliberately not `auto_accept or ...`: --yes answers the VM-removal
         # prompt, and someone passing it to avoid an interactive update has
         # not thereby agreed to have a running guest power-cycled (#164 C1).
-        allow_restart = getattr(cli_args, 'restart', False)
+        # --force-restart implies --restart, and also restarts a VM whose
+        # install is not known to be done, which --restart skips (G7).
+        force_restart = getattr(cli_args, 'force_restart', False)
+        allow_restart = getattr(cli_args, 'restart', False) or force_restart
 
         # Collected across the phases below and raised once at the very end:
         # a VM that fails to update must not leave the command reporting
@@ -2000,6 +2215,17 @@ class VMsMixin:
             prj_name = f'bprj__{config["project"]}__bprj'
             result_queue: Queue = Queue()
 
+            # An ISO-boot VM's install-only media go once its install is
+            # done (G7). They are not part of the diff below, which never
+            # compares them; a dry run says what it would eject.
+            eject_outcomes: dict = {}
+            update_failures.extend(self.eject_install_media(
+                update_vm_names, dry_run=dry_run, outcomes=eject_outcomes))
+            # a dry run did not eject what the real run would, before its
+            # diff; for those VMs the install is done all the same
+            done_installs = {name for name, outcome in eject_outcomes.items()
+                             if outcome.would_eject}
+
             # Resolve declared media to real local paths *before* diffing.
             # The differ cannot tell an unresolved entry from a resolved one,
             # and an unresolved cdrom read as "remove the ISO that is
@@ -2038,7 +2264,8 @@ class VMsMixin:
             _res, parallel_failures = self._run_parallel(
                 [(f"{cluster_name}/{vm_name}", self._update_single_vm,
                   (cluster_name, cluster_cfg, vm_name, vm_info,
-                   result_queue, dry_run, allow_restart))
+                   result_queue, dry_run, allow_restart, force_restart,
+                   f"{prj_name}_{cluster_name}_{vm_name}" in done_installs))
                  for cluster_name, cluster_cfg, vm_name, vm_info in update_tasks],
                 op_label='update vm')
 

@@ -1562,7 +1562,8 @@ class TestUpdateRestartFailures:
 
 def _needs_restart_update_worker(_self, _cluster_name, _cluster_cfg, vm_name,
                                  _vm_info, result_queue, _dry_run=False,
-                                 _allow_restart=False):
+                                 _allow_restart=False, _force_restart=False,
+                                 _install_done=False):
     """Stand-in for ``_update_single_vm`` reporting a pending restart."""
     result_queue.put((vm_name, {
         'status': 'needs_restart',

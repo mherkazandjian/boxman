@@ -321,7 +321,7 @@ template time:
 | `boxman up [--force] [--rebuild-templates] [--recreate-networks] [-y]` | **Primary entry point.** Provisions if absent, restarts shut-off/saved/paused VMs, no-ops if already running. Reconciles shared bridges, libvirt networks, containerlab and container clusters every call. A saved VM is restored from its managed save, not cold-booted; a shut-off VM with an *external* `<workdir>/<vm>.save` left by an older boxman makes `up` refuse — use `control start --restore`, or delete the file. `--force` deprovisions first. |
 | `boxman down [--suspend]` | Save (default: libvirt managed save, which the next `up` / `control start` restores) or `--suspend` (pause) all VMs, and tear down containerlab. Networks and disks remain. A VM libvirt cannot save (PCI passthrough) is a failure, never silently shut down. |
 | `boxman provision [--force] [--rebuild-templates]` | Full provision from scratch. Refuses if state exists unless `--force`. |
-| `boxman update [--dry-run] [-y] [--restart] [--recreate-networks]` | Non-destructive reconcile: add new VMs, hot-scale CPU/memory, add/grow/detach disks, attach/detach shared folders and cdroms, remove orphaned VMs, plus the network reconcile. Runs the network pass even when no VM changed. A change that cannot reach a running guest is written to the persistent config and the VM reported as needing a restart; `--restart` lets `update` power-cycle it (`-y` does not imply it). |
+| `boxman update [--dry-run] [-y] [--restart] [--force-restart] [--recreate-networks]` | Non-destructive reconcile: add new VMs, hot-scale CPU/memory, add/grow/detach disks, attach/detach shared folders and cdroms, remove orphaned VMs, plus the network reconcile. Runs the network pass even when no VM changed. A change that cannot reach a running guest is written to the persistent config and the VM reported as needing a restart; `--restart` lets `update` power-cycle it (`-y` does not imply it). |
 | `boxman deprovision [--cleanup]` | Tear down VMs and networks. `--cleanup` also removes generated files, SSH keys, empty dirs. If anything survives, exits 2 and keeps the cache entry and generated files so a re-run can finish. |
 | `boxman destroy [-y] [--templates]` | Nuke everything for this config. `--templates` also removes template workdirs. Prompts unless `-y`. There is no `--force`. Checks every path it would delete up front, and exits 2 keeping what is left if the teardown did not complete. |
 | `boxman destroy-runtime [-y]` | Destroy only the docker runtime and `.boxman` — which holds libvirt's own state under that runtime, so every domain, network and snapshot definition goes too. |
@@ -341,6 +341,7 @@ template time:
 | `boxman storage {df\|trim\|compact\|optimize\|compress-snapshots}` | qcow2 space reclaim and snapshot-memory compression. |
 | `boxman pxe-boot --vm <name> [--expected-ip IP] [--wait-timeout 600] [--restore-after]` | Network-boot a VM; optionally poll SSH then restore boot order to `[hd]`. |
 | `boxman netlab {deploy\|destroy\|inspect\|ssh <node> [--user U]}` | Containerlab subcommands (only when `containerlab:` is enabled). `netlab ssh` *prints* the ssh command — use `$(boxman netlab ssh sw1)`. |
+| `boxman control finish-install [--vms a,b] [--cluster c] [--dry-run]` | Declare an ISO-boot VM's install done: eject its `install_only` media now, whatever its guest agent says or its state (live + config when running, config when shut off). Refuses a named VM without install-only media; no-op, with a message, when nothing is left. After it, `up`/`update` no longer treat the VM as installing. |
 | `boxman control {suspend\|resume\|save\|start [--restore]} [--vms a,b] [--cluster c]` | Lifecycle ops; all VMs unless scoped. `save` is a libvirt managed save that `start` restores on its own; `start --restore` is only for an external `<workdir>/<vm>.save` from an older boxman. On container clusters these map to `pause`/`unpause`/`start`; `save` has no equivalent and is skipped with a message. |
 
 **Selection flags.** Every snapshot, storage and control subcommand takes
@@ -782,11 +783,41 @@ clusters:
   the OS is installed the disk wins. `[cdrom, hd]` and `[cdrom]` behave
   identically — anything past element 0 is ignored. There is no virt-install
   install phase: an installer's reboot is a plain reboot (into the disk, once
-  it is bootable), and the ISO stays attached until you eject it.
+  it is bootable), and the ISO stays attached until you eject it, or boxman
+  does (`install_only`, below).
 - **`cdroms:` entry forms:** a bare string, `{name: <iso-name>}` (resolved from
   `isos:`), or `{source: /abs/path.iso}` (explicit local file). The first cdrom
   is the boot ISO; the others go to virt-install with it, so an installer
   sees them on its first boot (a driver ISO, an answer file).
+- **`install_only: true`** on a cdroms entry (ISO-boot VMs only; refused on a
+  cloned VM) marks a medium the install needs and the installed guest does
+  not: an answer ISO holding a password, a driver ISO, the installer itself.
+  It goes to virt-install like the rest, and boxman ejects it (the drive
+  stays, empty) on the first `up` or `update` -- or the end of `provision` --
+  that finds the VM running and its guest agent reporting the guest's root
+  (`/`, or a drive root such as `C:\`) on the boot disk, via `virsh
+  guestinfo --filesystem`. A live installer's root is in memory, WinPE runs
+  no agent, and an installer mounts its target elsewhere, so the common
+  installers do not say that mid-install. It means the installed system is
+  up, not that it is done with the media: a last install stage that runs in
+  the installed system with its agent up and still reads them (AutoYaST's
+  second stage, a first-boot script) can lose them, which is why
+  `install_only` is opt-in per medium. Until then each run logs why the
+  media stay. A guest that runs no agent keeps them until you declare its
+  install done: `boxman control finish-install --vms <cluster>_<vm>
+  [--dry-run]` ejects them whatever the agent says (live and from the
+  config of a running VM, from the config of a shut-off one); a VM with
+  nothing left is a no-op, one with no install-only media is refused.
+  While media are attached the VM counts as installing, and `update
+  --restart` does not restart it: its other changes apply, the restart is
+  skipped with a warning naming `--force-restart` (which implies
+  `--restart` and restarts it anyway) and `finish-install`; `--dry-run`
+  says which would happen. `update` never compares an
+  install-only entry: it is neither put back after the eject nor detached
+  mid-install, and its ISO is neither checksummed nor downloaded by
+  `update`. `update --dry-run` says what it would eject. A first-boot
+  script that reads install-only media after it starts the guest agent
+  must copy what it needs first.
 - **`os_variant:`** (e.g. `win2k22`, `ubuntu24.04`; `osinfo-query os` lists
   them) sets virt-install's `--os-variant`, which picks device defaults such
   as the clock. Without it, virt-install detects the OS from the boot ISO with
@@ -995,7 +1026,8 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   written to the persistent config, and the summary lists the VM under
   *restart required* (a warning, exit 0). Restart it yourself, or re-run with
   `--restart` to let `update` shut it down cleanly and start it. `-y` does not
-  imply `--restart`; a paused guest is never restarted.
+  imply `--restart`; a paused guest is never restarted, and nor is one still
+  installing (install-only media attached) without `--force-restart`.
 - **CPU / memory**: hot-scaled up to the VM's live ceiling. Asking for more is
   **not an error** — boxman writes the persistent config and logs *"Restart
   needed for changes to take effect (live max ceiling cannot be raised on a
@@ -1027,6 +1059,8 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   name `sda` yourself. An `isos:` entry a cdrom names is downloaded if not yet
   cached; a cached file is never re-fetched, and a checksum mismatch fails
   that VM rather than triggering a download. `--dry-run` downloads nothing.
+  An `install_only` entry is not compared at all; `update` ejects it once
+  the install is done (see ISO boot).
 - **SSH step**: `update` ends by rewriting `ssh_config` and adding the cluster
   admin key to every running VM. A running VM that does not get the key fails
   the update (exit 2) after everything else ran; one that is not running only

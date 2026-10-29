@@ -198,6 +198,14 @@ class FlowsMixin:
                 _full_vm_name = f"{prj_name}_{_cluster_name}_{_vm_name}"
                 self.session_for_cluster(_cluster_name).eject_cdrom(_full_vm_name)
 
+        # Install-only media (G7) go when the installed system is up, which
+        # is rarely already the case here -- the IP wait ends at the first
+        # lease, an installer's own included -- so this usually reports that
+        # they stay, and a later `up` or `update` ejects them.
+        eject_problems = self.eject_install_media(
+            [name for name in self._get_project_vm_names()
+             if name not in undead])
+
         # generate ssh keys, add them to vms, and write ssh config. Every VM
         # was cloned in this run, so none may inherit an earlier ssh_config
         # block; the ones that never started are not expected to answer. A
@@ -224,6 +232,7 @@ class FlowsMixin:
         if undead:
             problems.append(
                 f"{len(undead)} VM(s) never started: {', '.join(undead)}")
+        problems.extend(eject_problems)
         problems.extend(ssh_failures)
         if problems:
             raise ProvisionError(
@@ -349,11 +358,16 @@ class FlowsMixin:
             # their connection info and ssh config, so it is reported after
             # the reconciliation rather than raised through it.
             compose_error = self._reconcile_compose_clusters()
+            # A second `up` is where an ISO-boot VM's install-only media go
+            # once its install is done (G7): the `up` that started the
+            # install did not wait for it.
+            eject_problems = self.eject_install_media()
             self.connect_info()
             # Re-write SSH config in case IPs changed (DHCP renewals after
             # a host reboot, manual virsh net cycle, etc.) or in case the
             # file is missing/stale from an older boxman version.
             problems = [compose_error] if compose_error else []
+            problems.extend(eject_problems)
             problems.extend(self._rewrite_ssh_config())
             if problems:
                 raise ProvisionError('; '.join(problems))
@@ -465,6 +479,11 @@ class FlowsMixin:
         # Bring up docker-compose clusters after the VMs are up (idempotent).
         compose_error = self._reconcile_compose_clusters()
 
+        # install-only media of a VM whose install is done (G7), as on the
+        # all-running branch above; a VM that did not come up is left alone
+        eject_problems = self.eject_install_media(
+            [name for name in expected_vms if name not in failures])
+
         # Display connection information
         self.connect_info()
 
@@ -479,6 +498,7 @@ class FlowsMixin:
                 f"({', '.join(sorted(failures))})")
         if compose_error:
             problems.append(compose_error)
+        problems.extend(eject_problems)
         problems.extend(ssh_problems)
         if problems:
             raise ProvisionError(

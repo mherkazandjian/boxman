@@ -17,6 +17,11 @@ from boxman.exceptions import (
 )
 from boxman.image_cache import ImageCache
 from boxman.providers.libvirt.commands import VirshCommand
+from boxman.providers.libvirt.install_media import (
+    INSTALL_ONLY_KEY,
+    is_install_only,
+    media_path,
+)
 from boxman.utils.http_download import download_url
 from boxman.utils.mac import canonical_mac, is_mac_like
 from boxman.utils.shell import run
@@ -681,6 +686,40 @@ class ImagesMixin:
                     problems.append(
                         f"{cluster_name}.vms.{vm_name}: 'cdroms:' must be a list, "
                         f"got {type(cdroms).__name__}")
+                    continue
+                problems.extend(self._install_only_problems(
+                    f"{cluster_name}.vms.{vm_name}", vm_info))
+        return problems
+
+    @staticmethod
+    def _install_only_problems(loc: str, vm_info: dict) -> list[str]:
+        """
+        The ``install_only`` keys of one VM's ``cdroms:`` that cannot work.
+
+        Only an ISO-boot VM has an install for a medium to belong to: its
+        cdroms reach virt-install with the boot ISO, and its installed
+        system is what ends their life. A cloned VM gets its cdroms from the
+        configure step and boots a finished system, so the key would mean
+        nothing there, silently. A value other than a boolean is a typo
+        (``install_only: yes`` is a boolean in YAML; ``'yes'`` is not).
+        """
+        problems = []
+        boot_order = vm_info.get('boot_order') or ['hd']
+        iso_boot = boot_order[0] == 'cdrom'
+        for i, entry in enumerate(vm_info.get('cdroms') or []):
+            if not isinstance(entry, dict) or INSTALL_ONLY_KEY not in entry:
+                continue
+            value = entry[INSTALL_ONLY_KEY]
+            label = entry.get('name') or entry.get('source') or f"#{i + 1}"
+            if not isinstance(value, bool):
+                problems.append(
+                    f"{loc}: cdrom '{label}' has install_only: {value!r}; it "
+                    f"must be true or false")
+            elif value and not iso_boot:
+                problems.append(
+                    f"{loc}: cdrom '{label}' is install_only, but the VM does "
+                    f"not boot from an ISO (boot_order starting with cdrom); "
+                    f"only an ISO-boot VM has an install for it to belong to")
         return problems
 
     def validate_direct_boot_config(self) -> None:
@@ -892,21 +931,65 @@ class ImagesMixin:
         return f"{safe}-{digest}{ext}"
 
     @staticmethod
-    def _cdrom_iso_names(vm_info: dict) -> set[str]:
+    def _cdrom_iso_names(vm_info: dict,
+                         install_only: bool | None = None) -> set[str]:
         """
         The ``isos:`` names a VM's ``cdroms:`` still needs looked up.
 
         An entry carrying an explicit ``source`` needs nothing: the source
         wins and the name, if any, is only a label.
+
+        Args:
+            install_only: None for every entry; True or False for only the
+                entries that are, or are not, marked ``install_only``.
         """
         names: set = set()
         for entry in (vm_info.get("cdroms") or []):
+            if (install_only is not None
+                    and is_install_only(entry) != install_only):
+                continue
             if isinstance(entry, str):
                 names.add(entry)
             elif (isinstance(entry, dict) and not entry.get("source")
                     and entry.get("name")):
                 names.add(entry["name"])
         return names
+
+    def _iso_cache_path(self, name: str) -> str | None:
+        """
+        Where the ``isos:`` entry *name* is cached, whether or not it is
+        there: no lookup, no checksum, no download. None for a name that is
+        not declared, or declared without a ``uri``.
+        """
+        isos_conf = (self.config or {}).get("isos") or {}
+        iso_conf = isos_conf.get(name) if isinstance(isos_conf, dict) else None
+        if not isinstance(iso_conf, dict) or not iso_conf.get("uri"):
+            return None
+        uri = iso_conf["uri"]
+        cache = ImageCache.from_config((self.app_config or {}).get("cache", {}))
+        return cache.cache_path_for(
+            uri, filename=self._iso_cache_filename(name, uri))
+
+    def _install_only_sources(self, vm_info: dict) -> set[str]:
+        """
+        The media paths of a VM's ``install_only`` cdroms (G7).
+
+        Computed, never fetched or verified: they are only looked for among
+        the drives of a domain that already exists, to eject them or to
+        leave them out of a comparison. An install-only ISO that has since
+        left the cache must not be downloaded for that, and the checksum of
+        a 5 GB installer is not worth reading on every ``up``.
+        """
+        sources: set = set()
+        for entry in (vm_info.get("cdroms") or []):
+            if not is_install_only(entry):
+                continue
+            source = entry.get("source")
+            if not source and entry.get("name"):
+                source = self._iso_cache_path(entry["name"])
+            if source:
+                sources.add(media_path(source))
+        return sources
 
     def _iso_paths_from_cache(
         self, names: set[str]
@@ -1041,7 +1124,10 @@ class ImagesMixin:
                     continue
                 if not (vm_info.get("cdroms") or []):
                     continue
-                needed = self._cdrom_iso_names(vm_info)
+                # Install-only media are never compared (G7), so nothing is
+                # verified or fetched for them: their path is enough to
+                # recognise the drive that still holds one.
+                needed = self._cdrom_iso_names(vm_info, install_only=False)
                 targets.append((cluster, vm_name, vm_info, full, needed))
                 wanted |= needed
 
@@ -1076,12 +1162,20 @@ class ImagesMixin:
                     name, f"iso '{name}' is not declared in the 'isos:' section")
                 for name in sorted(needed) if name not in paths
             ]
+            install_paths = {}
+            for name in self._cdrom_iso_names(vm_info, install_only=True):
+                path = self._iso_cache_path(name)
+                if path is None:
+                    reasons.append(
+                        f"iso '{name}' is not declared in the 'isos:' section")
+                else:
+                    install_paths[name] = path
             if reasons:
                 failures[full] = "; ".join(reasons)
                 continue
             try:
                 cluster["vms"][vm_name] = self._inject_resolved_iso(
-                    vm_info, paths)
+                    vm_info, {**install_paths, **paths})
             except ValueError as exc:
                 # _inject_resolved_iso raises a bare ValueError for a
                 # malformed entry; it escapes _update_single_vm now that

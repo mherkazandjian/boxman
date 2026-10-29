@@ -433,6 +433,18 @@ def parse_args():
         ),
         dest='restart'
     )
+    parser_update.add_argument(
+        '--force-restart',
+        action='store_true',
+        default=False,
+        help=(
+            'implies --restart, and restarts a VM even while its install is '
+            'not known to be done (install-only media still attached), '
+            'which --restart skips. Declaring the install done first '
+            '(boxman control finish-install) is the safer way.'
+        ),
+        dest='force_restart'
+    )
 
     #
     # sub parser for the 'down' subcommand
@@ -843,6 +855,23 @@ def parse_args():
     #
     # sub parser for the 'control start' subsubcommand
     #
+    #
+    # sub parser for the 'control finish-install' subsubcommand
+    #
+    parser_ctrl_finish = subparsers_ctrl.add_parser(
+        'finish-install', parents=[common, vms_parent, cluster_parent],
+        help='declare the install of ISO-boot vms done: eject their '
+             'install-only media now, whatever the guest agent says (for a '
+             'guest that runs no agent)')
+    parser_ctrl_finish.set_defaults(handler='finish_install')
+    parser_ctrl_finish.add_argument(
+        '--dry-run',
+        action='store_true',
+        default=False,
+        help='show what would be ejected without ejecting it',
+        dest='dry_run'
+    )
+
     parser_ctrl_start = subparsers_ctrl.add_parser('start', parents=[common, vms_parent, cluster_parent], help='start the vms')
     parser_ctrl_start.set_defaults(handler='start_vm')
     parser_ctrl_start.add_argument(

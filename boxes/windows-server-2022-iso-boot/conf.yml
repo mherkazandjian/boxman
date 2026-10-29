@@ -2,9 +2,9 @@
 #
 # A spike, not a finished box. It uses boxman's ISO-boot path
 # (boot_order: [cdrom, hd] -> IsoBootVM -> virt-install), which hands every
-# cdroms: entry to virt-install, and works around the one gap left (the
-# answer ISO, G7) with virt_install_extra_args -- see doc/windows-guests.md
-# for why, and for what a proper `os: windows` box would look like instead.
+# cdroms: entry to virt-install. All three are install-only: boxman ejects
+# them once the install is done (G7) -- see doc/windows-guests.md, also for
+# what a proper `os: windows` box would look like.
 #
 # Before `boxman up`, build the answer ISO (it holds the Administrator
 # password, so it is generated, never committed):
@@ -76,15 +76,25 @@ clusters:
         os_variant: win2k22
         networks:
           - name: win-net
+        # install_only: given to virt-install with the rest, so Setup sees
+        # it on its first boot, and ejected by the first `boxman up` or
+        # `boxman update` that finds the installed system's guest agent
+        # answering -- boxman-setup.ps1 installs the agent once it has read
+        # everything it needs off them. `boxman update` never compares an
+        # install-only medium: it neither puts one back nor detaches one
+        # mid-install.
         cdroms:
           - name: winsrv2022-eval
+            install_only: true
           # The host's virtio-win RPM, used in place (no download, no
           # cache): WinPE loads viostor and NetKVM from it, boxman-setup.ps1
-          # the rest. Declared, so `boxman update` leaves it attached.
+          # the rest.
           - name: virtio-win
             source: /usr/share/virtio-win/virtio-win.iso
-        # The answer ISO is not a cdroms: entry: it holds the password and is
-        # ejected after setup, and `boxman update` would put a declared one
-        # back. As a raw --disk it still reaches Setup's first boot.
-        virt_install_extra_args:
-          - '--disk=path={{ env("HOME") }}/workspaces/windows-server-2022-iso-boot/answer.iso,device=cdrom,readonly=on'
+            install_only: true
+          # The answer ISO make-answer-iso.sh writes. It holds the
+          # Administrator password in plain text, which any process in the
+          # guest could read from the drive until it is ejected.
+          - name: answer
+            source: '{{ env("HOME") }}/workspaces/windows-server-2022-iso-boot/answer.iso'
+            install_only: true

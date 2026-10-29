@@ -38,7 +38,8 @@ _CLI_HANDLERS = frozenset({
     'snapshot_list', 'snapshot_log', 'snapshot_restore', 'snapshot_delete',
     'snapshot_collapse', 'storage_df', 'storage_trim', 'storage_compact',
     'storage_optimize', 'storage_compress_snapshots', 'suspend_vm',
-    'resume_vm', 'save_vm', 'start_vm', 'run_task', 'ps', 'show_conf',
+    'resume_vm', 'save_vm', 'start_vm', 'finish_install', 'run_task', 'ps',
+    'show_conf',
     'ssh_session', 'exec_container', 'pxe_boot', 'netlab_deploy',
     'netlab_destroy', 'netlab_inspect', 'netlab_ssh',
 })
