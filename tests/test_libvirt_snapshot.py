@@ -123,8 +123,8 @@ def _shell_that_runs(calls: list | None = None):
         if calls is not None:
             calls.append(cmd)
         proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        return _result(ok=proc.returncode == 0, stderr=proc.stderr,
-                       return_code=proc.returncode)
+        return _result(ok=proc.returncode == 0, stdout=proc.stdout,
+                       stderr=proc.stderr, return_code=proc.returncode)
     return run
 
 
@@ -2476,6 +2476,9 @@ class TestCollapseTo:
 
         def fake_shell(cmd, *_a, **_kw):
             shell_executed.append(cmd)
+            if cmd.startswith("stat "):
+                # the identity check before the rebase reads the real files
+                return _shell_that_runs()(cmd)
             return _result()
 
         # Returns the right overlay path for (target, disk)
@@ -2810,32 +2813,99 @@ class TestCollapseKeepsTheLiveDisk:
         assert overlays["s2"].exists() and overlays["s1"].exists()
         assert virsh.snapshots == ["s1", "s2", "s3"]
 
-    @pytest.mark.parametrize("alias", ["symlink", "hardlink"])
-    def test_a_head_named_otherwise_than_the_target_is_rebased(
-            self, sm, tmp_path, alias):
+    def test_a_head_that_is_another_file_where_qemu_img_runs_is_rebased(
+            self, sm, tmp_path):
         # one file here need not be one file where qemu-img runs (a
-        # container with mounts of its own): only one path is, so another
-        # spelling is left to qemu-img, as before
+        # container with mounts of its own): what stat says there decides
         _base, overlays, memory = _take_external(
             tmp_path, ["s1", "s2"], real=False)
-        other = tmp_path / "other"
-        if alias == "symlink":
-            other.symlink_to(tmp_path)
-        else:
-            other.mkdir()
-            os.link(overlays["s1"], other / "vm01_disk.s1")
-        head = other / "vm01_disk.s1"
+        (tmp_path / "other").mkdir()
+        head = tmp_path / "other" / "vm01_disk.s1"
+        os.link(overlays["s1"], head)
         virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
                          {"vda": str(head)}, memory)
+        runs = _shell_that_runs()
+
+        def shell(cmd, *args, **kwargs):
+            if cmd.startswith("stat "):
+                return _result(stdout="64768 11\n64768 12\n")
+            return runs(cmd, *args, **kwargs)
 
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
-             patch.object(sm.virsh, "execute_shell",
-                          side_effect=_shell_that_runs()), \
+             patch.object(sm.virsh, "execute_shell", side_effect=shell), \
              patch.object(sm, "_qemu_img_rebase",
                           return_value=True) as rebase:
             assert sm.collapse_to("vm01", "s1") is True
 
         rebase.assert_called_once_with(str(head), str(overlays["s1"]))
+
+    @needs_qemu
+    @pytest.mark.parametrize("alias", ["symlink", "hardlink"])
+    def test_the_targets_own_overlay_named_otherwise_is_not_rebased(
+            self, sm, tmp_path, alias):
+        # as test_a_head_that_is_the_targets_own_overlay_is_not_rebased,
+        # with the head reported under another spelling: rebased onto
+        # itself it trips qemu's image lock, or without one loops
+        base, overlays, memory = _take_external(tmp_path, ["s1", "s2", "s4"])
+        reverted = tmp_path / "vm01_disk.1785187700"
+        _qemu("qemu-img", "create", "-q", "-f", "qcow2",
+              "-b", str(base), "-F", "qcow2", str(reverted))
+        s3 = tmp_path / "vm01_disk.s3"
+        _qemu("qemu-img", "create", "-q", "-f", "qcow2",
+              "-b", str(reverted), "-F", "qcow2", str(s3))
+        _write(s3, 6)
+        other = tmp_path / "other"
+        if alias == "symlink":
+            other.symlink_to(tmp_path)
+        else:
+            other.mkdir()
+            os.link(s3, other / s3.name)
+        head = other / s3.name
+        memory["s3"] = tmp_path / "vm01_snapshot_s3.raw"
+        memory["s3"].write_bytes(b"memory image")
+        records = {n: {"vda": str(overlays[n])} for n in ("s1", "s2", "s4")}
+        records["s3"] = {"vda": str(s3)}
+        virsh = _Libvirt(records, {"vda": str(head)}, memory,
+                         parents={"s1": None, "s2": "s1", "s4": "s2",
+                                  "s3": "s1"})
+        calls: list[str] = []
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs(calls)):
+            assert sm.collapse_to("vm01", "s3") is True
+
+        assert not any("qemu-img rebase" in c for c in calls)
+        assert _chain(s3) == [str(s3), str(reverted), str(base)]
+        assert _reads(s3, 0) and _reads(s3, 6)
+        assert not overlays["s4"].exists()
+        assert virsh.snapshots == ["s1", "s2", "s3"]
+
+    def test_one_that_cannot_be_examined_where_qemu_img_runs_stops(
+            self, sm, tmp_path):
+        _base, overlays, memory = _take_external(
+            tmp_path, ["s1", "s2"], real=False)
+        head = tmp_path / "vm01_disk.1785187700"
+        head.write_bytes(b"head")
+        virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
+                         {"vda": str(head)}, memory)
+        runs = _shell_that_runs()
+
+        def shell(cmd, *args, **kwargs):
+            if cmd.startswith("stat "):
+                return _result(ok=False, stderr="stat: Permission denied")
+            return runs(cmd, *args, **kwargs)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell", side_effect=shell), \
+             patch.object(sm, "_qemu_img_rebase",
+                          return_value=True) as rebase:
+            assert sm.collapse_to("vm01", "s1") is False
+
+        rebase.assert_not_called()
+        assert all(p.exists() for p in overlays.values())
+        assert memory["s2"].exists()
+        assert virsh.snapshots == ["s1", "s2"]
 
     @needs_qemu
     def test_a_target_overlay_that_is_not_there_stops_the_collapse(
@@ -3015,7 +3085,8 @@ class TestCollapseKeepsTheLiveDisk:
              patch.object(sm.logger, "info") as info:
             assert sm.collapse_to("vm01", "s1", dry_run=True) is True
 
-        assert calls == []
+        # nothing but the read-only identity check
+        assert all(c.startswith("stat ") for c in calls)
         assert all(p.exists() for p in overlays.values())
         lines = [str(c.args[0]) for c in info.call_args_list]
         assert any("would remove" in line and str(overlays["s2"]) in line

@@ -2106,6 +2106,30 @@ class SnapshotManager:
         except OSError:
             return os.path.realpath(path) == os.path.realpath(other)
 
+    def _one_file_where_qemu_runs(self, path: str, other: str) -> bool | None:
+        """
+        Whether *path* and *other* are one file where qemu-img opens them:
+        by ``(st_dev, st_ino)``, read with the commands boxman runs (in a
+        container, with its own mounts; with sudo when that is used), not
+        as boxman sees them. The same path is one file without asking.
+
+        Returns:
+            bool: or None when either cannot be stat'ed there.
+        """
+        if path == other:
+            return True
+        sudo = "sudo " if self.use_sudo else ""
+        result = self.virsh.execute_shell(
+            f"{sudo}stat -L -c '%d %i' -- {shlex.quote(path)} "
+            f"{shlex.quote(other)}", warn=True, hide=True)
+        if not result.ok:
+            return None
+        identities = [line.split() for line in result.stdout.splitlines()
+                      if line.strip()]
+        if len(identities) != 2 or any(len(i) != 2 for i in identities):
+            return None
+        return identities[0] == identities[1]
+
     def _collapse_keeps(self,
                         vm_name: str,
                         kept: list[str],
@@ -2217,10 +2241,17 @@ class SnapshotManager:
             for disk_target, source in disks:
                 new_base = self._overlay_path_for_snapshot(
                     vm_name, target_name, disk_target)
-                if source == new_base:
+                same = (None if not new_base
+                        else self._one_file_where_qemu_runs(source, new_base))
+                if same:
                     self.logger.info(
                         f"[dry-run]   {source} is the overlay of "
                         f"'{target_name}' itself; nothing to rebase")
+                elif same is None:
+                    self.logger.info(
+                        f"[dry-run]   whether {source} is {new_base} cannot "
+                        f"be told where qemu-img runs; the collapse would "
+                        f"stop here")
                 else:
                     self.logger.info(
                         f"[dry-run]   would rebase {source} onto {new_base}")
@@ -2238,7 +2269,10 @@ class SnapshotManager:
                         self.logger.info(f"[dry-run]   would remove {overlay}")
             return True
 
-        # Per-disk rebase — must succeed for every disk before we touch metadata.
+        # Per-disk rebase — must succeed for every disk before we touch
+        # metadata. What each disk needs is told for all of them first, so a
+        # disk that cannot be told stops the collapse before any is rebased.
+        rebases = []
         for disk_target, head_path in disks:
             new_base = self._overlay_path_for_snapshot(
                 vm_name, target_name, disk_target)
@@ -2247,15 +2281,22 @@ class SnapshotManager:
                     f"cannot find overlay for disk '{disk_target}' in "
                     f"snapshot '{target_name}' of vm {vm_name}")
                 return False
-            if head_path == new_base:
+            same = self._one_file_where_qemu_runs(head_path, new_base)
+            if same is None:
+                self.logger.error(
+                    f"cannot tell whether {head_path} is {new_base} where "
+                    f"qemu-img runs (one of them could not be stat'ed "
+                    f"there); not collapsing vm {vm_name}")
+                return False
+            rebases.append((disk_target, head_path, new_base, same))
+        for disk_target, head_path, new_base, same in rebases:
+            if same:
                 # nothing stands between them: the head is the target's own
                 # overlay (a revert and a new take put it there). Rebasing a
                 # file onto itself trips qemu's image lock at best, and
-                # without one writes a backing chain that loops. Only the
-                # same path says so: one file here need not be one file
-                # where qemu-img runs (a container's own mounts), and a
-                # path that cannot be examined proves nothing. Any other
-                # spelling is left to qemu-img, as before.
+                # without one writes a backing chain that loops. One file as
+                # boxman sees it need not be one where qemu-img runs (a
+                # container's own mounts), so it is asked there.
                 self.logger.info(
                     f"{head_path} is the overlay of '{target_name}' itself; "
                     f"nothing to rebase for {disk_target}")
