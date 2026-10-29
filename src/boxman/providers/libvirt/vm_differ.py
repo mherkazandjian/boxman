@@ -14,6 +14,7 @@ from .disk_ownership import (
     read_disk_records,
     unowned_disks,
 )
+from .install_media import is_install_only, media_path
 from .virsh_edit import VirshEdit
 from .virsh_parse import parse_domblklist
 
@@ -587,6 +588,15 @@ class VMStateDiffer:
         claimed_targets: set = set()
 
         entries = []
+        # Install-only media (G7) take no part in the comparison: one is not
+        # desired state once the install is done, and boxman ejects it then.
+        # Compared like the rest, an ejected medium was a drive to put back
+        # on every update, and one still attached mid-install was not; and
+        # left out of the comparison without more, the drive holding it was
+        # an undeclared drive to detach while the installer still read it.
+        # So their drives are kept out of the removals below, whatever they
+        # hold, and the entries are matched against nothing.
+        install_media: set = set()
         for cdrom_config in (desired_cdroms or []):
             raw_source = cdrom_config.get('source')
             if not raw_source:
@@ -600,6 +610,11 @@ class VMStateDiffer:
                     f"has no resolved source. Declared media must be resolved "
                     f"to a local path before it can be compared with what is "
                     f"attached; refusing to guess one.")
+            if is_install_only(cdrom_config):
+                # resolved all the same: an unrecognised install medium is a
+                # drive the removals below would detach mid-install
+                install_media.add(media_path(raw_source))
+                continue
             entries.append(
                 (cdrom_config,
                  os.path.abspath(os.path.expanduser(raw_source))))
@@ -663,6 +678,9 @@ class VMStateDiffer:
             # An empty drive holds no media to remove, and dropping it would
             # silently change the domain's topology.
             and c.get('source') is not None
+            # ...and an install medium is boxman's to eject, once the
+            # install is done, not update's to detach
+            and media_path(c['source']) not in install_media
         ]
         # Before any change: whether the guest is still waiting for a boot to
         # see an earlier one.

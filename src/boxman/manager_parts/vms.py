@@ -490,6 +490,88 @@ class VMsMixin:
                 f"({', '.join(problems)} failed) — see the preceding "
                 f"per-step errors for the cause.")
 
+    def eject_install_media(self, full_vm_names=None,
+                            dry_run: bool = False) -> list[str]:
+        """
+        Eject the install-only media of every VM whose install is done (G7).
+
+        Asked of every VM that declares ``install_only`` cdroms, on every
+        ``provision``, ``up`` and ``update``: boxman does not wait for an
+        install, so the run that starts one has usually ended before it is
+        done, and a later run is where its media go. A VM whose install is
+        not known to be done keeps them, with one line saying why -- the
+        same line mid-install and for a guest that runs no agent, which is
+        why it names the command that ejects them by hand.
+
+        Args:
+            full_vm_names: restrict to these domains; None for every VM.
+            dry_run: report what would be ejected, eject nothing.
+
+        Returns:
+            One line per VM whose media could not be ejected, or whose
+            drives could not be read; empty when nothing went wrong. A VM
+            still installing is not a problem.
+        """
+        problems: list[str] = []
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        for cluster_name, cluster in self._vm_clusters.items():
+            for vm_name, vm_info in (cluster.get('vms') or {}).items():
+                full = f"{prj_name}_{cluster_name}_{vm_name}"
+                if full_vm_names is not None and full not in full_vm_names:
+                    continue
+                sources = self._install_only_sources(vm_info or {})
+                if not sources:
+                    continue
+                session = self.session_for_cluster(cluster_name)
+                if not hasattr(session, 'eject_install_media'):
+                    continue
+                label = f"{cluster_name}/{vm_name}"
+                try:
+                    outcome = session.eject_install_media(
+                        full, sources, dry_run=dry_run)
+                except BoxmanError as exc:
+                    self.logger.error(
+                        f"vm {label}: could not look for its install-only "
+                        f"media: {exc}")
+                    problems.append(
+                        f"vm {label}: install-only media not checked: {exc}")
+                    continue
+                if not outcome.held:
+                    continue
+                held = ', '.join(f"{target} ({source})"
+                                 for target, source in outcome.held)
+                if outcome.waiting:
+                    by_hand = '; '.join(
+                        session.virsh_invocation(
+                            'change-media', full, target, '--eject',
+                            '--force', *outcome.scope(target))
+                        for target, _source in outcome.held)
+                    self.logger.info(
+                        f"vm {label}: keeping its install-only media "
+                        f"{held}: the install is not known to be done, as "
+                        f"{outcome.waiting}. They go on the first up or "
+                        f"update that finds the installed system's guest "
+                        f"agent reporting its root on the boot disk; to eject "
+                        f"them by hand: {by_hand}")
+                    continue
+                if outcome.would_eject:
+                    self.logger.info(
+                        f"[dry-run] vm {label}: would eject its install-only "
+                        f"media {held}, now that its install is done")
+                    continue
+                for target, source in outcome.ejected:
+                    self.logger.info(
+                        f"vm {label}: ejected install-only medium {source} "
+                        f"from {target}: its install is done")
+                for target, source, reason in outcome.failed:
+                    self.logger.error(
+                        f"vm {label}: could not eject install-only medium "
+                        f"{source} from {target}: {reason}")
+                    problems.append(
+                        f"vm {label}: install-only medium {source} is still "
+                        f"in {target}: {reason}")
+        return problems
+
     def _destroy_vm_and_disks(
         self, cluster_name: str, cluster: dict[str, Any], vm_name: str, vm_info: dict[str, Any]
     ) -> None:
@@ -1999,6 +2081,12 @@ class VMsMixin:
         if update_vm_names:
             prj_name = f'bprj__{config["project"]}__bprj'
             result_queue: Queue = Queue()
+
+            # An ISO-boot VM's install-only media go once its install is
+            # done (G7). They are not part of the diff below, which never
+            # compares them; a dry run says what it would eject.
+            update_failures.extend(self.eject_install_media(
+                update_vm_names, dry_run=dry_run))
 
             # Resolve declared media to real local paths *before* diffing.
             # The differ cannot tell an unresolved entry from a resolved one,

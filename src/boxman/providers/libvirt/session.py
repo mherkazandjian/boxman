@@ -25,6 +25,7 @@ from .disk import DiskManager
 from .disk_cleanup import FilesInUse, remove_vm_disks
 from .disk_ownership import detach_disk, forget_disk
 from .import_image import ImageImporter
+from .install_media import InstallMediaOutcome, eject_finished_install_media
 from .iso_boot_vm import IsoBootVM
 from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
@@ -2506,6 +2507,25 @@ class LibVirtSession(SessionConfigMixin):
                     self.logger.warning(
                         f"failed to eject cdrom {target} from {vm_name}: "
                         f"{eject_result.stderr.strip()}")
+
+    def eject_install_media(self, vm_name: str, sources,
+                            dry_run: bool = False) -> InstallMediaOutcome:
+        """
+        Eject a VM's install-only media once its installed system is up.
+
+        See :mod:`~boxman.providers.libvirt.install_media` for when that is.
+        The seed eject above runs after every provision; this one runs on
+        every ``up`` and ``update`` too, because an install outlasts the
+        ``up`` that starts it.
+
+        Args:
+            vm_name: the full domain name.
+            sources: the media its ``install_only`` cdroms resolve to.
+            dry_run: decide, eject nothing.
+        """
+        return eject_finished_install_media(
+            VirshCommand(provider_config=self.provider_config), vm_name,
+            sources, provider_config=self.provider_config, dry_run=dry_run)
 
     def get_latest_snapshot(self, vm_name):
         """Return the current snapshot name for a VM, or None if none exists."""

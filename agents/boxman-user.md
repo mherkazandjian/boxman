@@ -782,11 +782,28 @@ clusters:
   the OS is installed the disk wins. `[cdrom, hd]` and `[cdrom]` behave
   identically — anything past element 0 is ignored. There is no virt-install
   install phase: an installer's reboot is a plain reboot (into the disk, once
-  it is bootable), and the ISO stays attached until you eject it.
+  it is bootable), and the ISO stays attached until you eject it, or boxman
+  does (`install_only`, below).
 - **`cdroms:` entry forms:** a bare string, `{name: <iso-name>}` (resolved from
   `isos:`), or `{source: /abs/path.iso}` (explicit local file). The first cdrom
   is the boot ISO; the others go to virt-install with it, so an installer
   sees them on its first boot (a driver ISO, an answer file).
+- **`install_only: true`** on a cdroms entry (ISO-boot VMs only; refused on a
+  cloned VM) marks a medium the install needs and the installed guest does
+  not: an answer ISO holding a password, a driver ISO, the installer itself.
+  It goes to virt-install like the rest, and boxman ejects it (the drive
+  stays, empty) on the first `up` or `update` -- or the end of `provision` --
+  that finds the VM running and its guest agent reporting the guest's root
+  (`/`, or a drive root such as `C:\`) on the boot disk, via `virsh
+  guestinfo --filesystem`. A live installer's root is in memory, WinPE runs
+  no agent, and an installer mounts its target elsewhere, so nothing during
+  an install says that. Until then each run logs why the media stay and the
+  `virsh change-media … --eject` command to do it by hand; a guest that runs
+  no agent keeps them. `update` never compares an install-only entry: it is
+  neither put back after the eject nor detached mid-install, and its ISO is
+  neither checksummed nor downloaded by `update`. `update --dry-run` says
+  what it would eject. A first-boot script that reads install-only media
+  after it starts the guest agent must copy what it needs first.
 - **`os_variant:`** (e.g. `win2k22`, `ubuntu24.04`; `osinfo-query os` lists
   them) sets virt-install's `--os-variant`, which picks device defaults such
   as the clock. Without it, virt-install detects the OS from the boot ISO with
@@ -1027,6 +1044,8 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   name `sda` yourself. An `isos:` entry a cdrom names is downloaded if not yet
   cached; a cached file is never re-fetched, and a checksum mismatch fails
   that VM rather than triggering a download. `--dry-run` downloads nothing.
+  An `install_only` entry is not compared at all; `update` ejects it once
+  the install is done (see ISO boot).
 - **SSH step**: `update` ends by rewriting `ssh_config` and adding the cluster
   admin key to every running VM. A running VM that does not get the key fails
   the update (exit 2) after everything else ran; one that is not running only
