@@ -167,7 +167,7 @@ class TestRestartOptIn:
 
         def _capture(tasks, op_label='parallel task'):
             for _label, _target, args in tasks:
-                captured['allow_restart'] = args[-1]
+                captured['allow_restart'] = args[6]
             return {}, {}
 
         with patch.multiple(
@@ -205,7 +205,7 @@ class TestRestartOptIn:
 
         def _capture(tasks, op_label='parallel task'):
             for _label, _target, args in tasks:
-                captured['allow_restart'] = args[-1]
+                captured['allow_restart'] = args[6]
             return {}, {}
 
         with patch.multiple(

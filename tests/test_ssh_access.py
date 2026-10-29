@@ -146,7 +146,8 @@ def _sync_run_parallel(self, tasks, op_label="parallel task",
 
 
 def _nothing_to_change(self, cluster_name, cluster_cfg, vm_name, vm_info,
-                       result_queue, dry_run=False, allow_restart=False):
+                       result_queue, dry_run=False, allow_restart=False,
+                       force_restart=False, install_done=False):
     """Stand-in for ``_update_single_vm``: the VM is as configured."""
 
 

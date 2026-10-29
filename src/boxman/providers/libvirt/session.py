@@ -2509,7 +2509,8 @@ class LibVirtSession(SessionConfigMixin):
                         f"{eject_result.stderr.strip()}")
 
     def eject_install_media(self, vm_name: str, sources,
-                            dry_run: bool = False) -> InstallMediaOutcome:
+                            dry_run: bool = False,
+                            declared_done: bool = False) -> InstallMediaOutcome:
         """
         Eject a VM's install-only media once its installed system is up.
 
@@ -2522,10 +2523,13 @@ class LibVirtSession(SessionConfigMixin):
             vm_name: the full domain name.
             sources: the media its ``install_only`` cdroms resolve to.
             dry_run: decide, eject nothing.
+            declared_done: eject whatever the guest agent says (``boxman
+                control finish-install``).
         """
         return eject_finished_install_media(
             VirshCommand(provider_config=self.provider_config), vm_name,
-            sources, provider_config=self.provider_config, dry_run=dry_run)
+            sources, provider_config=self.provider_config, dry_run=dry_run,
+            declared_done=declared_done)
 
     def get_latest_snapshot(self, vm_name):
         """Return the current snapshot name for a VM, or None if none exists."""

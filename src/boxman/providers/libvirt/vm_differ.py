@@ -398,6 +398,8 @@ class VMStateDiffer:
                 the persistent definition holds)
               - cdroms_restart_pending, and cdroms_pending_targets: the
                 targets the next boot changes
+              - install_media_held: the targets still holding an
+                install-only medium (the install is not known to be done)
               - new_shared_folders, removed_shared_folders, changed_shared_folders
               - memballoon_changed, memballoon_restart_pending,
                 desired_memballoon (normalized), actual_memballoon, and
@@ -686,6 +688,12 @@ class VMStateDiffer:
         # see an earlier one.
         cdroms_pending_targets = cdroms_awaiting_boot(
             live_cdroms, persistent_cdroms)
+        # The drives still holding an install-only medium: the install is
+        # not known to be done, so update must not restart the guest under
+        # it unless told to (--force-restart).
+        install_media_held = sorted({
+            c['target'] for c in persistent_cdroms + live_cdroms
+            if c.get('source') and media_path(c['source']) in install_media})
 
         # --- Shared folder diff ---
         # What boxman *configures* is the persistent definition, so that is
@@ -766,6 +774,7 @@ class VMStateDiffer:
             'changed_cdroms': changed_cdroms,
             'cdroms_restart_pending': bool(cdroms_pending_targets),
             'cdroms_pending_targets': cdroms_pending_targets,
+            'install_media_held': install_media_held,
             'shared_folders_restart_pending': shared_folders_restart_pending,
             'new_shared_folders': new_shared_folders,
             'removed_shared_folders': removed_shared_folders,

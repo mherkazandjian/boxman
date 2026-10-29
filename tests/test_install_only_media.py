@@ -28,6 +28,7 @@ import pytest
 from boxman.exceptions import ConfigError, ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.install_media import (
+    InstallMediaOutcome,
     installed_system_is_up,
     is_install_only,
     parse_guestinfo,
@@ -540,14 +541,15 @@ class TestTheManagerPass:
         mgr, session = self._manager(tmp_path, self._outcome())
         assert mgr.eject_install_media() == []
         session.eject_install_media.assert_called_once_with(
-            FULL, {mgr._iso_cache_path('installer')}, dry_run=False)
+            FULL, {mgr._iso_cache_path('installer')}, dry_run=False,
+            declared_done=False)
 
     def test_a_vm_left_out_is_not_asked(self, tmp_path):
         mgr, session = self._manager(tmp_path, self._outcome())
         mgr.eject_install_media([f'{PRJ}_c1_linux01'])
         session.eject_install_media.assert_not_called()
 
-    def test_waiting_names_the_reason_and_the_command_by_hand(self, tmp_path):
+    def test_waiting_names_the_reason_and_the_command_to_finish(self, tmp_path):
         mgr, _session = self._manager(tmp_path, self._outcome(
             held=[('sda', '/c/win.iso')], live={'sda'}, persistent={'sda'},
             waiting="its guest agent does not answer (error: x)"))
@@ -558,7 +560,8 @@ class TestTheManagerPass:
             "the install is not known to be done, as its guest agent does "
             "not answer (error: x).")
         assert line.endswith(
-            f"virsh change-media {FULL} sda --eject --force --live --config")
+            "a guest without an agent can be told so: "
+            "boxman control finish-install --vms c1_win01")
 
     def test_a_failed_eject_is_a_problem(self, tmp_path):
         mgr, _session = self._manager(tmp_path, self._outcome(
@@ -579,7 +582,7 @@ class TestTheManagerPass:
             held=[('sda', '/c/win.iso')], would_eject=[('sda', '/c/win.iso')]))
         mgr.eject_install_media(dry_run=True)
         assert session.eject_install_media.call_args.kwargs == {
-            'dry_run': True}
+            'dry_run': True, 'declared_done': False}
         mgr.logger.info.assert_called_with(
             "[dry-run] vm c1/win01: would eject its install-only media sda "
             "(/c/win.iso), now that its install is done")
@@ -657,14 +660,16 @@ class TestTheVerbsAsk:
         mgr._find_all_existing_project_vms = MagicMock(return_value=[FULL])
         mgr.eject_install_media = calls.eject_install_media
         mgr.eject_install_media.return_value = []
+        mgr.eject_install_media.side_effect = (
+            lambda names, dry_run=False, outcomes=None: [])
         mgr._normalize_cdroms_for_update = calls._normalize_cdroms_for_update
         mgr._normalize_cdroms_for_update.return_value = {}
         mgr._run_parallel = MagicMock(return_value=({}, {}))
         mgr.update(types.SimpleNamespace(dry_run=True, yes=False))
         assert [c[0] for c in calls.mock_calls] == [
             'eject_install_media', '_normalize_cdroms_for_update']
-        assert calls.eject_install_media.call_args == (
-            ({FULL},), {'dry_run': True})
+        assert calls.eject_install_media.call_args.args == ({FULL},)
+        assert calls.eject_install_media.call_args.kwargs['dry_run'] is True
 
     def test_a_failed_eject_fails_update(self):
         mgr = make_bare_manager(_iso_config([{'name': 'installer',
@@ -727,3 +732,276 @@ class TestTheVerbsAsk:
         # the rest of provision ran first
         mgr.setup_ssh_access.assert_called_once()
         mgr.deploy_netlab.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# boxman control finish-install: the install declared done
+# ---------------------------------------------------------------------------
+
+class TestDeclaringTheInstallDone:
+    """A guest whose installed system runs no agent kept its install-only
+    media for ever; `boxman control finish-install` ejects them on the
+    user's word."""
+
+    def test_a_running_guest_without_an_agent_loses_them_live(self, media):
+        domain = _windows_domain(media, agent=None)
+        with _virsh(domain):
+            outcome = LibVirtSession(
+                config={'provider': {'libvirt': {'use_sudo': False}}}
+            ).eject_install_media(VM, {media['answer']}, declared_done=True)
+        assert outcome.ejected == [('sdc', media['answer'])]
+        assert domain.calls_of('change-media') == [
+            ('change-media', VM, 'sdc', '--eject', '--force', '--live',
+             '--config')]
+        assert not domain.calls_of('guestinfo')
+
+    def test_a_shut_off_one_loses_them_from_its_config(self, media):
+        domain = _windows_domain(media, state='shut off')
+        with _virsh(domain):
+            outcome = LibVirtSession(
+                config={'provider': {'libvirt': {'use_sudo': False}}}
+            ).eject_install_media(VM, {media['answer']}, declared_done=True)
+        assert outcome.ejected == [('sdc', media['answer'])]
+        assert domain.calls_of('change-media') == [
+            ('change-media', VM, 'sdc', '--eject', '--force', '--config')]
+        assert domain.persistent['sdc'][2] is None
+
+    def test_afterwards_up_and_update_find_nothing_to_say(self, media):
+        domain = _windows_domain(media, agent=None)
+        sources = {media['installer'], media['drivers'], media['answer']}
+        with _virsh(domain):
+            session = LibVirtSession(
+                config={'provider': {'libvirt': {'use_sudo': False}}})
+            session.eject_install_media(VM, sources, declared_done=True)
+            outcome = session.eject_install_media(VM, sources)
+        assert outcome.held == [] and outcome.waiting is None
+
+    def _manager(self, tmp_path, outcome=None, cdroms=None):
+        config = _iso_config(cdroms if cdroms is not None else [
+            {'name': 'installer', 'install_only': True}, {'name': 'drivers'}])
+        config['clusters']['c1']['vms']['linux01'] = {
+            'boot_order': ['cdrom'], 'cdroms': [{'name': 'drivers'}]}
+        mgr = _manager(config, tmp_path)
+        session = MagicMock()
+        session.eject_install_media.return_value = (
+            outcome or InstallMediaOutcome())
+        mgr.session_for_cluster = MagicMock(return_value=session)
+        mgr._update_sessions_with_runtime = MagicMock()
+        mgr._is_compose_cluster = lambda name: False
+        return mgr, session
+
+    @staticmethod
+    def _cli(vms='all', dry_run=False, cluster=None):
+        return types.SimpleNamespace(vms=vms, dry_run=dry_run, cluster=cluster)
+
+    def test_it_ejects_one_named_vm_whatever_the_agent_says(self, tmp_path):
+        mgr, session = self._manager(tmp_path, InstallMediaOutcome(
+            held=[('sda', '/c/win.iso')], ejected=[('sda', '/c/win.iso')]))
+        mgr.finish_install(self._cli(vms='win01'))
+        session.eject_install_media.assert_called_once_with(
+            FULL, {mgr._iso_cache_path('installer')}, dry_run=False,
+            declared_done=True)
+        mgr.logger.info.assert_any_call(
+            "vm c1/win01: ejected install-only medium /c/win.iso from sda: "
+            "its install is declared done")
+
+    def test_a_vm_with_nothing_left_is_a_no_op_that_says_so(self, tmp_path):
+        mgr, _session = self._manager(tmp_path, InstallMediaOutcome())
+        mgr.finish_install(self._cli(vms='c1_win01'))
+        mgr.logger.info.assert_any_call(
+            "vm c1/win01: no install-only medium is left in its drives; "
+            "nothing to eject")
+
+    def test_a_named_vm_without_install_only_media_is_refused(self, tmp_path):
+        mgr, session = self._manager(tmp_path)
+        with pytest.raises(ConfigError, match=(
+                "vm c1/linux01 has no install-only media \\(no cdroms: entry "
+                "with install_only: true\\), so it has no install to declare "
+                "done")):
+            mgr.finish_install(self._cli(vms='win01,linux01'))
+        session.eject_install_media.assert_not_called()
+
+    def test_an_unknown_vm_is_refused(self, tmp_path):
+        mgr, session = self._manager(tmp_path)
+        with pytest.raises(ConfigError, match="there is no VM 'win02'"):
+            mgr.finish_install(self._cli(vms='win02'))
+        session.eject_install_media.assert_not_called()
+
+    def test_all_leaves_out_the_vms_without_them(self, tmp_path):
+        mgr, session = self._manager(tmp_path)
+        mgr.finish_install(self._cli())
+        assert [c.args[0] for c in session.eject_install_media.call_args_list
+                ] == [FULL]
+
+    def test_a_project_without_any_is_refused(self, tmp_path):
+        mgr, _session = self._manager(tmp_path, cdroms=[{'name': 'drivers'}])
+        with pytest.raises(ConfigError,
+                           match="no selected VM has install-only media"):
+            mgr.finish_install(self._cli())
+
+    def test_a_dry_run_ejects_nothing(self, tmp_path):
+        mgr, session = self._manager(tmp_path, InstallMediaOutcome(
+            held=[('sda', '/c/win.iso')], would_eject=[('sda', '/c/win.iso')]))
+        mgr.finish_install(self._cli(vms='win01', dry_run=True))
+        assert session.eject_install_media.call_args.kwargs == {
+            'dry_run': True, 'declared_done': True}
+        mgr.logger.info.assert_any_call(
+            "[dry-run] vm c1/win01: would eject its install-only media sda "
+            "(/c/win.iso), now that its install is declared done")
+
+    def test_a_failed_eject_fails_it(self, tmp_path):
+        mgr, _session = self._manager(tmp_path, InstallMediaOutcome(
+            held=[('sda', '/c/win.iso')],
+            failed=[('sda', '/c/win.iso', 'error: locked')]))
+        with pytest.raises(ProvisionError,
+                           match="control finish-install failed for 1"):
+            mgr.finish_install(self._cli(vms='win01'))
+
+    def test_the_cli_has_it(self):
+        from boxman.scripts.cli_parser import parse_args
+        args = parse_args().parse_args([
+            'control', 'finish-install', '--vms', 'c1_win01', '--cluster',
+            'c1', '--dry-run'])
+        assert (args.handler, args.vms, args.cluster, args.dry_run) == (
+            'finish_install', 'c1_win01', 'c1', True)
+        from boxman.scripts.app import _CLI_HANDLERS
+        assert 'finish_install' in _CLI_HANDLERS
+
+
+# ---------------------------------------------------------------------------
+# update --restart skips a guest mid-install; --force-restart does not
+# ---------------------------------------------------------------------------
+
+class TestNoRestartMidInstall:
+
+    @staticmethod
+    def _run(held, allow_restart=True, force_restart=False, dry_run=False,
+             install_done=False, state='running'):
+        from boxman.providers.libvirt.vm_differ import VMStateDiffer
+        from test_update_restart_opt_in import _diff
+        mgr = make_bare_manager({'project': 'demo'})
+        mgr.provider = MagicMock()
+        mgr.provider.update_vm_cpu_memory.return_value = {
+            'success': True, 'restart_needed': True}
+        mgr.provider.shutdown_and_wait.return_value = True
+        mgr.provider.start_vm.return_value = True
+        queue = MagicMock()
+        diff = _diff(memory_changed=True, desired_memory_mb=4096,
+                     install_media_held=held, vm_state=state)
+        with patch.object(VMStateDiffer, 'diff_vm', return_value=diff):
+            mgr._update_single_vm(
+                'c1', {'workdir': '/tmp'}, 'win01', {'memory': 4096}, queue,
+                dry_run=dry_run, allow_restart=allow_restart,
+                force_restart=force_restart, install_done=install_done)
+        return mgr, queue.put.call_args.args[0][1]
+
+    def test_restart_skips_a_guest_mid_install_and_says_why(self):
+        mgr, result = self._run(['sda', 'sdc'])
+        mgr.provider.shutdown_and_wait.assert_not_called()
+        mgr.provider.start_vm.assert_not_called()
+        assert result['status'] == 'needs_restart'
+        assert ("the restart was skipped: win01 is still installing (its "
+                "install-only media in sda, sdc are attached), and update "
+                "does not restart a guest mid-install; re-run with "
+                "--force-restart to restart it anyway, or declare the "
+                "install done first: boxman control finish-install --vms "
+                "c1_win01") in result['details']
+        mgr.logger.warning.assert_called_once()
+
+    def test_its_other_changes_still_apply(self):
+        # as without --restart: written now, live where libvirt can
+        mgr, result = self._run(['sda'])
+        mgr.provider.update_vm_cpu_memory.assert_called_once()
+        assert 'written to the persistent config' in result['details']
+
+    def test_force_restart_restarts_it(self):
+        mgr, result = self._run(['sda'], force_restart=True)
+        mgr.provider.shutdown_and_wait.assert_called_once()
+        mgr.provider.start_vm.assert_called_once()
+        assert result['status'] == 'updated'
+        assert 'still installing' in mgr.logger.warning.call_args.args[0]
+
+    def test_a_finished_install_is_restarted_by_restart(self):
+        mgr, result = self._run([])
+        mgr.provider.shutdown_and_wait.assert_called_once()
+        assert result['details'].endswith('(restarted)')
+
+    def test_a_dry_run_says_the_restart_would_be_skipped(self):
+        mgr, result = self._run(['sda'], dry_run=True)
+        assert result['status'] == 'dry_run'
+        assert ("a restart these changes need would be skipped: win01 is "
+                "still installing") in result['details']
+        mgr.provider.update_vm_cpu_memory.assert_not_called()
+
+    def test_a_dry_run_says_force_restart_would_restart_it(self):
+        _mgr, result = self._run(['sda'], dry_run=True, force_restart=True)
+        assert ("a restart these changes need would go ahead although win01 "
+                "is still installing (its install-only media in sda are "
+                "attached): --force-restart") in result['details']
+
+    def test_a_dry_run_whose_eject_pass_found_the_install_done(self):
+        # the real run ejects before it diffs
+        _mgr, result = self._run(['sda'], dry_run=True, install_done=True)
+        assert 'still installing' not in result['details']
+
+    def test_without_restart_nothing_is_said_about_the_install(self):
+        _mgr, result = self._run(['sda'], allow_restart=False)
+        assert 'still installing' not in result['details']
+        assert '--restart' in result['details']
+
+    def test_force_restart_implies_restart(self):
+        from boxman.scripts.cli_parser import parse_args
+        args = parse_args().parse_args(['update', '--force-restart'])
+        assert args.force_restart is True
+        mgr = make_bare_manager({'project': 'demo', 'clusters': {}})
+        captured = {}
+        for name in ('validate_direct_boot_config',
+                     'validate_clone_identity_config',
+                     '_update_sessions_with_runtime', 'ensure_shared_bridges',
+                     'report_network_results', 'raise_on_network_failures',
+                     'setup_ssh_access', 'connect_info',
+                     'report_clone_degradations'):
+            setattr(mgr, name, MagicMock())
+        mgr.reconcile_networks = MagicMock(return_value={})
+        mgr._get_project_vm_names = MagicMock(return_value=[FULL])
+        mgr._find_all_existing_project_vms = MagicMock(return_value=[FULL])
+        mgr.config['clusters'] = {'c1': {'workdir': '/wd',
+                                         'vms': {'win01': {}}}}
+        mgr.eject_install_media = MagicMock(return_value=[])
+        mgr._normalize_cdroms_for_update = MagicMock(return_value={})
+
+        def run_parallel(tasks, op_label='', **_kw):
+            for _label, _target, args in tasks:
+                captured['args'] = args
+            return {}, {}
+
+        mgr._run_parallel = run_parallel
+        mgr.update(types.SimpleNamespace(dry_run=False, yes=False,
+                                         restart=False, force_restart=True))
+        # (..., dry_run, allow_restart, force_restart, install_done)
+        assert captured['args'][5:] == (False, True, True, False)
+
+
+class TestTheDifferSaysWhatIsHeld:
+
+    def test_drives_holding_install_media_are_named(self, media):
+        domain = _windows_domain(media)
+        diff = _diff(domain, [
+            {'name': 'installer', 'source': media['installer'],
+             'install_only': True},
+            {'name': 'drivers', 'source': media['drivers']},
+            {'name': 'answer', 'source': media['answer'],
+             'install_only': True}])
+        assert diff['install_media_held'] == ['sda', 'sdc']
+
+    def test_none_once_they_are_ejected(self, media):
+        domain = _windows_domain(media)
+        for view in (domain.live, domain.persistent):
+            view['sda'] = ('cdrom', 'sata', None)
+            view['sdc'] = ('cdrom', 'sata', None)
+        diff = _diff(domain, [
+            {'name': 'installer', 'source': media['installer'],
+             'install_only': True},
+            {'name': 'answer', 'source': media['answer'],
+             'install_only': True}])
+        assert diff['install_media_held'] == []

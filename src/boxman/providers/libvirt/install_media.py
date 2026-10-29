@@ -207,7 +207,9 @@ def installed_system_is_up(virsh, vm_name: str,
 
 def eject_finished_install_media(virsh, vm_name: str, sources: Iterable[str],
                                  provider_config: dict[str, Any] | None = None,
-                                 dry_run: bool = False) -> InstallMediaOutcome:
+                                 dry_run: bool = False,
+                                 declared_done: bool = False
+                                 ) -> InstallMediaOutcome:
     """
     Eject *sources* from *vm_name* once its installed system is up.
 
@@ -226,6 +228,10 @@ def eject_finished_install_media(virsh, vm_name: str, sources: Iterable[str],
         sources: the media paths the VM's ``install_only`` entries resolve
             to (:func:`media_path` spelling).
         dry_run: find and decide, eject nothing.
+        declared_done: the user said the install is done (``boxman control
+            finish-install``): no agent is asked, and a domain in any state
+            loses its media -- from the persistent definition alone when it
+            is not active, since ``--live`` needs a running guest.
 
     Raises:
         ProvisionError: if the domain's block devices cannot be listed.
@@ -252,19 +258,22 @@ def eject_finished_install_media(virsh, vm_name: str, sources: Iterable[str],
     if not outcome.held:
         return outcome
 
-    if state != 'running':
-        outcome.waiting = (f"it is {state}" if state
-                           else "its state cannot be read")
-        return outcome
-
-    boot_target = boot_disk_target(virsh, vm_name)
-    if boot_target is None:
-        outcome.waiting = "it has no boot disk to look for the installed system on"
-        return outcome
-    done, why_not = installed_system_is_up(virsh, vm_name, boot_target)
-    if not done:
-        outcome.waiting = why_not
-        return outcome
+    # Declared done, the user's word stands in for the agent's, whatever
+    # the domain's state.
+    if not declared_done:
+        if state != 'running':
+            outcome.waiting = (f"it is {state}" if state
+                               else "its state cannot be read")
+            return outcome
+        boot_target = boot_disk_target(virsh, vm_name)
+        if boot_target is None:
+            outcome.waiting = ("it has no boot disk to look for the installed "
+                               "system on")
+            return outcome
+        done, why_not = installed_system_is_up(virsh, vm_name, boot_target)
+        if not done:
+            outcome.waiting = why_not
+            return outcome
 
     if dry_run:
         outcome.would_eject = outcome.held
