@@ -7,6 +7,7 @@ from typing import Any
 from boxman.exceptions import ProvisionError
 
 from .cdrom import CDROMManager
+from .commands import virt_install_path
 from .direct_vm import DirectInstallVM
 
 
@@ -72,7 +73,14 @@ class IsoBootVM(DirectInstallVM):
         # the one definition, with a normal reboot. `--cdrom` stays because
         # it is the medium virt-install detects the OS from; a CD-ROM
         # `--disk` would not be read.
-        args = [f"--cdrom={shlex.quote(self.iso_path)}",
+        #
+        # Each path goes through virt_install_path: shell quoting alone let
+        # a comma in a `cdroms:` source end virt-install's `path=` value
+        # there, and a quote in any of them reach the domain as another
+        # file. `--cdrom` is a whole value, which virt-install does not
+        # split.
+        iso = virt_install_path(self.iso_path, self.vm_name, sub_option=False)
+        args = [f"--cdrom={shlex.quote(iso)}",
                 "--install=no_install=yes"]
         for entry in self._extra_cdroms():
             source = os.path.abspath(os.path.expanduser(entry["source"]))
@@ -81,7 +89,8 @@ class IsoBootVM(DirectInstallVM):
                     f"vm {self.vm_name}: cdrom "
                     f"'{entry.get('name') or entry['source']}': ISO file does "
                     f"not exist: {source}")
-            disk = f"path={source},device=cdrom,readonly=on"
+            disk = (f"path={virt_install_path(source, self.vm_name)},"
+                    f"device=cdrom,readonly=on")
             target = entry.get("target")
             if target:
                 disk += (f",target.dev={target},"
