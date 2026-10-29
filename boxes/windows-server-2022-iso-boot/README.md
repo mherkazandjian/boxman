@@ -35,7 +35,8 @@ This is a spike box. It is not a template and it is not cloned (see
 5. The first `boxman up` or `boxman update` after that ejects the three
    CD-ROMs: the guest agent reports `C:\` on the boot disk, which is
    boxman's sign that the installed system is up. Until then, each `up`
-   and `update` logs why the media stay and how to eject them by hand.
+   and `update` logs why the media stay, and `boxman control
+   finish-install --vms win_win01` ejects them on your word.
    The answer ISO holds the Administrator password in plain text, so this
    matters: until the eject, any process in the guest can read it from
    the drive. `boxman update` never compares the three: it neither puts
@@ -110,7 +111,7 @@ All of these are covered in the doc.
   `C:\ProgramData\ssh\administrators_authorized_keys` for administrators.
 - **A guest whose agent does not run keeps its install media.** boxman
   ejects them only once the guest agent reports the installed system, so
-  if `boxman-setup.ps1` could not install the agent, eject them by hand:
-  each `up` and `update` logs the `virsh change-media` command.
+  if `boxman-setup.ps1` could not install the agent, declare the install
+  done: `boxman control finish-install --vms win_win01`.
 - **Licensing.** The ISO is a 180-day evaluation for test/demo use. Do not
   push the ISO or a disk installed from it to a registry.

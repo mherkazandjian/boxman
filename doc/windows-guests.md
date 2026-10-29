@@ -391,7 +391,11 @@ Plus `make-answer-iso.sh` to render the answer file.
    them (a first-boot script, AutoYaST's second stage reading the DVD) can
    lose them. That is why `install_only` is opt-in per medium:
    `boxman-setup.ps1` installs the agent after the last step that reads
-   the media. A golden image or
+   the media. For a guest whose installed system runs no agent, `boxman
+   control finish-install --vms <cluster>_<vm>` declares the install done
+   and ejects the media whatever the agent says. While they are attached
+   the VM counts as installing, and `update --restart` does not restart
+   it unless given `--force-restart`. A golden image or
    template built this way carries no install media and no password ISO.
 4. A new **`unattend:`** block. boxman renders the answer file and builds
    the answer ISO itself, as it already builds NoCloud seeds (with the
