@@ -28,6 +28,7 @@ from typing import Any
 import invoke
 
 from boxman import log
+from boxman.exceptions import ProvisionError
 from boxman.image_cache import ImageCache
 from boxman.loggers.logger import is_verbose
 from boxman.utils.http_download import download_url
@@ -43,7 +44,7 @@ from .cloudinit_presets import (  # noqa: F401 — re-exported for back-compat
 from .cloudinit_presets import (
     hash_password as _hash_password,
 )
-from .commands import VirshCommand, VirtInstallCommand
+from .commands import VirshCommand, VirtInstallCommand, virt_install_path
 from .destroy_vm import shutdown_and_wait as _shutdown_and_wait
 from .destroy_vm import wait_until_shut_off as _wait_until_shut_off
 from .virsh_parse import parse_domblklist
@@ -947,6 +948,16 @@ class CloudInitTemplate:
             image_ext = os.path.splitext(self.image_path)[1] or f".{self.disk_format}"
         dst_image_path = os.path.join(template_dir, f"{self.template_name}{image_ext}")
         seed_iso_path = os.path.join(template_dir, "seed.iso")
+        # a path virt-install cannot be given would fail the same way on
+        # every run: refused before a base image is fetched for it
+        try:
+            for path in (dst_image_path, seed_iso_path):
+                virt_install_path(path, self.template_name)
+        except ProvisionError as exc:
+            self.logger.error(
+                f"cannot create template '{self.template_name}': {exc}")
+            self._report_kept(replacing)
+            return False
         staged = [dst_image_path + self.STAGED_SUFFIX,
                   seed_iso_path + self.STAGED_SUFFIX]
 
@@ -1100,8 +1111,12 @@ class CloudInitTemplate:
             parts.append(f"--vcpus={self.vcpus}")
             parts.append(f"--os-variant={shlex.quote(self.os_variant)}")
             parts.append("--import")
-            parts.append(f"--disk=path={shlex.quote(dst_image_path)},format={self.disk_format},bus=virtio,discard=unmap")
-            parts.append(f"--disk=path={shlex.quote(seed_iso_path)},device=cdrom")
+            # each path quoted for virt-install's parser, then for the
+            # shell: a comma in the workdir ended `path=` there
+            disk = virt_install_path(dst_image_path, self.template_name)
+            seed = virt_install_path(seed_iso_path, self.template_name)
+            parts.append(f"--disk=path={shlex.quote(disk)},format={self.disk_format},bus=virtio,discard=unmap")
+            parts.append(f"--disk=path={shlex.quote(seed)},device=cdrom")
 
             # Use bridge device directly if resolved, otherwise fall back to network name
             if bridge_device:

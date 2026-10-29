@@ -21,7 +21,7 @@ from boxman.exceptions import (
 )
 from boxman.utils.shell import run as _shell_run
 
-from .commands import VirshCommand, VirtInstallCommand
+from .commands import VirshCommand, VirtInstallCommand, virt_install_path
 from .disk import create_image_exclusive, libvirt_disk_source
 
 #: The virtio-serial port name the QEMU guest agent listens on.
@@ -238,6 +238,9 @@ class DirectInstallVM:
         # they run (the docker-compose runtime's container has another cwd)
         disk_path = libvirt_disk_source(
             os.path.join(self.workdir, f"{self.vm_name}.qcow2"))
+        # likewise a boot-disk path virt-install cannot be given (a workdir
+        # holding a quote): refused before qemu-img writes the image there
+        disk_value = virt_install_path(disk_path, self.vm_name)
         disk_size = self._boot_disk_size()
         # `or` (not .get default) so an explicit null in YAML still falls back
         memory = self.info.get("memory") or 2048
@@ -254,8 +257,10 @@ class DirectInstallVM:
         parts.append(f"--name={self.vm_name}")
         parts.append(f"--memory={memory}")
         parts.append(f"--vcpus={vcpus}")
+        # quoted for virt-install's parser, then for the shell: a comma in
+        # the workdir (a project directory `lab,v2`) ended `path=` there
         parts.append(
-            f"--disk=path={shlex.quote(disk_path)},format=qcow2,driver.type=qcow2,bus=virtio,discard=unmap")
+            f"--disk=path={shlex.quote(disk_value)},format=qcow2,driver.type=qcow2,bus=virtio,discard=unmap")
         for spec in network_specs:
             net_arg = f"--network=network={spec['name']},model=virtio"
             if spec["mac"]:

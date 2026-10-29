@@ -5,7 +5,7 @@ from typing import Any
 import invoke
 
 from boxman import log
-from boxman.exceptions import ConfigError
+from boxman.exceptions import ConfigError, ProvisionError
 from boxman.runtime.docker_compose import docker_exec_wrap
 from boxman.utils.shell import run as _shell_run
 
@@ -446,6 +446,57 @@ class VirshCommand(LibVirtCommandBase):
             Result of the command execution
         """
         return super().execute(cmd, *args, **kwargs)
+
+
+#: What virt-install cannot be given in a file path, by any option.
+#: virtinst escapes each value it sets in the domain XML (``xml_escape``)
+#: and libxml2 escapes it again, so ``/lab's/x.iso`` is defined as
+#: ``/lab&apos;s/x.iso``, another file (virt-install 5.0.0 with libxml2
+#: 2.9.13, through ``--disk path=`` and ``--cdrom`` alike; ``--print-xml``
+#: shows it).
+VIRT_INSTALL_UNPASSABLE = "&'\"<>"
+
+#: What virt-install's own parser reads specially in a sub-option string
+#: such as ``--disk path=…,device=cdrom``. It splits the string with
+#: ``shlex`` in POSIX mode with ``,`` as the only separator (virtinst's
+#: ``cli.parse_optstr_tuples``): a comma ends the value, and the rest is
+#: read as further sub-options; a backslash escapes the next character
+#: and is dropped. Doubling the comma does not escape it -- that is
+#: QEMU's ``-drive`` syntax, and virt-install reads ``,,`` as one
+#: separator. Single quotes do.
+_VIRT_INSTALL_SUB_OPTION_SPECIAL = ",\\"
+
+
+def virt_install_path(path: str, vm_name: str, sub_option: bool = True) -> str:
+    """
+    *path* as virt-install must be given it to read it back unchanged.
+
+    As a sub-option value (``--disk path=<it>,…``) a path holding a comma
+    or a backslash is single-quoted for virt-install's parser; with
+    *sub_option* false it is a whole option value (``--cdrom=<it>``),
+    which virt-install does not split, and is returned as it is. Quoting
+    for the shell stays the caller's: this is what virt-install itself
+    has to see.
+
+    Raises:
+        ProvisionError: *path* holds a character virt-install cannot be
+            given (:data:`VIRT_INSTALL_UNPASSABLE`); raised before
+            virt-install runs, naming *vm_name* and *path*.
+    """
+    held = [c for c in VIRT_INSTALL_UNPASSABLE if c in path]
+    if held:
+        raise ProvisionError(
+            f"vm {vm_name}: virt-install cannot be given the path {path}: "
+            f"it holds {' '.join(held)}, which virt-install writes into "
+            f"the domain definition escaped twice (' becomes &apos;), so "
+            f"the domain would name another file. Rename the file or "
+            f"directory so that its path holds none of "
+            f"{' '.join(VIRT_INSTALL_UNPASSABLE)}.")
+    if sub_option and any(c in path for c in _VIRT_INSTALL_SUB_OPTION_SPECIAL):
+        # inside single quotes shlex reads every character as itself, and
+        # the path holds no single quote: that was refused above
+        return f"'{path}'"
+    return path
 
 
 class VirtInstallCommand(LibVirtCommandBase):

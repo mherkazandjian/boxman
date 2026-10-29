@@ -175,6 +175,8 @@ class TestSshAliasOfANullHostname:
             lambda name: {"eth0": f"192.168.10.{name[-1]}"})
         manager.session_for_cluster = lambda cluster_name: session
         manager._docker_ssh_jump_stanza = lambda: None
+        # connect_info reads the VMs' states; unknown, it asks every VM
+        manager._vm_states_if_known = lambda: None
         return manager
 
     def test_the_written_ssh_config(self, tmp_path):
