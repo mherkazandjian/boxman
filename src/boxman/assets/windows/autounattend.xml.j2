@@ -20,8 +20,9 @@
     timezone       UTC unless set
     virtio_os      the virtio-win driver directory, 2k22 unless set
 
-  Assumes SeaBIOS (MBR partitioning), a virtio-blk boot disk and a virtio-net
-  NIC, which is what boxman's IsoBootVM creates, and the virtio-win ISO
+  Assumes SeaBIOS (MBR partitioning), a virtio-blk boot disk, a virtio-net
+  NIC and a UTC real-time clock, which is what boxman's IsoBootVM creates
+  for an os: windows VM, and the virtio-win ISO
   attached as a CD-ROM, so WinPE can load viostor and NetKVM before it looks
   for a disk.
 -#}
@@ -104,6 +105,19 @@
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <ComputerName>{{ computer_name }}</ComputerName>
       <TimeZone>{{ timezone }}</TimeZone>
+    </component>
+    <!-- boxman gives an os: windows domain a UTC real-time clock; without
+         this Windows reads the RTC as the time zone's local time. Read at
+         boot, so from the reboot into OOBE on. -->
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>The real-time clock holds UTC</Description>
+          <Path>reg add HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation /v RealTimeIsUniversal /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
     </component>
   </settings>
 
