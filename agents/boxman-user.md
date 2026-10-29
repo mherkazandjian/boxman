@@ -854,6 +854,54 @@ clusters:
 
 ---
 
+## Windows guests (`os: windows`)
+
+A per-VM `os:` key, `linux` by default. An `os: windows` VM that boots from
+an ISO is installed unattended; `boxes/windows-server-2022-iso-boot` is the
+example (Server 2022 Core evaluation, SeaBIOS, OpenSSH only).
+
+```yaml
+vms:
+  win01:
+    os: windows
+    admin_pass: '{{ env("BOXMAN_WIN_ADMIN_PASS") }}'  # never a literal in the box
+    boot_order: [cdrom, hd]
+    disk_size: 40G
+    os_variant: win2k22
+    cdroms:
+      - { name: winsrv2022-eval, install_only: true }
+      - { name: virtio-win, source: /usr/share/virtio-win/virtio-win.iso, install_only: true }
+    # unattend: {template: ./a.xml.j2, files: [./setup.ps1], image_index: 2,
+    #            vars: {timezone: ...}}   # optional; false = install by hand
+```
+
+- **The answer ISO** is boxman's: it renders `autounattend.xml` (its own
+  template by default, Jinja with conf.yml's `env()`, values XML-escaped)
+  and writes it, `boxman-setup.ps1` and `authorized_keys` (cluster key +
+  `ssh.authorized_keys`) to `<workdir>/<domain>-unattend.iso`, mode 0600.
+  It is an install-only cdrom boxman adds, ejected with the others once the
+  install is done, and deleted then, and with the VM. `update` never needs
+  the password; the `up` that creates the VM does.
+- **Refused before anything is built:** an `admin_pass` Windows' default
+  policy would refuse (8+ chars, 3 of upper/lower/digit/symbol, no account
+  name), a computer name (`hostname:` or key) that is not a NetBIOS name,
+  an answer file that does not render into XML, `cloudinit*` keys, a
+  `base_image` that is a `templates:` entry, `clone_*: required`, and an
+  unattended install under a non-local runtime.
+- **ssh:** user `Administrator`, or the VM's/cluster's `admin_user` (created
+  in Administrators by the default answer file); the key comes from the
+  answer ISO, so no `ssh-copy-id` push; `boxman ssh <cluster>_<vm>` opens
+  PowerShell. The inventory host gets `ansible_shell_type: powershell`
+  (Ansible needs the `ansible.windows` collection for its Windows modules).
+- **Clock:** the domain gets `--clock offset=utc` and the answer file sets
+  `RealTimeIsUniversal`; virt-install's default `localtime` put a UTC guest
+  an hour ahead on a CET host.
+- **Timing:** about 2 min to the installed system's DHCP lease (the first
+  `up`'s IP wait), 3-3.5 min to `boxman-setup: done`; the Server 2022
+  OpenSSH Feature on Demand needs guest internet.
+
+---
+
 ## PXE boot (Cobbler / network install)
 
 1. **Declare the VM with `boot_order: [network, hd]`.** boxman then creates a
