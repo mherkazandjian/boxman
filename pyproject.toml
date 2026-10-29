@@ -40,17 +40,15 @@ include = [
     { path = "boxes/*/*.md", format = ["sdist", "wheel"] },
     { path = "boxes/*/configs/*.j2", format = ["sdist", "wheel"] },
     { path = "boxes/*/site/*.html", format = ["sdist", "wheel"] },
-    # what a box runs outside boxman: its Makefile, the templates it
-    # renders (answer.toml.tmpl, autounattend.xml.in), the scripts,
-    # the guest-side setup script and its terraform. The scripts keep their
-    # mode: the wheel marks a file executable when git has it so, and pip
-    # restores that, which `./make-answer-iso.sh` and the Makefile's
-    # `scripts/ssh-site` need (the *.sh under scripts/ are run with bash).
+    # what a box runs outside boxman: its Makefile, the template it renders
+    # (answer.toml.tmpl), its scripts and its terraform. The scripts keep
+    # their mode: the wheel marks a file executable when git has it so, and
+    # pip restores that, which the Makefile's `scripts/ssh-site` needs (the
+    # *.sh under scripts/ are run with bash). The Windows box's answer-file
+    # template and setup script are no longer box files: they ship as
+    # package data under src/boxman/assets/windows/ (#271).
     { path = "boxes/*/Makefile", format = ["sdist", "wheel"] },
     { path = "boxes/*/*.tmpl", format = ["sdist", "wheel"] },
-    { path = "boxes/*/*.in", format = ["sdist", "wheel"] },
-    { path = "boxes/*/*.sh", format = ["sdist", "wheel"] },
-    { path = "boxes/*/*.ps1", format = ["sdist", "wheel"] },
     { path = "boxes/*/scripts/*.sh", format = ["sdist", "wheel"] },
     { path = "boxes/*/scripts/ssh-site", format = ["sdist", "wheel"] },
     { path = "boxes/*/terraform/*.tf", format = ["sdist", "wheel"] },
