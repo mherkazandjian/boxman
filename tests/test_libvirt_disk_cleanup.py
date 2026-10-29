@@ -208,6 +208,50 @@ class TestTeardownFilesAreStagedBesideThem:
         assert sorted(p.name for p in tmp_path.iterdir()) == ["actual", "link"]
 
 
+class TestTeardownLocatorNamesTheSavedInventory:
+    """A retry reads the inventory the locator names. The locator recorded
+    ``os.path.abspath`` of where it was saved, which folds ``link/..`` as
+    text: for an inventory saved through ``link/..`` it named a file in
+    another directory, missing there (the retry stopped) or a stale one
+    (the retry decided with it)."""
+
+    @staticmethod
+    def _inventory(disk_source: str) -> StorageInventory:
+        return StorageInventory(
+            vm_name="vm01", disk_sources=[disk_source], media_sources=[],
+            records=[], records_state="present", chains={}, boot_family=[],
+            legacy_disks=None)
+
+    @pytest.mark.parametrize("stale", [False, True],
+                             ids=["none-folded", "stale-folded"])
+    @pytest.mark.parametrize("relative", [False, True],
+                             ids=["absolute", "relative"])
+    def test_an_inventory_saved_through_a_symlink_and_dotdot(
+            self, tmp_path: Path, monkeypatch, relative, stale):
+        disks, directory = TestTeardownFilesAreStagedBesideThem._beside_target(
+            tmp_path, "vms")
+        disks.mkdir()
+        if stale:
+            # where link/../vms folds to as text: an earlier inventory there
+            (tmp_path / "vms").mkdir()
+            save_teardown_inventory(self._inventory("/stale.qcow2"),
+                                    str(tmp_path / "vms"))
+        if relative:
+            monkeypatch.chdir(tmp_path)
+            directory = os.path.join("link", "..", "vms")
+        saved = save_teardown_inventory(self._inventory("/current.qcow2"),
+                                        directory)
+        locator = str(tmp_path / "locators" / "vm01.json")
+
+        save_teardown_locator(locator, "vm01", saved)
+
+        located = read_teardown_locator(locator, "vm01")
+        assert os.path.isfile(located), located
+        assert os.path.samefile(located, disks / ".boxman-teardown-vm01.json")
+        assert load_teardown_inventory(located, "vm01").disk_sources == [
+            "/current.qcow2"]
+
+
 class TestRemoveIfUnchanged:
     """The claim rename can fail; its still-empty private directory must
     not be left behind in the workdir (#212 review round 3, R3-1)."""
