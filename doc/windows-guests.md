@@ -383,10 +383,15 @@ Plus `make-answer-iso.sh` to render the answer file.
    `boxman update`. "Done" is what the guest agent of the installed system
    reports: the guest's root on the boot disk. A live installer's root is
    in memory or on the CD, WinPE runs no agent, and an installer mounts
-   its target disk somewhere other than its root, so the signal cannot
-   fire mid-install, on any OS; a guest without an agent keeps its media,
-   and every `up` and `update` says so. `boxman-setup.ps1` installs the
-   agent after the last step that reads the media. A golden image or
+   its target disk somewhere other than its root, so the common installers
+   do not set it off mid-install; a guest without an agent keeps its
+   media, and every `up` and `update` says so. It says the installed
+   system is up, not that it is done with the media: an install whose last
+   stage runs in the installed system with its agent up and still reads
+   them (a first-boot script, AutoYaST's second stage reading the DVD) can
+   lose them. That is why `install_only` is opt-in per medium:
+   `boxman-setup.ps1` installs the agent after the last step that reads
+   the media. A golden image or
    template built this way carries no install media and no password ISO.
 4. A new **`unattend:`** block. boxman renders the answer file and builds
    the answer ISO itself, as it already builds NoCloud seeds (with the

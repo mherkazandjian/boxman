@@ -17,15 +17,22 @@ see is the guest agent of the installed system: the agent lists the guest's
 filesystems, and libvirt maps each one to the domain's disk targets
 (``virsh guestinfo --filesystem``). The install counts as done when the
 guest's root -- ``/``, or a Windows drive root such as ``C:\`` -- lives on
-the VM's boot disk. Nothing that runs during an install says that: a live
-installer's root is in memory or on the CD-ROM, WinPE runs no agent, and an
-installer that mounts its target disk mounts it somewhere other than its
-own root. A guest that runs no agent keeps its install-only media, and
-boxman says so on every ``up`` and ``update``.
+the VM's boot disk. The common installers say nothing like it while they
+run: a live installer's root is in memory or on the CD-ROM, WinPE runs no
+agent, and an installer that mounts its target disk mounts it somewhere
+other than its own root. A guest that runs no agent keeps its install-only
+media, and boxman says so on every ``up`` and ``update``.
 
 So the media go on the first ``up`` or ``update`` that finds the installed
-system's agent answering. A first-boot script that still reads install-only
-media after it starts the agent has to copy what it needs off them first.
+system's agent answering. That is a sign the installed system is up, not
+that it is done with the media: an install whose last stage runs inside
+the installed system, with its agent already up, and still reads them --
+a first-boot script, AutoYaST's second stage reading the DVD -- can lose
+them. Such a stage has to copy what it needs first, or install the agent
+last, as the Windows box's setup script does. That is why
+``install_only`` is opt-in, per medium, rather than the default for every
+cdrom of an ISO-boot VM: only the box knows when its install is done with
+a medium.
 """
 
 from __future__ import annotations

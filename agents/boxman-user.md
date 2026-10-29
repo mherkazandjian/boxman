@@ -796,14 +796,19 @@ clusters:
   that finds the VM running and its guest agent reporting the guest's root
   (`/`, or a drive root such as `C:\`) on the boot disk, via `virsh
   guestinfo --filesystem`. A live installer's root is in memory, WinPE runs
-  no agent, and an installer mounts its target elsewhere, so nothing during
-  an install says that. Until then each run logs why the media stay and the
-  `virsh change-media … --eject` command to do it by hand; a guest that runs
-  no agent keeps them. `update` never compares an install-only entry: it is
-  neither put back after the eject nor detached mid-install, and its ISO is
-  neither checksummed nor downloaded by `update`. `update --dry-run` says
-  what it would eject. A first-boot script that reads install-only media
-  after it starts the guest agent must copy what it needs first.
+  no agent, and an installer mounts its target elsewhere, so the common
+  installers do not say that mid-install. It means the installed system is
+  up, not that it is done with the media: a last install stage that runs in
+  the installed system with its agent up and still reads them (AutoYaST's
+  second stage, a first-boot script) can lose them, which is why
+  `install_only` is opt-in per medium. Until then each run logs why the
+  media stay and the `virsh change-media … --eject` command to do it by
+  hand; a guest that runs no agent keeps them. `update` never compares an
+  install-only entry: it is neither put back after the eject nor detached
+  mid-install, and its ISO is neither checksummed nor downloaded by
+  `update`. `update --dry-run` says what it would eject. A first-boot
+  script that reads install-only media after it starts the guest agent
+  must copy what it needs first.
 - **`os_variant:`** (e.g. `win2k22`, `ubuntu24.04`; `osinfo-query os` lists
   them) sets virt-install's `--os-variant`, which picks device defaults such
   as the clock. Without it, virt-install detects the OS from the boot ISO with
