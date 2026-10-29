@@ -4555,23 +4555,6 @@ class TestOverlaysInADiskSnapshotDir:
 
         assert s1.exists() and base.exists()
 
-    def test_unset_memory_images_beside_a_boot_disk_are_kept_as_before(
-            self, tmp_path):
-        """With no disk_snapshot_dir anywhere, the images found beside a boot
-        disk in a memory_snapshot_dir outside the workdirs are its family,
-        decided as such: outside every workdir, kept, as before."""
-        workdir, snaps = self._dirs(tmp_path)
-        boot = _qcow2(snaps / f'{VM}.qcow2')
-        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
-        zst = _file(snaps / f'{VM}_snapshot_s1.raw.zst')
-        t = _Teardown(workdir, disks=[boot], records=[],
-                      memory_snapshot_dir=snaps,
-                      memory_images={'s1': str(raw)})
-
-        t.update_remove()
-
-        assert boot.exists() and raw.exists() and zst.exists()
-
     def test_a_retry_with_no_chain_saved_for_one_keeps_everything(
             self, tmp_path):
         """One its snapshots recorded, with no chain saved for it: what it

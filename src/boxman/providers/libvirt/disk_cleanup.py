@@ -1076,7 +1076,7 @@ def remove_vm_storage(
     for path in inventory.boot_family:
         if path in extra_related and media_refusal(path) is None:
             continue
-        if (overlay_dirs and is_memory_image(vm, path)
+        if (is_memory_image(vm, path)
                 and real(os.path.dirname(path)) not in real_workdirs
                 and _directory_is_one_of(path, memory_ids)):
             # what its snapshots recorded decides it (1b), but every refusal
