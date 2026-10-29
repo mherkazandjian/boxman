@@ -281,6 +281,16 @@ class DirectInstallVM:
         if not any(GUEST_AGENT_CHANNEL in arg for arg in extra_args):
             parts.append(
                 f"--channel=unix,target.type=virtio,name={GUEST_AGENT_CHANNEL}")
+        # virt-install gives a Windows guest <clock offset='localtime'>: the
+        # RTC carries the host's local time. The answer file sets a time
+        # zone, UTC by default, and Windows read the RTC as that zone's
+        # time, so on a CET host the guest's clock ran an hour ahead. An
+        # os: windows VM gets a UTC RTC instead, and its answer file tells
+        # Windows so (RealTimeIsUniversal), whatever its time zone. A box
+        # that passes its own --clock keeps it.
+        if (self.info.get("os") == "windows"
+                and not any(arg.startswith("--clock") for arg in extra_args)):
+            parts.append("--clock=offset=utc")
         for extra in extra_args:
             parts.append(extra)
 

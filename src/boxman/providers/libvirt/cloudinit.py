@@ -47,6 +47,7 @@ from .cloudinit_presets import (
 from .commands import VirshCommand, VirtInstallCommand, virt_install_path
 from .destroy_vm import shutdown_and_wait as _shutdown_and_wait
 from .destroy_vm import wait_until_shut_off as _wait_until_shut_off
+from .iso_image import build_iso
 from .virsh_parse import parse_domblklist
 
 
@@ -210,20 +211,16 @@ class CloudInitTemplate:
             return True
 
         # Fallback: include network-config in the ISO if present
-        extra_files = ""
+        files = [os.path.join(nocloud_dir, 'user-data'),
+                 os.path.join(nocloud_dir, 'meta-data')]
         if os.path.exists(network_config_path):
-            extra_files = f" {shlex.quote(network_config_path)}"
+            files.append(network_config_path)
 
-        for tool in ("genisoimage", "mkisofs", "xorrisofs"):
-            result = self.virsh.execute_shell(
-                f"{tool} -output {shlex.quote(seed_iso_path)} -volid cidata -joliet -rock "
-                f"{shlex.quote(os.path.join(nocloud_dir, 'user-data'))} "
-                f"{shlex.quote(os.path.join(nocloud_dir, 'meta-data'))}{extra_files}",
-                hide=not is_verbose(logging.DEBUG), warn=True,
-            )
-            if result.ok:
-                self.logger.info(f"seed ISO created with {tool}")
-                return True
+        tool = build_iso(self.virsh.execute_shell, seed_iso_path, "cidata",
+                         files)
+        if tool:
+            self.logger.info(f"seed ISO created with {tool}")
+            return True
 
         self.logger.error(
             "failed to create seed ISO. Install one of: "

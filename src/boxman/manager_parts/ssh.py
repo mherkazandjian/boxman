@@ -339,7 +339,7 @@ class SSHMixin:
                     self.logger.status("  ip addresses: not available")
 
                 # get ssh connection information
-                admin_user = cluster.get('admin_user', '<placeholder>')
+                admin_user = self.ssh_user(cluster, vm_info, '<placeholder>')
                 base_path = ws_path or cluster.get('workdir', '~')
                 admin_key = os.path.expanduser(os.path.join(
                     base_path,
@@ -549,9 +549,10 @@ class SSHMixin:
                         'label': f"{cluster_name}/{vm_name}",
                         'alias': prefixed_host,
                         'node': padded_alias,
-                        'user': cluster.get("admin_user", "admin"),
+                        'user': self.ssh_user(cluster, vm_info, 'admin'),
                         'identity_file': admin_priv_key,
-                        'keys': keys,
+                        # a Windows VM's key is not ssh-copy-id's to add
+                        'keys': keys and not self.is_windows(vm_info),
                         'address': None,
                         # set only for a VM known not to be running
                         'state': None,
@@ -923,12 +924,23 @@ class SSHMixin:
 
             targets = []
             left_out = []
+            windows = 0
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 label = f"{cluster_name}/{vm_name}"
                 state = (None if vm_states is None
                          else vm_states.get(full_vm_name, 'not defined'))
-                if state in self._NOT_RUNNING_STATES:
+                if self.is_windows(vm_info):
+                    # sshd reads administrators_authorized_keys for an
+                    # administrator, not the ~/.ssh/authorized_keys
+                    # ssh-copy-id writes: the copy would succeed and still
+                    # not let the key in. The key went in with the answer ISO.
+                    windows += 1
+                    self.logger.info(
+                        f"not adding the ssh key to vm {label} with "
+                        f"ssh-copy-id: it runs Windows, and its key is "
+                        f"installed from its answer ISO")
+                elif state in self._NOT_RUNNING_STATES:
                     self.logger.info(
                         f"not adding the ssh key to vm {label}: it is not "
                         f"running ({state})")
@@ -936,6 +948,10 @@ class SSHMixin:
                     left_out.append(label)
                 else:
                     targets.append((vm_name, vm_info, full_vm_name, label))
+
+            if windows and not targets and not left_out:
+                # nothing here for ssh-copy-id, so no admin_pass is missing
+                continue
 
             raw_pass = cluster.get('admin_pass')
             admin_pass = None

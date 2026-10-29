@@ -1,4 +1,4 @@
-# First-logon setup for the windows-server-2022-iso-boot box.
+# boxman's default first-logon setup for an `os: windows` VM (unattend:).
 #
 # Runs once, as Administrator, from the answer ISO (FirstLogonCommands).
 # Every step runs even when an earlier one failed, and all of it is logged
@@ -7,7 +7,13 @@
 #
 # The CD-ROMs are install-only: boxman ejects them on the first `up` or
 # `update` that finds the QEMU guest agent answering. So nothing is read off
-# them after step 1 installs the agent; the public key is read first.
+# them after step 1 installs the agent; the public keys boxman put on the
+# answer ISO (the cluster's, and boxman.yml's ssh.authorized_keys) are read
+# first.
+#
+# OpenSSH is the only remote access it sets up, and the only one boxman
+# uses. It does not touch WinRM, which Windows Server itself enables (HTTP
+# 5985, Negotiate auth), or RDP, which stays off.
 
 Start-Transcript -Path C:\boxman-setup.log -Append
 $ErrorActionPreference = 'Continue'
@@ -35,8 +41,8 @@ function Install-Msi($relpath) {
     if ($p.ExitCode -notin 0, 3010) { Fail "$msi (msiexec exit code $($p.ExitCode))" }
 }
 
-# 0. The optional public key for Administrator, read now: the media may be
-#    gone by step 4.
+# 0. The public keys for Administrator, read now: the media may be gone by
+#    step 3.
 $authorizedKeys = $null
 $key = Find-Media 'authorized_keys'
 if ($key) { $authorizedKeys = Get-Content -Raw -Path $key }
@@ -51,14 +57,7 @@ Install-Msi 'guest-agent\qemu-ga-x86_64.msi'
 Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private
 Enable-NetFirewallRule -Name 'FPS-ICMP4-ERQ-In' -ErrorAction SilentlyContinue
 
-# 3. WinRM over HTTP (5985) with the default Negotiate/NTLM auth and message
-#    encryption -- no Basic, no AllowUnencrypted. Ansible: winrm + ntlm.
-try {
-    Enable-PSRemoting -Force -SkipNetworkProfileCheck -ErrorAction Stop
-    Set-Item -Path WSMan:\localhost\Service\Auth\Basic -Value $false -ErrorAction Stop
-} catch { Fail "WinRM: $_" }
-
-# 4. OpenSSH server. On Server 2022 it is a Feature on Demand fetched from
+# 3. OpenSSH server. On Server 2022 it is a Feature on Demand fetched from
 #    Windows Update, so this needs the guest to reach the internet.
 try {
     $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
@@ -77,17 +76,18 @@ if (Get-Service sshd -ErrorAction SilentlyContinue) {
         New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' `
             -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
     }
-    # The public key read in step 0 (members of Administrators read this
-    # file, not ~/.ssh/authorized_keys).
+    # The public keys read in step 0. sshd reads this file, not
+    # ~/.ssh/authorized_keys, for every member of Administrators, which is
+    # why boxman does not push a key with ssh-copy-id.
     if ($authorizedKeys) {
         $dst = 'C:\ProgramData\ssh\administrators_authorized_keys'
         Set-Content -Path $dst -Value $authorizedKeys -NoNewline -Encoding ascii
         icacls.exe $dst /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
         if ($LASTEXITCODE -ne 0) { Fail "authorized_keys (icacls exit code $LASTEXITCODE)" }
-    }
+    } else { Fail 'no authorized_keys on the answer ISO: nothing can log in over ssh' }
 } else { Fail 'sshd not available (OpenSSH capability did not install)' }
 
-# 5. Auto-logon off. LogonCount 1 allows no second auto-logon, but it leaves
+# 4. Auto-logon off. LogonCount 1 allows no second auto-logon, but it leaves
 #    AutoAdminLogon set until Windows clears it at the next boot. Clear it
 #    now, with the count and any stored password.
 $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'

@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="utf-8"?>
+{#-
+  boxman's default answer file: an unattended Windows Server 2022 install on
+  libvirt/KVM (an `os: windows` VM with `unattend:`, doc/windows-guests.md).
+
+  boxman renders it with Jinja -- the env() helpers of conf.yml, and every
+  value autoescaped for XML -- and writes the result onto the VM's answer
+  ISO, never anywhere else: it holds the Administrator password in plain
+  text. These comments are Jinja's, so none of them reaches the guest.
+
+  Variables (an `unattend: vars:` entry overrides any of them):
+    admin_pass     the Administrator password (the VM's or cluster's
+                   admin_pass), checked against Windows' complexity rule
+    admin_user     the ssh user; an account other than Administrator is
+                   created, in Administrators, with the same password
+    computer_name  the VM's hostname: or key, a valid NetBIOS name
+    image_index    the install.wim image: on the 2022 evaluation ISO, 1 is
+                   Standard Core, 2 Standard with Desktop Experience
+    locale         en-US unless set
+    timezone       UTC unless set
+    virtio_os      the virtio-win driver directory, 2k22 unless set
+
+  Assumes SeaBIOS (MBR partitioning), a virtio-blk boot disk, a virtio-net
+  NIC and a UTC real-time clock, which is what boxman's IsoBootVM creates
+  for an os: windows VM, and the virtio-win ISO
+  attached as a CD-ROM, so WinPE can load viostor and NetKVM before it looks
+  for a disk.
+-#}
+{%- set locale = locale | default('en-US') %}
+{%- set timezone = timezone | default('UTC') %}
+{%- set virtio_os = virtio_os | default('2k22') %}
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <SetupUILanguage><UILanguage>{{ locale }}</UILanguage></SetupUILanguage>
+      <InputLocale>{{ locale }}</InputLocale>
+      <SystemLocale>{{ locale }}</SystemLocale>
+      <UILanguage>{{ locale }}</UILanguage>
+      <UserLocale>{{ locale }}</UserLocale>
+    </component>
+
+    <!-- The CD-ROM letters are not fixed, so offer every likely one; Setup
+         skips paths that do not exist. -->
+    <component name="Microsoft-Windows-PnpCustomizationsWinPE" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <DriverPaths>
+{%- for driver in ('viostor', 'NetKVM') %}
+{%- set outer = loop.index0 %}
+{%- for letter in ('D', 'E', 'F') %}
+        <PathAndCredentials wcm:action="add" wcm:keyValue="{{ outer * 3 + loop.index }}"><Path>{{ letter }}:\{{ driver }}\{{ virtio_os }}\amd64</Path></PathAndCredentials>
+{%- endfor %}
+{%- endfor %}
+      </DriverPaths>
+    </component>
+
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order><Type>Primary</Type><Size>500</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order><Type>Primary</Type><Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order><PartitionID>1</PartitionID>
+              <Format>NTFS</Format><Label>System</Label><Active>true</Active>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order><PartitionID>2</PartitionID>
+              <Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/INDEX</Key><Value>{{ image_index }}</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo><DiskID>0</DiskID><PartitionID>2</PartitionID></InstallTo>
+        </OSImage>
+      </ImageInstall>
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        <FullName>boxman</FullName>
+        <Organization>boxman</Organization>
+      </UserData>
+    </component>
+  </settings>
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>{{ computer_name }}</ComputerName>
+      <TimeZone>{{ timezone }}</TimeZone>
+    </component>
+    <!-- boxman gives an os: windows domain a UTC real-time clock; without
+         this Windows reads the RTC as the time zone's local time. Read at
+         boot, so from the reboot into OOBE on. -->
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>The real-time clock holds UTC</Description>
+          <Path>reg add HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation /v RealTimeIsUniversal /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <UserAccounts>
+        <AdministratorPassword>
+          <Value>{{ admin_pass }}</Value><PlainText>true</PlainText>
+        </AdministratorPassword>
+{%- if admin_user | lower != 'administrator' %}
+        <!-- the ssh user; as a member of Administrators it reads the same
+             administrators_authorized_keys -->
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>{{ admin_user }}</Name>
+            <Group>Administrators</Group>
+            <Password><Value>{{ admin_pass }}</Value><PlainText>true</PlainText></Password>
+          </LocalAccount>
+        </LocalAccounts>
+{%- endif %}
+      </UserAccounts>
+      <!-- One automatic logon, so FirstLogonCommands run. LogonCount 1 allows
+           no second one; boxman-setup.ps1 also turns auto-logon off, and logs
+           that session off, when it is done. -->
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <LogonCount>1</LogonCount>
+        <Username>Administrator</Username>
+        <Password><Value>{{ admin_pass }}</Value><PlainText>true</PlainText></Password>
+      </AutoLogon>
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>boxman guest setup (drivers, agent, OpenSSH)</Description>
+          <CommandLine>cmd /c for %d in (D E F G) do @if exist %d:\boxman-setup.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File %d:\boxman-setup.ps1</CommandLine>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>

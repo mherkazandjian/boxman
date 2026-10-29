@@ -53,6 +53,11 @@ class FlowsMixin:
         self.validate_direct_boot_config()
         self.validate_clone_identity_config()
         self.validate_iso_runtime()
+        # os: windows, and the answer ISOs of the VMs this run installs: a
+        # password Windows would refuse at OOBE stops the run here, not a
+        # guest at a prompt nobody answers
+        self.validate_guest_os_config()
+        self.validate_answer_media()
 
         # --- Pre-check: detect state that would block a clean provision ---
         # Block on either (a) live VMs from this project, or (b) a stale

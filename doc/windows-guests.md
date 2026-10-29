@@ -7,20 +7,22 @@ proposal, and the open questions. The proof-of-concept box is
 
 ## 1. Answer
 
-**Yes for a single installed guest, today, with one small boxman fix (G1,
-in this branch). Not yet as a template that boxman clones.**
+**Yes for a single installed guest: `os: windows` plus an ISO is a box
+boxman installs unattended and reaches with `boxman ssh` (Phase 1, §5.2).
+Not yet as a template that boxman clones.**
 
 The PoC box installs Windows Server 2022 (Server Core, evaluation) unattended
 through boxman's existing ISO-boot path (`boot_order: [cdrom, hd]` →
 `IsoBootVM` → `virt-install`). The guest comes up with all virtio drivers
-and the QEMU guest agent, and is reachable by Ansible over **both** WinRM and
-OpenSSH (`ansible.windows.win_ping` → `pong` on both). The install takes 3 to
-3.5 minutes of active time on the test host (§2).
+and the QEMU guest agent. During the spike it was reachable by Ansible over
+**both** WinRM and OpenSSH (`ansible.windows.win_ping` → `pong` on both);
+Phase 1 keeps OpenSSH only (§3.4). The install takes 3 to 3.5 minutes of
+active time on the test host (§2).
 
 It needs no workaround in `virt_install_extra_args` any more, down from
-five: G1 to G4 and G7 are fixed. Each pointed at a small, specific gap in
-boxman (§4). None of them were architectural. The answer ISO is still
-built by a script in the box until boxman builds it itself (§5.2 item 4).
+five, and no script: G1 to G5 and G7 are fixed, and boxman builds the
+answer ISO itself (`unattend:`). Each gap pointed at a small, specific
+place in boxman (§4). None of them were architectural.
 Clone-based Windows boxes, which would match how every Linux box works, need
 more: a sysprep'd local template plus cloudbase-init, and boxman's
 Linux-only clone-identity pass switched off (§5).
@@ -87,6 +89,35 @@ and `boxman update --dry-run` found no changes. `boxman destroy -y` then
 removed the domain, its network and the workspace, and left the cached ISO
 (sha256) and the RPM's virtio-win ISO (`rpm -V`) as they were.
 
+Phase 1 (`os: windows`, `unattend:`, install-only media) was verified with
+fresh installs of the box as committed, under its own project and network,
+on the first test host:
+
+- the answer ISO was built 0600 in the workspace (libvirt had given it to
+  root by the time the guest ran); the password appeared in no log line;
+- `boxman-setup: done` came 3 min 10 s and 3 min 21 s after `boxman up`
+  started; `ssh Administrator@…` with the cluster key worked, `boxman ssh`
+  opened PowerShell, and Ansible's `raw` worked through the generated
+  inventory (`ansible_shell_type: powershell`); `win_ping` was not run, as
+  the `ansible.windows` collection was not installed on that host;
+- with `admin_user: boxadmin` the account was created in Administrators,
+  the ssh config named it, and it logged in with the same key;
+- in one run the agent was up by the end of the first `up`'s 123 s IP
+  wait, and that `up` ejected all three media and deleted the answer ISO,
+  while setup went on to finish; in the other, the first `up` kept them
+  (no agent yet) and the second ejected them. In both, `domblklist` showed
+  three empty drives, live and persistent;
+- an `update --dry-run` 45 s into an install (WinPE) reported no changes
+  and kept the media, naming the agent that did not answer;
+- after the eject, `update --dry-run` found no changes and a further `up`
+  did nothing; `boxman destroy -y`, once after the eject and once in the
+  middle of an install, removed the domain, its network, the workspace and,
+  in the second case, the answer ISO, and left the cached ISO (sha256) and
+  the RPM's virtio-win ISO (`rpm -V`) as they were;
+- a parallel test on the same host found the guest's clock an hour ahead
+  (`<clock offset='localtime'>` read as UTC); with `--clock offset=utc` and
+  `RealTimeIsUniversal` the guest's and the host's epoch agreed.
+
 Not tested: Windows 11 / Server 2025, UEFI + Secure Boot + TPM, Desktop
 Experience, cloudbase-init, sysprep + clone, snapshots of a Windows guest,
 the docker runtime (boxman refuses ISO boot there anyway).
@@ -128,12 +159,13 @@ Things learned about the answer file:
 - **No product key** is needed for evaluation media.
 - **A malformed answer file fails only at boot.** The first draft had `--`
   inside an XML comment, which is invalid XML (caught by `xmllint`, not by
-  booting). The render script now runs `xmllint` first.
+  booting). boxman now parses the rendered file before it builds the ISO.
 - **Secrets.** `AdministratorPassword` and `AutoLogon` are plain text in the
   answer file (`<PlainText>false</PlainText>` is only base64). The file is
-  rendered from a template at build time, the ISO is written mode 0600, and
-  nothing rendered is committed. On this host libvirt then chowns it to root
-  while attached. In the guest, Setup keeps the `AutoLogon` password as the
+  rendered from a template at build time, the ISO is written mode 0600 into
+  the workspace, and nothing rendered is committed. On this host libvirt
+  then chowns it to root while attached, and boxman deletes it once it is
+  ejected, or with the VM. In the guest, Setup keeps the `AutoLogon` password as the
   LSA secret `DefaultPassword` (not the registry value of that name), and it
   was still there after the one logon and two reboots, so `boxman-setup.ps1`
   deletes it. Without that, every snapshot or copy of the disk carries it.
@@ -214,7 +246,10 @@ opt-in.**
 | Weakness | | NTLM over HTTP is message-encrypted but NTLM itself is weak (relay, offline cracking of captured exchanges); acceptable on a host-only NAT, not on a shared network. Stronger: HTTPS listener (5986) with a self-signed cert boxman would generate, or Kerberos, which needs a domain. CredSSP only for double-hop |
 | Gotcha | for members of Administrators, sshd ignores `~\.ssh\authorized_keys`, so boxman's `ssh-copy-id` push (§4 G5) would "succeed" and still not work | HTTPS (5986) needs a certificate; Kerberos needs a domain |
 
-The PoC enables both, so either can be dropped later without rebuilding.
+The PoC enabled both. Phase 1 settled on OpenSSH alone (§6, Q5): boxman's
+setup script no longer configures WinRM, and nothing in boxman uses it.
+Windows Server still runs its own WinRM listener (HTTP 5985, Negotiate) by
+default; the setup script leaves it as Windows has it.
 RDP is left off: Windows' default, and nothing here needs a desktop
 session. The console is reachable over VNC (`virsh vncdisplay`); it shows
 the logon screen, since the setup script logs its auto-logon session off.
@@ -319,7 +354,7 @@ AMD/KVM is known to be fragile and was not tried.
 | G2 | **The VM stays off after the installer's first reboot.** The install-phase domain has `on_reboot=destroy`; with `--wait=0` nothing restarts it into the final definition | `direct_vm.py` (`--wait=0`) | Windows (and any installer that reboots) stops after phase 1. The first `boxman up` then waits 600 s for an IP and **exits 0** with a warning | none any more (it was a later `'--wait=30'`: virt-install waited out the install phase and restarted the guest, and `boxman up` blocked meanwhile) | **fixed:** no install phase. `IsoBootVM` keeps `--cdrom` and adds `--install no_install=yes`, so virt-install writes one definition (boot `hd,cdrom`, a normal reboot) and the installer's reboot boots the installed disk. Unlike a plain CD-ROM `--disk`, this keeps virt-install's OS detection from the ISO (the `--disk` form loses the OS id, and with it Windows' `localtime` clock). The IP wait stops waiting for a VM that stopped running, with a warning, not an error: the proxmox box's installer powers its VM off by design. A virt-install that failed after defining its domain (a `--wait` that ran out) raises `PartialInstallError` with virt-install's own words, instead of being retried four times into "name already in use" |
 | G3 | **No guest-agent channel.** virt-install adds `org.qemu.guest_agent.0` only for OS variants it knows have an agent (Linux) | `direct_vm.py` | `boxman storage trim`, agent IP lookup, fsinfo and fsfreeze fail ("QEMU guest agent is not configured") | none any more | **fixed in this branch:** `DirectInstallVM` always adds the channel, unless `virt_install_extra_args` already add one (harmless when no agent runs) |
 | G4 | **OS detection picks the wrong version.** With osinfo-db 20250606, `--os-variant=detect=on` identifies the 2022 eval ISO as `win2k25` (20250124 gets `win2k22` right), so the result depends on the host | `direct_vm.py` | wrong libosinfo defaults; it happens to be harmless for 2022 vs 2025 | none any more: `os_variant: win2k22` | **fixed:** an `os_variant:` key for direct-install VMs (ISO and PXE), as templates already have |
-| G5 | **ssh access assumes a Linux guest.** `ssh_config` writes `User admin`; the `admin_pass` key push is `sshpass ssh-copy-id` (to `~/.ssh/authorized_keys`); the generated inventory has no `ansible_connection` or `ansible_shell_type` | `manager_parts/ssh.py`, `manager_parts/workspace.py` | `boxman ssh` and `boxman run` do not reach the guest | the key is baked into the answer ISO; the user is passed by hand | `os: windows` → `User Administrator` (or `admin_user`), the key pushed into `administrators_authorized_keys` by the guest setup (not ssh-copy-id), inventory vars `ansible_shell_type: powershell` (or the WinRM set) |
+| G5 | **ssh access assumes a Linux guest.** `ssh_config` writes `User admin`; the `admin_pass` key push is `sshpass ssh-copy-id` (to `~/.ssh/authorized_keys`); the generated inventory has no `ansible_connection` or `ansible_shell_type` | `manager_parts/ssh.py`, `manager_parts/workspace.py` | `boxman ssh` and `boxman run` do not reach the guest | none any more | **fixed:** `os: windows` → `User Administrator` (or `admin_user`), the cluster key (and boxman.yml's `ssh.authorized_keys`) carried by the answer ISO into `administrators_authorized_keys` by the setup script, no ssh-copy-id, inventory var `ansible_shell_type: powershell` |
 | G6 | the post-provision "eject `seed.iso`" step ran over the ISO-boot VM | `manager_parts/flows.py:194` | **none here.** All three CD-ROMs were still attached afterwards; listed only so that a Windows template using a `cidata` seed checks it | n/a | n/a |
 | G7 | **The answer ISO stays attached for the VM's whole life**, live and persistent, and it holds the Administrator password in plain text. Any process in the guest can read it from the CD | `direct_vm.py` (media given to virt-install stay in the definition) | password exposure inside the guest. And since the answer ISO is not in `cdroms:`, `boxman update` takes it for a removed drive and detaches it, on every run, until it is ejected | none any more (it was a raw `--disk`, ejected by hand once setup was done) | **fixed:** `install_only: true` on a `cdroms:` entry. The medium goes to virt-install like the rest; boxman ejects it (`change-media --eject --force`, the drive stays) on the first `up` or `update`, or at the end of `provision`, that finds the guest agent reporting the guest's root (`/`, `C:\`) on the boot disk (`virsh guestinfo --filesystem`); `update` never compares it, so it is neither put back nor detached mid-install. Phase 2 avoids the password part anyway, because the per-clone secret comes from the cloudbase-init seed |
 
@@ -339,7 +374,7 @@ Two things showed up that are **not** Windows-specific:
 
 ## 5. Design proposal
 
-### 5.1 Today: the PoC box
+### 5.1 Today: the box
 
 ```yaml
 isos:
@@ -348,6 +383,8 @@ isos:
     checksum: sha256:3e4fa6d8…
 vms:
   win01:
+    os: windows                       # G5, and an unattended install
+    admin_pass: '${env:BOXMAN_WIN_ADMIN_PASS}'  # read when the ISO is built
     boot_order: [cdrom, hd]
     disk_size: 40G
     memory: 4096
@@ -358,12 +395,10 @@ vms:
       - name: virtio-win              # host RPM, used in place
         source: /usr/share/virtio-win/virtio-win.iso
         install_only: true
-      - name: answer                  # written by make-answer-iso.sh
-        source: '{{ env("HOME") }}/workspaces/…/answer.iso'
-        install_only: true
+    # the answer ISO is a third, install-only entry boxman adds
 ```
 
-Plus `make-answer-iso.sh` to render the answer file.
+No script: boxman renders its own answer file and builds the answer ISO.
 
 ### 5.2 Phase 1: first-class unattended install (small, and fixes Linux installers too)
 
@@ -397,7 +432,7 @@ Plus `make-answer-iso.sh` to render the answer file.
    the VM counts as installing, and `update --restart` does not restart
    it unless given `--force-restart`. A golden image or
    template built this way carries no install media and no password ISO.
-4. A new **`unattend:`** block. boxman renders the answer file and builds
+4. **Done:** a new **`unattend:`** block. boxman renders the answer file and builds
    the answer ISO itself, as it already builds NoCloud seeds (with the
    seed-ISO helper, generalised to take a label and a list of files):
 
@@ -418,17 +453,55 @@ Plus `make-answer-iso.sh` to render the answer file.
          # boxman public key, and the image index
    ```
 
-   boxman would ship a default `autounattend.xml.j2` and `boxman-setup.ps1`
-   (this PoC's, parameterised), so a minimal Windows VM is `os: windows`
-   plus an ISO. virt-install's own `--unattended` was evaluated and
+   boxman ships a default `autounattend.xml.j2` and `boxman-setup.ps1`
+   (`src/boxman/assets/windows/`, the PoC's, parameterised), so a minimal
+   Windows VM is `os: windows` plus an ISO and a password: `unattend:` is
+   implied for an `os: windows` ISO-boot VM, and `unattend: false` turns
+   it off for an install by hand. As built:
+
+   - The template is rendered with conf.yml's `env()` helpers, every value
+     escaped for XML and an undefined name an error, from `admin_pass`,
+     `admin_user` (created in Administrators when it is not
+     Administrator), `computer_name` (`hostname:` or the VM key, a NetBIOS
+     name), `image_index` (1, Server Core), and `unattend: vars:`, which
+     also set `locale`, `timezone` and `virtio_os` (but none of the
+     values boxman derives). It must render into well-formed XML.
+     `files:` replaces the default script list. The template and files
+     are looked for only when a VM is about to be created.
+   - The password comes from `admin_pass` on the VM or the cluster, as a
+     reference (`${env:BOXMAN_WIN_ADMIN_PASS}`, `file://`) read only when
+     the ISO is built: through the `env()` template helper it would pass
+     through the YAML, where a quote breaks the file, and land in
+     `conf.rendered.yml`. It is checked against Windows' complexity rule
+     (8+ characters, 3 of Microsoft's categories, no account name) before
+     anything is built, without being echoed.
+   - The answer ISO (`BOXMAN_ANSWER`: `autounattend.xml`, the files,
+     `authorized_keys`) is staged in a 0700 directory, written 0600 and
+     moved into place, in the cluster workdir as
+     `<domain>-unattend.iso`, never under the box (`*-unattend.iso` is
+     gitignored, and a workdir inside a git work tree gets a warning). It
+     is an install-only cdrom boxman adds to the VM, so it is ejected with
+     the rest (G7); the file is deleted then, when the create fails
+     before the domain exists, and with the VM. libvirt's
+     `dynamic_ownership` hands it to qemu while the VM runs. The cloud-init
+     seed still has no such policy (#197).
+   - The domain gets `--clock offset=utc`, and the answer file sets
+     `RealTimeIsUniversal`: virt-install's `localtime` clock for Windows,
+     read as UTC by a guest in UTC, put it an hour ahead on a CET host.
+
+   virt-install's own `--unattended` was evaluated and
    rejected: with osinfo-db 20250124 it refuses `win2k22` (no Windows Server
    2022 template), and its Windows templates need a product key and inject
    no virtio drivers.
-5. **`os: windows` switches** (G5): ssh user `Administrator` (or
-   `admin_user`); the boxman key goes in through the answer ISO, not
-   `ssh-copy-id`; inventory gets `ansible_shell_type: powershell` (or the
-   WinRM vars when `transport: winrm`); clone identity is forced `off`; no
-   `cloudinit:` allowed.
+5. **Done: `os: windows` switches** (G5): ssh user `Administrator` (or
+   `admin_user`, the VM's or the cluster's: decided, a cluster-level
+   `admin_user` carries over to its Windows VMs, and the answer file
+   creates that account); the boxman key goes in through
+   the answer ISO, not `ssh-copy-id`; inventory gets
+   `ansible_shell_type: powershell`; clone identity is forced `off`
+   (`required` is refused); `cloudinit*` keys are refused, and so is a
+   `base_image` that is a `templates:` entry, which boxman builds with
+   cloud-init. No WinRM transport (Q5).
 
 ### 5.3 Phase 2: Windows templates (golden image built locally)
 
@@ -458,16 +531,16 @@ prompt (§3.1). Win11 client licensing on VMs is its own question.
 2. **What is Windows for?** Ansible role testing against Windows targets?
    AD/domain-controller labs? User desktops? That decides Core vs Desktop,
    2022 vs 2025, and whether Phase 3 matters at all.
-3. **`os:` key vs inference.** Is a new per-VM `os: windows` (default
-   `linux`) acceptable in the config schema? The alternative, inferring from
-   `os_variant`, is implicit.
+3. **`os:` key vs inference.** Decided for Phase 1: a per-VM `os:` key,
+   `linux` by default. Inferring it from `os_variant` would be implicit.
 4. **Licensing owner.** Who decides what is acceptable beyond the 180-day
    evaluation: volume licensing or KMS for Server, and whether any
    Windows image may ever be shared between hosts or users? Until someone
    decides, the rule in §3.5 stands: nothing installed from eval media
    leaves the host that built it.
-5. **WinRM in scope?** Proposal: OpenSSH by default; WinRM opt-in, needing
-   pywinrm on the controller. Or drop WinRM entirely?
+5. **WinRM in scope?** Decided for Phase 1: OpenSSH only. boxman neither
+   configures nor uses WinRM; an opt-in transport could come later, and
+   would need pywinrm on the controller.
 6. **Server 2022 + OpenSSH offline.** The OpenSSH FoD comes from Windows
    Update. Do lab networks always have internet, or should boxman support an
    FoD ISO, or target Server 2025, where OpenSSH is in-box?
@@ -482,10 +555,16 @@ prompt (§3.1). Win11 client licensing on VMs is its own question.
    of those boxes declares a single CD-ROM, so G1 changes none of them, and
    G3 only adds an agent channel where virt-install added none.)
 8. **The shared-host teardown issue** (§4): file separately?
+9. **A cluster-level `admin_user` and Windows VMs.** Decided: it carries
+   over. An `os: windows` VM's ssh user is its own `admin_user`, else the
+   cluster's, else `Administrator`, and the default answer file creates
+   any account other than Administrator in Administrators, with the
+   Administrator password, so the name the ssh config uses exists.
 
 ## 7. Reproducing
 
 See the box [README](../boxes/windows-server-2022-iso-boot/README.md). In
-short: `dnf install virtio-win`; `BOXMAN_WIN_ADMIN_PASS=… ./make-answer-iso.sh`;
-`boxman up`; once `boxman-setup: done`, `boxman up` again, which ejects the
-install media (G7); then `win_ping`.
+short: `dnf install virtio-win`; `BOXMAN_WIN_ADMIN_PASS=… boxman up`; once
+`boxman-setup: done`, `boxman up` again, which ejects the install media and
+deletes the answer ISO if the first did not (G7); then `boxman ssh
+win_win01` or `win_ping`.
