@@ -3006,6 +3006,11 @@ class TestMemoryImagesInASnapshotDir:
 
         assert boot.exists()
         assert not (raw.exists() or zst.exists())
+        if path == "update_remove":
+            # listed there, the boot disk is not left to what they recorded:
+            # kept, as outside the workdir, and named
+            assert (f'{boot}' in t.warnings
+                    and 'outside every cluster workdir' in t.warnings)
 
 
     @pytest.mark.parametrize("path", ["deprovision", "update_remove"])
@@ -3040,6 +3045,31 @@ class TestMemoryImagesInASnapshotDir:
 
         assert boot.exists() and raw.exists()
         assert f'left {raw} in place' in t.warnings
+
+    @pytest.mark.parametrize("how", ["media", "under media"])
+    def test_one_the_vm_attaches_as_media_there_is_kept_and_named(
+            self, tmp_path, how):
+        """Left to what the snapshots recorded, an image no snapshot
+        records but the vm attaches as a CD-ROM, or under one, was decided
+        by nothing: with nothing kept, the inventory that says what it is
+        went too, and a later teardown finding it in a workdir (the
+        memory_snapshot_dir a bind mount of one) removed it."""
+        workdir, snaps = self._dirs(tmp_path)
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
+        boot = snaps / f'{VM}.qcow2'          # already gone
+        if how == "media":
+            media, chains = [raw], {}
+        else:
+            seed = _qcow2(tmp_path / 'elsewhere' / 'seed.qcow2')
+            media, chains = [seed], {seed: [seed, raw]}
+        t = _Teardown(workdir, disks=[boot], media=media, records=[],
+                      memory_snapshot_dir=snaps)
+        t.session.backing_chains.side_effect = _live(chains)
+
+        t.update_remove()
+
+        assert raw.exists()
+        assert str(raw) in t.warnings and 'CD-ROM' in t.warnings
 
 
 class TestMemoryImagesLeftOutside:
