@@ -1,15 +1,18 @@
-# Proof of concept: an unattended Windows Server 2022 guest.
+# An unattended Windows Server 2022 (Server Core, evaluation) guest.
 #
-# A spike, not a finished box. It uses boxman's ISO-boot path
-# (boot_order: [cdrom, hd] -> IsoBootVM -> virt-install), which hands every
-# cdroms: entry to virt-install. All three are install-only: boxman ejects
-# them once the install is done (G7) -- see doc/windows-guests.md, also for
-# what a proper `os: windows` box would look like.
+# `os: windows` on an ISO-boot VM makes boxman install it unattended: it
+# renders its own answer file (src/boxman/assets/windows/autounattend.xml.j2)
+# and puts it on an answer ISO with its setup script (boxman-setup.ps1) and
+# the cluster's public key. Setup sees that ISO, virtio-win and the Windows
+# ISO on its first boot; all three are install-only, and the first
+# `boxman up` or `boxman update` after the install ejects them (G7). See
+# doc/windows-guests.md.
 #
-# Before `boxman up`, build the answer ISO (it holds the Administrator
-# password, so it is generated, never committed):
+# The Administrator password comes from the environment and goes into the
+# answer ISO only, which boxman writes 0600 into the workspace and removes
+# once it is ejected, or with the VM:
 #
-#   BOXMAN_WIN_ADMIN_PASS='...' ./make-answer-iso.sh
+#   BOXMAN_WIN_ADMIN_PASS='...' boxman up
 #
 # Media and licensing: the ISO below is Microsoft's 180-day *evaluation*,
 # licensed for test and demonstration only. boxman downloads it from
@@ -63,6 +66,13 @@ clusters:
         autostart: True
     vms:
       win01:
+        # ssh user Administrator, key from the answer ISO, inventory shell
+        # powershell, no cloud-init, no clone identity pass
+        os: windows
+        # 8+ characters, 3 of upper/lower/digit/symbol, or boxman refuses it
+        # before anything is built (Windows would stop at OOBE). Set it for
+        # the up that creates the VM; later commands do not need it.
+        admin_pass: '{{ env("BOXMAN_WIN_ADMIN_PASS") }}'
         vcpus: 2
         memory: 4096
         # A first entry of `cdrom` only selects boxman's ISO-boot path
@@ -82,7 +92,7 @@ clusters:
         # answering -- boxman-setup.ps1 installs the agent once it has read
         # everything it needs off them. `boxman update` never compares an
         # install-only medium: it neither puts one back nor detaches one
-        # mid-install.
+        # mid-install. The answer ISO is a third entry, which boxman adds.
         cdroms:
           - name: winsrv2022-eval
             install_only: true
@@ -92,9 +102,10 @@ clusters:
           - name: virtio-win
             source: /usr/share/virtio-win/virtio-win.iso
             install_only: true
-          # The answer ISO make-answer-iso.sh writes. It holds the
-          # Administrator password in plain text, which any process in the
-          # guest could read from the drive until it is ejected.
-          - name: answer
-            source: '{{ env("HOME") }}/workspaces/windows-server-2022-iso-boot/answer.iso'
-            install_only: true
+        # boxman's answer file and setup script, Standard Core (image 1 of
+        # the evaluation ISO). To use your own, paths relative to this file:
+        # unattend:
+        #   template: ./autounattend.xml.j2   # Jinja, with conf.yml's env()
+        #   files: [./boxman-setup.ps1]       # copied onto the answer ISO
+        #   image_index: 2                    # Desktop Experience
+        #   vars: {timezone: W. Europe Standard Time}

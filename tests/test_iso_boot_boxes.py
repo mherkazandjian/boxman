@@ -101,10 +101,13 @@ class TestIsoBoxConfig:
 
     def test_no_ssh_expectations_are_declared(self, box_dir):
         # these boxes cannot provision a login; declaring admin_user/ssh_config
-        # would promise something the box does not deliver
+        # would promise something the box does not deliver -- except an
+        # os: windows box, whose answer ISO carries the cluster key
         for cluster in _config(box_dir)["clusters"].values():
-            assert "admin_user" not in cluster
             assert "base_image" not in cluster
+            if _windows(cluster):
+                continue
+            assert "admin_user" not in cluster
 
     def test_readme_documents_the_limitation(self, box_dir):
         # scoped to the boxes added alongside this check: talos-iso-boot has
@@ -115,7 +118,29 @@ class TestIsoBoxConfig:
         readme = os.path.join(box_dir, "README.md")
         assert os.path.exists(readme), "an iso-boot box needs a README"
         text = open(readme, encoding="utf-8").read().lower()
+        if any(_windows(c) for c in _config(box_dir)["clusters"].values()):
+            # boxman installs it unattended and reaches it over ssh
+            assert "boxman ssh win_win01" in text
+            return
         assert "boxman ssh" in text and "not" in text
+
+    def test_a_windows_box_keeps_its_password_out_of_the_repo(self, box_dir):
+        for cluster in _config(box_dir)["clusters"].values():
+            if not _windows(cluster):
+                continue
+            raw = open(os.path.join(box_dir, "conf.yml"),
+                       encoding="utf-8").read()
+            assert "admin_pass: '{{ env(\"BOXMAN_WIN_ADMIN_PASS\") }}'" in raw
+            for vm in cluster["vms"].values():
+                # every medium is install-only; boxman adds the answer ISO
+                assert all(c.get("install_only") is True
+                           for c in vm["cdroms"]), vm["cdroms"]
+                assert not vm.get("virt_install_extra_args")
+
+
+def _windows(cluster: dict) -> bool:
+    return any((vm or {}).get("os") == "windows"
+               for vm in (cluster.get("vms") or {}).values())
 
 
 def _load_image_checker():
