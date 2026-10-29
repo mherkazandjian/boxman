@@ -638,3 +638,92 @@ class TestTheVerbsAsk:
         mgr.eject_install_media.return_value = ['vm c1/win01: still in sda']
         with pytest.raises(ProvisionError, match="still in sda"):
             mgr.up(types.SimpleNamespace())
+
+    def test_update_asks_before_it_resolves_the_media_it_diffs(self):
+        # the eject comes first: the diff after it then sees empty drives,
+        # and a dry run passes its flag on
+        mgr = make_bare_manager(_iso_config([{'name': 'installer',
+                                              'install_only': True}]))
+        calls = MagicMock()
+        for name in ('validate_direct_boot_config',
+                     'validate_clone_identity_config',
+                     '_update_sessions_with_runtime', 'ensure_shared_bridges',
+                     'report_network_results', 'raise_on_network_failures',
+                     'setup_ssh_access', 'connect_info',
+                     'report_clone_degradations'):
+            setattr(mgr, name, MagicMock())
+        mgr.reconcile_networks = MagicMock(return_value={})
+        mgr._get_project_vm_names = MagicMock(return_value=[FULL])
+        mgr._find_all_existing_project_vms = MagicMock(return_value=[FULL])
+        mgr.eject_install_media = calls.eject_install_media
+        mgr.eject_install_media.return_value = []
+        mgr._normalize_cdroms_for_update = calls._normalize_cdroms_for_update
+        mgr._normalize_cdroms_for_update.return_value = {}
+        mgr._run_parallel = MagicMock(return_value=({}, {}))
+        mgr.update(types.SimpleNamespace(dry_run=True, yes=False))
+        assert [c[0] for c in calls.mock_calls] == [
+            'eject_install_media', '_normalize_cdroms_for_update']
+        assert calls.eject_install_media.call_args == (
+            ({FULL},), {'dry_run': True})
+
+    def test_a_failed_eject_fails_update(self):
+        mgr = make_bare_manager(_iso_config([{'name': 'installer',
+                                              'install_only': True}]))
+        for name in ('validate_direct_boot_config',
+                     'validate_clone_identity_config',
+                     '_update_sessions_with_runtime', 'ensure_shared_bridges',
+                     'report_network_results', 'raise_on_network_failures',
+                     'setup_ssh_access', 'connect_info',
+                     'report_clone_degradations'):
+            setattr(mgr, name, MagicMock())
+        mgr.reconcile_networks = MagicMock(return_value={})
+        mgr._get_project_vm_names = MagicMock(return_value=[FULL])
+        mgr._find_all_existing_project_vms = MagicMock(return_value=[FULL])
+        mgr.eject_install_media = MagicMock(return_value=['still in sda'])
+        mgr._normalize_cdroms_for_update = MagicMock(return_value={})
+        mgr._run_parallel = MagicMock(return_value=({}, {}))
+        with pytest.raises(ProvisionError, match="still in sda"):
+            mgr.update(types.SimpleNamespace(dry_run=False, yes=False))
+
+    def _provision_manager(self):
+        mgr = make_bare_manager(_iso_config([{'name': 'installer',
+                                              'install_only': True}]))
+        mgr.cache = MagicMock(projects={})
+        for name in ('_update_sessions_with_runtime',
+                     'validate_direct_boot_config',
+                     'validate_clone_identity_config', 'validate_iso_runtime',
+                     'register_project_in_cache', '_expand_oci_base_images',
+                     'validate_base_images', 'provision_files',
+                     'ensure_shared_bridges', 'define_networks', 'clone_vms',
+                     'configure_and_start_vms', 'wait_for_vm_ips',
+                     'setup_ssh_access', 'connect_info',
+                     'provision_compose_clusters', 'deploy_netlab',
+                     'report_clone_degradations'):
+            setattr(mgr, name, MagicMock())
+        mgr._find_existing_project_vms = MagicMock(return_value=[])
+        mgr.ensure_templates_exist = MagicMock(return_value=True)
+        mgr._get_project_vm_names = MagicMock(return_value=[FULL])
+        mgr._get_vm_states = MagicMock(return_value={FULL: 'running'})
+        mgr.session_for_cluster = MagicMock()
+        mgr.eject_install_media = MagicMock(return_value=[])
+        return mgr
+
+    def test_provision_asks_once_the_vms_have_their_addresses(self):
+        mgr = self._provision_manager()
+        order = MagicMock()
+        order.attach_mock(mgr.wait_for_vm_ips, 'wait_for_vm_ips')
+        order.attach_mock(mgr.eject_install_media, 'eject_install_media')
+        order.attach_mock(mgr.setup_ssh_access, 'setup_ssh_access')
+        mgr.provision(types.SimpleNamespace(force=False))
+        assert [c[0] for c in order.mock_calls] == [
+            'wait_for_vm_ips', 'eject_install_media', 'setup_ssh_access']
+        mgr.eject_install_media.assert_called_once_with([FULL])
+
+    def test_a_failed_eject_fails_provision_at_its_end(self):
+        mgr = self._provision_manager()
+        mgr.eject_install_media.return_value = ['vm c1/win01: still in sda']
+        with pytest.raises(ProvisionError, match="still in sda"):
+            mgr.provision(types.SimpleNamespace(force=False))
+        # the rest of provision ran first
+        mgr.setup_ssh_access.assert_called_once()
+        mgr.deploy_netlab.assert_called_once()
