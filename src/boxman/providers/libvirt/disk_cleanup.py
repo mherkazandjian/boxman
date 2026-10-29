@@ -970,6 +970,7 @@ def remove_vm_storage(
           for layer in layers)])
 
     # -- 1. the boot-disk family ------------------------------------------
+    deferred = []         # left to what the snapshots recorded (1b)
     for path in inventory.boot_family:
         if path in extra_related and media_refusal(path) is None:
             continue
@@ -984,6 +985,8 @@ def remove_vm_storage(
                       or (_CHAINS_UNREAD if chains is None else None))
             if reason:
                 admission.refuse(path, reason)
+            else:
+                deferred.append(path)
             continue
         reason = static_refusal(path)
         if reason is None and inventory.records_state == RECORDS_UNKNOWN:
@@ -1023,6 +1026,13 @@ def remove_vm_storage(
                 admission.refuse(path, reason)
             else:
                 admission.admit(path)
+    # one left to them that they did not record is kept, as outside the
+    # workdirs, as it was before it was left to them: refused, so that
+    # every protection applied to what is admitted still holds it, and the
+    # saved inventory stays
+    for path in deferred:
+        if not admission.is_admitted_as(path):
+            admission.refuse(path, _OUTSIDE)
 
     # -- 2./3. extra disks -------------------------------------------------
     state = inventory.records_state
