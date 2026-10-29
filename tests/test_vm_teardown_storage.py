@@ -3724,6 +3724,34 @@ class TestOverlaysInADiskSnapshotDir:
         assert (f'left {base} in place because the backing chains'
                 in t.warnings)
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches anything")
+    def test_one_there_libvirt_does_not_name_is_kept_when_an_identity_is_unread(
+            self, tmp_path):
+        """Left to what libvirt names as the vm's and not named, a file
+        there stays untouched without a word. But with the layer a CD-ROM
+        is built on named through a directory that cannot be searched,
+        whether that layer is this file cannot be told: it is kept, and
+        the inventory stays."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _file(ov / f'{VM}.base.qcow2')
+        seed = _qcow2(tmp_path / 'elsewhere' / 'seed.qcow2')
+        locked = tmp_path / 'locked'
+        locked.mkdir()
+        alias = locked / 'base.qcow2'
+        t = _Teardown(workdir, disks=[ov / f'{VM}.s1'], media=[seed],
+                      records=[], disk_snapshot_dir=ov,
+                      chains={str(seed): [str(seed), str(alias)]})
+        locked.chmod(0)
+        try:
+            t.update_remove()
+        finally:
+            locked.chmod(0o755)
+
+        assert base.exists()
+        assert (f'left {base} in place because the identity of {alias}'
+                in t.warnings)
+        assert _inventories(tmp_path), "the inventory that keeps it went"
+
     def test_a_symlink_there_keeps_the_file_it_names(self, tmp_path):
         """A symlink is no file a teardown unlinks, and its refusal holds
         for the file it names, as anywhere else."""

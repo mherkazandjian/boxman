@@ -733,6 +733,14 @@ _UNDER_MEDIA = "it backs a CD-ROM or other media source of the vm"
 _OUTSIDE = "it is outside every cluster workdir of the project"
 _CHAINS_UNREAD = ("the backing chains of the vm's disks could not be read, "
                   "so whether a CD-ROM is built on it cannot be told")
+
+
+def _identity_unread(unreadable: dict[str, OSError]) -> str:
+    """Why a file is kept when the identity of one in *unreadable* could
+    not be read."""
+    path, exc = min(unreadable.items())
+    return (f"the identity of {path} could not be read ({exc}), so whether "
+            f"that is this file cannot be told — make it accessible")
 _NOT_AN_ARTIFACT = (
     "the vm was already undefined and no saved teardown inventory was "
     "found, so only boxman's own qcow2 images and memory files are removed "
@@ -1111,6 +1119,7 @@ def remove_vm_storage(
 
     # -- 1. the boot-disk family ------------------------------------------
     deferred = []         # left to what the snapshots recorded (1b)
+    left_to_1c = []       # left to what libvirt names as the vm's (1c)
     for path in inventory.boot_family:
         if path in extra_related and media_refusal(path) is None:
             continue
@@ -1138,6 +1147,8 @@ def remove_vm_storage(
                       or (_CHAINS_UNREAD if chains is None else None))
             if reason:
                 admission.refuse(path, reason)
+            else:
+                left_to_1c.append(path)
             continue
         reason = static_refusal(path)
         if reason is None and inventory.records_state == RECORDS_UNKNOWN:
@@ -1205,6 +1216,14 @@ def remove_vm_storage(
             admission.refuse(path, reason)
         else:
             admission.admit(path)
+    # one left to 1c that it did not name is not the vm's by its name and
+    # stays untouched without a word; but with an identity unread, whether
+    # it is a file a protection names under another name (a CD-ROM's
+    # layer) cannot be told, so it is kept, and the saved inventory stays
+    if identities.unreadable:
+        for path in left_to_1c:
+            if not admission.is_admitted_as(path):
+                admission.refuse(path, _identity_unread(identities.unreadable))
 
     # -- 2./3. extra disks -------------------------------------------------
     state = inventory.records_state
@@ -1273,12 +1292,8 @@ def remove_vm_storage(
     else:
         _refuse_incomplete_chains(chains, admission)
     if identities.unreadable:
-        unreadable, exc = min(identities.unreadable.items())
         for path in list(admission.admitted.values()):
-            admission.refuse(path, (
-                f"the identity of {unreadable} could not be read ({exc}), so "
-                f"whether that is this file cannot be told — make it "
-                f"accessible"))
+            admission.refuse(path, _identity_unread(identities.unreadable))
 
     # -- in use by another domain ------------------------------------------
     if admission.admitted:
