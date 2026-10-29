@@ -161,6 +161,7 @@ data/dev/*
 # an unattended Windows install's answer ISO holds the Administrator
 # password; boxman writes it to the cluster workdir, which may be in a box
 *-unattend.iso
+.unattend-*/
 containers/docker/data
 .boxman
 

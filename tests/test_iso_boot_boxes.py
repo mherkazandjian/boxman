@@ -130,7 +130,9 @@ class TestIsoBoxConfig:
                 continue
             raw = open(os.path.join(box_dir, "conf.yml"),
                        encoding="utf-8").read()
-            assert "admin_pass: '{{ env(\"BOXMAN_WIN_ADMIN_PASS\") }}'" in raw
+            # read when the answer ISO is built: never in the YAML or in
+            # conf.rendered.yml
+            assert "admin_pass: '${env:BOXMAN_WIN_ADMIN_PASS}'" in raw
             for vm in cluster["vms"].values():
                 # every medium is install-only; boxman adds the answer ISO
                 assert all(c.get("install_only") is True

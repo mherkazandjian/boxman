@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from importlib import resources as importlib_resources
 from typing import Any
@@ -50,6 +51,13 @@ WINDOWS_ADMIN = 'Administrator'
 
 #: the keys an ``unattend:`` block takes
 UNATTEND_KEYS = frozenset({'template', 'files', 'image_index', 'vars'})
+
+#: the template variables boxman derives itself, which ``unattend: vars:``
+#: may not set: a vars: admin_pass replaced the password after its policy
+#: check, and a vars: admin_user created an account the ssh config does not
+#: name
+DERIVED_VARS = frozenset({'admin_pass', 'admin_user', 'computer_name',
+                          'image_index', 'vm_name'})
 
 #: the names boxman writes onto an answer ISO itself, which no file of
 #: ``unattend: files:`` may take
@@ -96,15 +104,62 @@ def answer_iso_path(workdir: str, full_vm_name: str) -> str:
 
 
 def _git_work_tree(path: str) -> str | None:
-    """The git work tree *path* is in, or None."""
+    """
+    The top of the git work tree *path* is in, or None -- git's answer.
+
+    A ``.git`` entry on the way up is not enough: a host can have an empty
+    ``/tmp/.git`` directory, and every workdir under /tmp then looked like a
+    repository. Without git, or for a path git does not take for a work
+    tree, the answer is None and nothing is warned about.
+    """
     path = os.path.abspath(path)
-    while True:
-        if os.path.exists(os.path.join(path, '.git')):
-            return path
+    while not os.path.isdir(path):
         parent = os.path.dirname(path)
         if parent == path:
             return None
         path = parent
+    environ = {key: value for key, value in os.environ.items()
+               if key not in ('GIT_DIR', 'GIT_WORK_TREE')}
+    try:
+        result = subprocess.run(
+            ['git', '-C', path, 'rev-parse', '--show-toplevel'],
+            capture_output=True, text=True, timeout=30, env=environ,
+            check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    top = result.stdout.strip()
+    return top if result.returncode == 0 and top else None
+
+
+#: the "nonalphanumeric" characters of Windows' complexity rule; currency
+#: signs, a space and anything else are not among them
+PASSWORD_SYMBOLS = frozenset("~!@#$%^&*_-+=`|\\(){}[]:;\"'<>,.?/")
+
+
+def password_categories(password: str) -> set[str]:
+    """
+    The categories of Windows' complexity rule that *password* draws on.
+
+    As Microsoft documents them: upper-case letters and lower-case letters
+    (of European languages, diacritics, Greek and Cyrillic included -- what
+    ``str.isupper`` and ``str.islower`` say), the base-10 digits, the listed
+    nonalphanumeric characters, and any other alphabetic character, which
+    is a category of its own (most Asian scripts). A space, a currency sign
+    or an accent on its own counts for none of them.
+    """
+    found = set()
+    for char in password:
+        if char in '0123456789':
+            found.add('digit')
+        elif char in PASSWORD_SYMBOLS:
+            found.add('symbol')
+        elif char.isupper():
+            found.add('upper')
+        elif char.islower():
+            found.add('lower')
+        elif char.isalpha():
+            found.add('other letter')
+    return found
 
 
 def password_problem(password: str, users: tuple[str, ...]) -> str | None:
@@ -115,14 +170,17 @@ def password_problem(password: str, users: tuple[str, ...]) -> str | None:
     password it refuses with a prompt nobody answers: the guest waits there,
     and ``boxman up`` waits for an address it never gets. So the rule is
     checked before anything is built: eight characters or more, three of
-    upper case, lower case, digit and symbol, and none of the account names.
-    The password itself is never part of the answer.
+    the categories :func:`password_categories` counts, and none of the
+    account names. The password itself is never part of the answer.
     """
-    classes = sum(bool(re.search(pattern, password)) for pattern in
-                  (r'[A-Z]', r'[a-z]', r'[0-9]', r'[^A-Za-z0-9]'))
-    if len(password) < 8 or classes < 3:
-        return ("is shorter than 8 characters or has fewer than 3 of upper "
-                "case, lower case, digits and symbols, which Windows refuses")
+    if len(password) < 8:
+        return "is shorter than 8 characters"
+    categories = password_categories(password)
+    if len(categories) < 3:
+        return (f"draws on {len(categories)} of the categories Windows counts "
+                f"(upper case, lower case, digits 0-9, the symbols "
+                f"~!@#$%^&*_-+=`|\\(){{}}[]:;\"'<>,.?/ -- not a space or a "
+                f"currency sign -- and other letters), and Windows wants 3")
     for user in users:
         if len(user) > 2 and user.lower() in password.lower():
             return (f"contains the account name '{user}', which Windows "
@@ -313,8 +371,12 @@ class GuestOSMixin:
                 if (not isinstance(vm_info, dict)
                         or self.unattend_of(vm_info) is None):
                     continue
-                cdroms = vm_info.setdefault('cdroms', [])
-                if not isinstance(cdroms, list) or any(
+                cdroms = vm_info.get('cdroms')
+                # No cdroms of its own is no ISO to install from, which
+                # validate_guest_os_config says in those words. Added
+                # anyway, the answer ISO became the boot ISO, and the error
+                # named an iso 'unattend' nobody declared.
+                if not isinstance(cdroms, list) or not cdroms or any(
                         isinstance(c, dict) and c.get(ANSWER_CDROM_MARK)
                         for c in cdroms):
                     continue
@@ -404,6 +466,14 @@ class GuestOSMixin:
         block = self.unattend_of(vm_info)
         if block is None:
             return bad
+        own_cdroms = [c for c in (vm_info.get('cdroms') or [])
+                      if not (isinstance(c, dict) and c.get(ANSWER_CDROM_MARK))]
+        if not own_cdroms:
+            bad.append(
+                f"{loc} is installed unattended from an ISO, but its cdroms: "
+                f"name no Windows ISO to install from: give it a first "
+                f"cdroms: entry naming an isos: entry (the answer ISO is "
+                f"boxman's to add)")
         if runtime != 'local':
             bad.append(f"{loc}: an unattended install needs the local "
                        f"runtime (the answer ISO is built on this host)")
@@ -412,39 +482,57 @@ class GuestOSMixin:
             bad.append(f"{loc}.unattend has unknown key(s) "
                        f"{', '.join(unknown)} (it takes "
                        f"{', '.join(sorted(UNATTEND_KEYS))})")
+        # Shapes only. Whether the files are there matters to the VM about
+        # to be created (validate_answer_media): one installed long ago
+        # reads none of them again, and checking every update made moving a
+        # template break every later update.
         template = block.get('template')
-        if template is not None:
-            if not isinstance(template, str) or not template:
-                bad.append(f"{loc}.unattend.template must be a path")
-            elif not os.path.isfile(self._unattend_path(template)):
-                bad.append(f"{loc}.unattend.template "
-                           f"{self._unattend_path(template)} does not exist")
+        if template is not None and (not isinstance(template, str)
+                                     or not template):
+            bad.append(f"{loc}.unattend.template must be a path")
         files = block.get('files')
-        if files is not None:
-            if not isinstance(files, list) or not all(
-                    isinstance(f, str) and f for f in files):
-                bad.append(f"{loc}.unattend.files must be a list of paths")
-            else:
-                seen: set = set()
-                for path in files:
-                    full = self._unattend_path(path)
-                    name = os.path.basename(full)
-                    if not os.path.isfile(full):
-                        bad.append(f"{loc}.unattend.files: {full} does not "
-                                   f"exist")
-                    elif name in (ANSWER_FILE, AUTHORIZED_KEYS):
-                        bad.append(f"{loc}.unattend.files: {name} is the "
-                                   f"name of a file boxman writes itself")
-                    elif name in seen:
-                        bad.append(f"{loc}.unattend.files: two files are "
-                                   f"named {name}")
-                    seen.add(name)
+        if files is not None and (not isinstance(files, list) or not all(
+                isinstance(f, str) and f for f in files)):
+            bad.append(f"{loc}.unattend.files must be a list of paths")
         index = block.get('image_index', 1)
         if isinstance(index, bool) or not isinstance(index, int) or index < 1:
             bad.append(f"{loc}.unattend.image_index must be a positive "
                        f"integer, got {index!r}")
-        if not isinstance(block.get('vars', {}), dict):
+        variables = block.get('vars', {})
+        if not isinstance(variables, dict):
             bad.append(f"{loc}.unattend.vars must be a mapping")
+        else:
+            derived = sorted(DERIVED_VARS & set(variables))
+            if derived:
+                bad.append(
+                    f"{loc}.unattend.vars sets {', '.join(derived)}, which "
+                    f"boxman derives itself: set admin_pass, admin_user, "
+                    f"hostname or unattend.image_index instead")
+        return bad
+
+    def _answer_file_problems(self, loc: str,
+                              vm_info: dict[str, Any]) -> list[str]:
+        """What is wrong with the template and files a VM's answer ISO is
+        about to be built from."""
+        bad = []
+        block = self.unattend_of(vm_info) or {}
+        template = block.get('template')
+        if template and not os.path.isfile(self._unattend_path(template)):
+            bad.append(f"{loc}.unattend.template "
+                       f"{self._unattend_path(template)} does not exist")
+        seen: set = set()
+        for path in (block.get('files') or []):
+            full = self._unattend_path(path)
+            name = os.path.basename(full)
+            if not os.path.isfile(full):
+                bad.append(f"{loc}.unattend.files: {full} does not exist")
+            elif name in (ANSWER_FILE, AUTHORIZED_KEYS):
+                bad.append(f"{loc}.unattend.files: {name} is the name of a "
+                           f"file boxman writes itself")
+            elif name in seen:
+                bad.append(f"{loc}.unattend.files: two files are named "
+                           f"{name}")
+            seen.add(name)
         return bad
 
     def _answer_targets(self, full_vm_names=None):
@@ -476,8 +564,10 @@ class GuestOSMixin:
             raise ConfigError(
                 f"{loc} is installed unattended, so it needs admin_pass, the "
                 f"Administrator password, on the VM or its cluster; it is "
-                f"not set or empty. Keep it out of the box: admin_pass: "
-                f"'{{{{ env(\"BOXMAN_WIN_ADMIN_PASS\") }}}}'")
+                f"not set or empty. Keep it out of the box and out of its "
+                f"rendered conf: admin_pass: '${{env:BOXMAN_WIN_ADMIN_PASS}}' "
+                f"(read when the answer ISO is built) or "
+                f"'file://<a 0600 file>'")
         try:
             password = str(self.fetch_value(raw))
         except (ValueError, OSError) as exc:
@@ -495,13 +585,15 @@ class GuestOSMixin:
                 f"to 15 letters, digits and hyphens, not all digits); set "
                 f"hostname:")
         block = self.unattend_of(vm_info) or {}
+        # vars first, so what boxman derives -- and checked above -- is what
+        # the template gets; validate_guest_os_config refuses them in vars:
         return {
+            **(block.get('vars') or {}),
             'admin_user': admin_user,
             'admin_pass': password,
             'computer_name': computer_name,
             'image_index': block.get('image_index', 1),
             'vm_name': vm_name,
-            **(block.get('vars') or {}),
         }
 
     def validate_answer_media(self, full_vm_names=None) -> None:
@@ -515,6 +607,11 @@ class GuestOSMixin:
         """
         for cluster_name, cluster, vm_name, vm_info, _full in \
                 self._answer_targets(full_vm_names):
+            problems = self._answer_file_problems(
+                f"{cluster_name}.vms.{vm_name}", vm_info)
+            if problems:
+                raise ConfigError("invalid answer ISO configuration: "
+                                  + "; ".join(problems))
             context = self._answer_context(cluster_name, cluster, vm_name,
                                            vm_info)
             render_answer_file(self._answer_template(vm_info), context)
@@ -560,6 +657,11 @@ class GuestOSMixin:
         ws_path = self.config.get('workspace', {}).get('path', '')
         for cluster_name, cluster, vm_name, vm_info, full in targets:
             label = f"{cluster_name}/{vm_name}"
+            problems = self._answer_file_problems(
+                f"{cluster_name}.vms.{vm_name}", vm_info)
+            if problems:
+                raise ConfigError("invalid answer ISO configuration: "
+                                  + "; ".join(problems))
             context = self._answer_context(cluster_name, cluster, vm_name,
                                            vm_info)
             answer = render_answer_file(self._answer_template(vm_info),
@@ -591,6 +693,28 @@ class GuestOSMixin:
             self.logger.info(
                 f"vm {label}: wrote its answer ISO {iso} with {tool}, readable "
                 f"by its owner only: it holds the Administrator password")
+
+    def discard_unused_answer_media(self, full_vm_names=None) -> None:
+        """
+        Remove the answer ISO of every VM among *full_vm_names* that has no
+        domain: the create that was to use it failed, before virt-install
+        defined anything or before it ran. Left there, it held the password
+        until a ``destroy``. One whose domain exists stays with it, and goes
+        with it.
+
+        Best effort, on a path that is already failing: a problem is logged,
+        and the failure that brought it here is the one raised.
+        """
+        for cluster_name, cluster, _vm_name, _vm_info, full in list(
+                self._answer_targets(full_vm_names)):
+            try:
+                if self.session_for_cluster(cluster_name).vm_exists(full):
+                    continue
+                self.remove_answer_media(full, [cluster['workdir']])
+            except Exception as exc:  # noqa: BLE001 - logged, not raised
+                self.logger.error(
+                    f"could not remove the answer ISO of {full}, which holds "
+                    f"its Administrator password: {exc}")
 
     def remove_answer_media(self, full_vm_name: str, workdirs,
                             strict: bool = True) -> list[str]:

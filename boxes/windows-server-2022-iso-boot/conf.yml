@@ -72,7 +72,11 @@ clusters:
         # 8+ characters, 3 of upper/lower/digit/symbol, or boxman refuses it
         # before anything is built (Windows would stop at OOBE). Set it for
         # the up that creates the VM; later commands do not need it.
-        admin_pass: '{{ env("BOXMAN_WIN_ADMIN_PASS") }}'
+        # A reference rather than the env() template helper: boxman reads it
+        # when it builds the answer ISO, so the password never passes through
+        # this file's YAML (where a quote in it would break the file) or into
+        # conf.rendered.yml.
+        admin_pass: '${env:BOXMAN_WIN_ADMIN_PASS}'
         vcpus: 2
         memory: 4096
         # A first entry of `cdrom` only selects boxman's ISO-boot path

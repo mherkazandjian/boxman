@@ -14,7 +14,9 @@ validation and the file handling run for real.
 from __future__ import annotations
 
 import os
+import shutil
 import stat
+import subprocess
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -190,11 +192,22 @@ class TestTheUnattendBlock:
         assert ("c1.vms.win01.unattend has unknown key(s) templat (it takes "
                 "files, image_index, template, vars)" in _refused(mgr))
 
-    def test_a_template_that_is_not_there_is_refused(self, tmp_path):
+    def test_a_template_that_is_not_there_is_refused_for_a_new_vm(
+            self, tmp_path):
         mgr = _manager(tmp_path, vms={'win01': _win_vm(
             unattend={'template': './answer.xml.j2'})})
+        with pytest.raises(ConfigError) as excinfo:
+            mgr.validate_answer_media()
         assert (f"c1.vms.win01.unattend.template {tmp_path}/box/answer.xml.j2 "
-                f"does not exist" in _refused(mgr))
+                f"does not exist" in str(excinfo.value))
+
+    def test_a_vm_installed_long_ago_does_not_need_its_template(
+            self, tmp_path):
+        # review of #271: checked on every update, a template moved after
+        # the install broke every later update
+        mgr = _manager(tmp_path, vms={'win01': _win_vm(unattend={
+            'template': './moved.xml.j2', 'files': ['./moved.ps1']})})
+        mgr.validate_guest_os_config()
 
     def test_paths_are_read_from_the_conf_dir(self, tmp_path):
         box = tmp_path / 'box'
@@ -216,7 +229,10 @@ class TestTheUnattendBlock:
         mgr = _manager(tmp_path, vms={'win01': _win_vm(unattend={'files': [
             str(tmp_path / 'a' / 'setup.ps1'), str(tmp_path / 'b' / 'setup.ps1'),
             str(tmp_path / 'a' / 'autounattend.xml')]})})
-        message = _refused(mgr)
+        mgr.validate_guest_os_config()
+        with pytest.raises(ConfigError) as excinfo:
+            mgr.validate_answer_media()
+        message = str(excinfo.value)
         assert "two files are named setup.ps1" in message
         assert ("autounattend.xml is the name of a file boxman writes itself"
                 in message)
@@ -227,6 +243,29 @@ class TestTheUnattendBlock:
             unattend={'image_index': index})})
         assert "c1.vms.win01.unattend.image_index must be a positive integer" in (
             _refused(mgr))
+
+    def test_vars_may_not_set_what_boxman_derives(self, tmp_path):
+        # review of #271: vars: admin_pass replaced the password after its
+        # policy check, vars: admin_user made an account ssh_config ignored
+        mgr = _manager(tmp_path, vms={'win01': _win_vm(unattend={'vars': {
+            'admin_pass': 'x', 'admin_user': 'other', 'timezone': 'UTC'}})})
+        assert ("c1.vms.win01.unattend.vars sets admin_pass, admin_user, which "
+                "boxman derives itself" in _refused(mgr))
+
+    def test_an_iso_boot_windows_vm_without_cdroms_names_the_missing_iso(
+            self, tmp_path):
+        # review of #271: the answer ISO became cdroms[0], and the error was
+        # "cdroms references unknown iso 'unattend'"
+        mgr = _manager(tmp_path, vms={'win01': _win_vm(cdroms=[])})
+        mgr.add_answer_cdroms()
+        assert mgr.config['clusters']['c1']['vms']['win01']['cdroms'] == []
+        assert ("c1.vms.win01 is installed unattended from an ISO, but its "
+                "cdroms: name no Windows ISO to install from" in _refused(mgr))
+        mgr = _manager(tmp_path, vms={'win01': {
+            'os': 'windows', 'boot_order': ['cdrom'], 'admin_pass': PASSWORD}})
+        mgr.add_answer_cdroms()
+        assert 'cdroms' not in mgr.config['clusters']['c1']['vms']['win01']
+        assert "name no Windows ISO to install from" in _refused(mgr)
 
     def test_it_needs_the_local_runtime(self, tmp_path):
         mgr = _manager(tmp_path)
@@ -303,8 +342,10 @@ class TestThePassword:
             self._context(tmp_path, admin_pass='')
         assert ("c1.vms.win01 is installed unattended, so it needs admin_pass"
                 in str(excinfo.value))
-        assert ("admin_pass: '{{ env(\"BOXMAN_WIN_ADMIN_PASS\") }}'"
+        # a reference: the env() helper would paste it into the YAML
+        assert ("admin_pass: '${env:BOXMAN_WIN_ADMIN_PASS}'"
                 in str(excinfo.value))
+        assert '{{' not in str(excinfo.value)
 
     @pytest.mark.parametrize('weak', ['short1A', 'alllowercase1',
                                       'Administrator-9x', 'NoDigitsHere'])
@@ -321,6 +362,33 @@ class TestThePassword:
         assert 'shorter than 8' in password_problem('Ab1!', ())
         assert "account name 'boxadmin'" in password_problem(
             'xBoxAdmin99!', ('Administrator', 'boxadmin'))
+
+    @pytest.mark.parametrize('password', [
+        'aaaaaaa1é',        # é is a lower-case letter, not a symbol
+        'abc def 1',        # a space is no symbol
+        'abcdefg1€',        # nor a currency sign
+        'abcdefg1£¥',
+    ])
+    def test_what_windows_does_not_count_as_a_symbol_is_refused(
+            self, password):
+        # review of #271: [^A-Za-z0-9] took these for symbols, and OOBE
+        # refused the password boxman had passed
+        assert 'draws on 2 of the categories' in password_problem(
+            password, ('Administrator',))
+
+    @pytest.mark.parametrize('password', [
+        'Παράδειγμα1',      # Greek upper and lower case
+        'ПарольПароль1',    # Cyrillic
+        'Ünïcödé-pass',     # diacritics, and a listed symbol
+        'パスワードabc1',     # other letters are a category of their own
+    ])
+    def test_microsofts_categories_are_counted(self, password):
+        assert password_problem(password, ('Administrator',)) is None
+
+    def test_the_symbols_are_microsofts_list(self):
+        assert guest_os.PASSWORD_SYMBOLS == set(
+            "~!@#$%^&*_-+=`|\\(){}[]:;\"'<>,.?/")
+        assert guest_os.password_categories('~|\\') == {'symbol'}
 
     def test_the_vms_wins_over_the_clusters(self, tmp_path):
         mgr = _manager(tmp_path, cluster={'admin_pass': 'Cluster-pass-1'})
@@ -354,6 +422,53 @@ class TestThePassword:
             'admin_user': 'boxadmin', 'admin_pass': PASSWORD,
             'computer_name': 'win01', 'image_index': 2, 'vm_name': 'win01',
             'timezone': 'X'}
+
+    def test_what_boxman_derives_wins_over_vars(self, tmp_path):
+        # the validation refuses these in vars:; were it skipped, the
+        # checked password is still the one rendered
+        context = self._context(tmp_path, unattend={'vars': {
+            'admin_pass': 'x', 'admin_user': 'other', 'computer_name': 'y'}})
+        assert (context['admin_pass'], context['admin_user'],
+                context['computer_name']) == (PASSWORD, 'Administrator',
+                                              'win01')
+
+
+class TestTheBoxsPassword:
+    """Review of #271: the box said admin_pass: '{{ env(...) }}', so the
+    password was pasted into a single-quoted YAML scalar -- a quote in it
+    broke every command, two quotes silently became one -- and was written
+    to conf.rendered.yml beside the box."""
+
+    PASSWORDS = ["Ab1'quote'x", 'Ab1"dq"x!', "Ab1''two", 'Ab1 {{ x }} %}']
+
+    def _load(self, tmp_path, monkeypatch, password):
+        box_dir = Path(__file__).resolve().parents[1] / 'boxes' / \
+            'windows-server-2022-iso-boot'
+        box = tmp_path / 'box'
+        box.mkdir()
+        (box / 'conf.yml').write_text((box_dir / 'conf.yml').read_text())
+        monkeypatch.setenv('BOXMAN_WIN_ADMIN_PASS', password)
+        monkeypatch.setenv('BOXMAN_CONF_FILE', str(box / 'conf.yml'))
+        monkeypatch.setenv('BOXMAN_CONF_DIR', str(box))
+        monkeypatch.setenv('HOME', str(tmp_path / 'home'))
+        return BoxmanManager(str(box / 'conf.yml')), box
+
+    @pytest.mark.parametrize('password', PASSWORDS)
+    def test_it_reaches_the_answer_file_as_typed(self, tmp_path, monkeypatch,
+                                                 password):
+        mgr, _box = self._load(tmp_path, monkeypatch, password)
+        cluster = mgr.config['clusters']['win']
+        context = mgr._answer_context('win', cluster, 'win01',
+                                      cluster['vms']['win01'])
+        assert context['admin_pass'] == password
+
+    @pytest.mark.parametrize('password', PASSWORDS)
+    def test_it_is_not_in_the_rendered_conf(self, tmp_path, monkeypatch,
+                                            password):
+        _mgr, box = self._load(tmp_path, monkeypatch, password)
+        rendered = (box / 'conf.rendered.yml').read_text()
+        assert password not in rendered
+        assert "admin_pass: '${env:BOXMAN_WIN_ADMIN_PASS}'" in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -585,12 +700,75 @@ class TestBuildingTheAnswerMedia:
         mgr.build_answer_media({'bprj__demo__bprj_c1_other'})
         mgr.generate_ssh_keys.assert_not_called()
 
+    @pytest.mark.skipif(shutil.which('git') is None, reason='needs git')
     def test_a_workdir_in_a_git_work_tree_is_warned_about(self, tmp_path):
-        (tmp_path / '.git').mkdir()
+        subprocess.run(['git', 'init', '-q', str(tmp_path)], check=True)
         mgr, _tool = self._built(tmp_path)
         warning = mgr.logger.warning.call_args.args[0]
         assert "is inside the git work tree" in warning
         assert str(tmp_path) in warning
+
+    def test_an_empty_dot_git_directory_is_no_work_tree(self, tmp_path):
+        # review of #271: /tmp/.git, an empty directory on the test host,
+        # made every workdir under /tmp look like a repository
+        (tmp_path / '.git').mkdir()
+        assert guest_os._git_work_tree(str(tmp_path / 'ws' / 'nowhere')) is None
+        mgr, _tool = self._built(tmp_path)
+        mgr.logger.warning.assert_not_called()
+
+    def test_no_git_is_no_warning(self, tmp_path):
+        with patch.object(guest_os.subprocess, 'run',
+                          side_effect=FileNotFoundError('git')):
+            assert guest_os._git_work_tree(str(tmp_path)) is None
+
+    def test_update_checks_a_new_vms_password_before_anything_else(
+            self, tmp_path):
+        # review of #271: in update it came after the network reconcile,
+        # the template builds and the download of the ISO
+        mgr = _manager(tmp_path, vms={'win01': _win_vm(admin_pass='weak')})
+        for name in ('validate_direct_boot_config',
+                     'validate_clone_identity_config',
+                     '_update_sessions_with_runtime', 'ensure_shared_bridges',
+                     'reconcile_networks', 'report_clone_degradations'):
+            setattr(mgr, name, MagicMock())
+        mgr._get_project_vm_names = MagicMock(
+            return_value=['bprj__demo__bprj_c1_win01'])
+        mgr._find_all_existing_project_vms = MagicMock(return_value=[])
+        with pytest.raises(ConfigError, match="admin_pass of c1.vms.win01"):
+            mgr.update(types.SimpleNamespace(dry_run=False, yes=False))
+        mgr.reconcile_networks.assert_not_called()
+
+    def test_update_does_not_ask_an_existing_vm_for_its_password(
+            self, tmp_path):
+        mgr = _manager(tmp_path, vms={'win01': _win_vm(admin_pass='')})
+        mgr._get_project_vm_names = MagicMock(
+            return_value=['bprj__demo__bprj_c1_win01'])
+        mgr._find_all_existing_project_vms = MagicMock(
+            return_value=['bprj__demo__bprj_c1_win01'])
+        for name in ('validate_direct_boot_config',
+                     'validate_clone_identity_config'):
+            setattr(mgr, name, MagicMock())
+        mgr._update_sessions_with_runtime = MagicMock(
+            side_effect=RuntimeError('got past the checks'))
+        with pytest.raises(RuntimeError, match='got past the checks'):
+            mgr.update(types.SimpleNamespace(dry_run=True, yes=False))
+
+    @pytest.mark.skipif(not any(shutil.which(t) for t in
+                                ('genisoimage', 'mkisofs', 'xorrisofs')),
+                        reason='needs genisoimage, mkisofs or xorrisofs')
+    def test_a_real_iso_tool_under_umask_000_still_makes_it_0600(
+            self, tmp_path):
+        iso = tmp_path / 'wd' / 'vm-unattend.iso'
+        old = os.umask(0)
+        try:
+            write_answer_iso(str(iso), {'autounattend.xml': '<a/>',
+                                        'authorized_keys': 'k\n'},
+                             default_answer_files())
+        finally:
+            os.umask(old)
+        assert stat.S_IMODE(os.stat(iso).st_mode) == 0o600
+        assert os.listdir(iso.parent) == [iso.name]
+        assert iso.stat().st_size > 0
 
     def test_provision_checks_the_password_before_anything_is_built(
             self, tmp_path):
@@ -656,6 +834,82 @@ class TestRemovingIt:
             with pytest.raises(ProvisionError, match="could not look up"):
                 mgr.remove_answer_media('x', [str(tmp_path)])
         assert "remove it by hand" in mgr.logger.warning.call_args.args[0]
+
+    def test_it_goes_with_a_vm_whose_config_no_longer_says_windows(
+            self, tmp_path):
+        # review of #271: an os:/unattend:/boot_order edit after the install
+        # left the ISO behind at destroy
+        mgr, iso = self._with_iso(tmp_path)
+        mgr._teardown_vm = MagicMock()
+        mgr.session_for_cluster = MagicMock()
+        cluster = mgr.config['clusters']['c1']
+        mgr._destroy_vm_and_disks('c1', cluster, 'win01',
+                                  {'boot_order': ['hd'], 'base_image': 'x'})
+        assert not iso.exists()
+
+    def test_a_linux_vm_in_an_unsearchable_workdir_is_not_failed_for_it(
+            self, tmp_path):
+        mgr, _iso = self._with_iso(tmp_path)
+        mgr._teardown_vm = MagicMock()
+        mgr.session_for_cluster = MagicMock()
+        cluster = mgr.config['clusters']['c1']
+        with patch('os.lstat',
+                   side_effect=PermissionError(13, 'Permission denied')):
+            mgr._destroy_vm_and_disks('c1', cluster, 'vm2', {})
+
+    def _failed_create(self, tmp_path, domain_exists, build_fails=False):
+        mgr = _manager(tmp_path)
+        mgr.add_answer_cdroms()
+        iso = Path(answer_iso_path(str(tmp_path / 'ws'),
+                                   'bprj__demo__bprj_c1_win01'))
+
+        def build(*_args):
+            iso.parent.mkdir(parents=True, exist_ok=True)
+            iso.write_text('password inside')
+            if build_fails:
+                raise ConfigError('the next VM had no password')
+
+        mgr.build_answer_media = MagicMock(side_effect=build)
+        mgr._resolve_iso_config = MagicMock()
+        mgr._ensure_libvirt_storage_pool = MagicMock()
+        session = MagicMock()
+        session.vm_exists.return_value = domain_exists
+        mgr.session_for_cluster = MagicMock(return_value=session)
+        mgr.provider = session
+        mgr._run_parallel = MagicMock(return_value=(
+            {}, {'bprj__demo__bprj_c1_win01': 'virt-install failed'}))
+        return mgr, iso
+
+    def test_a_failed_create_leaves_no_password_iso(self, tmp_path):
+        # review of #271: it stayed in the workdir until a destroy
+        mgr, iso = self._failed_create(tmp_path, domain_exists=False)
+        with pytest.raises(ProvisionError, match="clone failed"):
+            mgr.clone_vms()
+        assert not iso.exists()
+
+    def test_one_a_defined_domain_holds_goes_with_the_domain(self, tmp_path):
+        mgr, iso = self._failed_create(tmp_path, domain_exists=True)
+        with pytest.raises(ProvisionError, match="clone failed"):
+            mgr.clone_vms()
+        assert iso.exists()
+
+    def test_a_build_that_fails_partway_leaves_none(self, tmp_path):
+        mgr, iso = self._failed_create(tmp_path, domain_exists=False,
+                                       build_fails=True)
+        with pytest.raises(ConfigError):
+            mgr.clone_vms()
+        assert not iso.exists()
+
+    def test_a_failed_create_in_update_leaves_none_either(self, tmp_path):
+        mgr, iso = self._failed_create(tmp_path, domain_exists=False)
+        with pytest.raises(ProvisionError, match="clone failed"):
+            mgr._clone_and_configure_new_vms({'bprj__demo__bprj_c1_win01'})
+        assert not iso.exists()
+
+    def test_the_staging_directory_is_gitignored(self):
+        lines = (Path(__file__).resolve().parents[1] / '.gitignore'
+                 ).read_text().splitlines()
+        assert '*-unattend.iso' in lines and '.unattend-*/' in lines
 
     def test_one_that_cannot_be_removed_fails(self, tmp_path):
         mgr, iso = self._with_iso(tmp_path)
