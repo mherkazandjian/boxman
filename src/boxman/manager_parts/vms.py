@@ -1076,19 +1076,25 @@ class VMsMixin:
         # disk_snapshot_dir, which it never lists — another VM's full name
         # can begin with this one's and a dot (remove_vm_storage)
         overlays: dict[str, list[str]] | None = None
+        overlays_unread = False
         if exists and self._cluster_disk_snapshot_dirs():
             overlays = session.snapshot_overlay_files(full_vm_name)
             if overlays is None:
+                overlays_unread = True
                 self.logger.warning(
                     f"{full_vm_name}: could not read the overlays its "
                     f"snapshots recorded, one of which can be built on any "
                     f"of its files, so nothing in a disk_snapshot_dir will be "
                     f"removed, nor what that is built on")
         # and what those only a snapshot records are built on: kept, one
-        # keeps that too (remove_vm_storage)
+        # keeps that too (remove_vm_storage). Unread, so are their chains,
+        # which keeps everything: any of its files can be under one.
         recorded_only = snapshot_only_overlays(overlays, sources)
-        overlay_chains = (session.backing_chains(recorded_only)
-                          if recorded_only else {})
+        if overlays_unread:
+            overlay_chains = None
+        else:
+            overlay_chains = (session.backing_chains(recorded_only)
+                              if recorded_only else {})
         if overlay_chains is not None:
             # gone already: saved as built on nothing, which a retry tells
             # apart from one it knows nothing of
@@ -1429,7 +1435,9 @@ class VMsMixin:
         overlay with no chain saved, keeps everything this time. Saved as
         ``None`` (none could be read), nothing was removed, so they are read
         as at capture, all of them still there — and saved, for the retries
-        after this one to decide with.
+        after this one to decide with; unless the overlays themselves could
+        not be read at capture, which no retry can do, the domain gone: then
+        every retry keeps everything.
 
         Returns:
             ``(chains, found)``: the chains to decide with, or ``None``; and
@@ -1448,6 +1456,12 @@ class VMsMixin:
         heads = list(dict.fromkeys([
             *snapshot_only_overlays(saved.overlays, sources),
             *(known or {})]))
+        if known is None and saved.overlays is None:
+            self.logger.warning(
+                f"{saved.vm_name}: the overlays its snapshots recorded could "
+                f"not be read when the teardown began, and cannot be now, so "
+                f"no retry removes anything one of them may be built on")
+            return None, {}
         if known is None:
             now = session.backing_chains(heads) if heads else {}
             gone = [head for head in heads if now is not None

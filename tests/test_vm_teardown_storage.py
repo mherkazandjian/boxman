@@ -3957,6 +3957,43 @@ class TestOverlaysInADiskSnapshotDir:
         assert 'could not read the overlays its snapshots recorded' in (
             t.warnings)
 
+    @PATHS
+    def test_snapshots_that_cannot_be_read_keep_the_disk_the_vm_is_on(
+            self, tmp_path, path):
+        """The domain on its base, and an overlay there no disk is on but
+        a snapshot may record, built on that base: with the snapshots
+        unread, nothing tells, so the base is kept too."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(ov / f'{VM}.s1')
+        t = _Teardown(workdir, disks=[base], records=[], disk_snapshot_dir=ov,
+                      overlays=None)
+
+        getattr(t, path)()
+
+        assert base.exists() and s1.exists()
+        assert f'left {base} in place because' in t.warnings
+        assert _inventories(tmp_path), "the inventory that keeps it went"
+
+    def test_a_retry_after_the_snapshots_could_not_be_read_keeps_the_disk(
+            self, tmp_path):
+        """What the first attempt could not read cannot be read again: the
+        domain is gone, and its snapshots with it."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(ov / f'{VM}.s1')
+        t = _Teardown(workdir, disks=[base], records=[], disk_snapshot_dir=ov,
+                      overlays=None)
+        t.deprovision()
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+
+        t.deprovision()
+
+        assert base.exists() and s1.exists()
+        assert f'left {base} in place because' in t.warnings
+        assert _inventories(tmp_path)
+
     def test_one_another_domains_snapshot_records_is_kept(self, tmp_path):
         """VM ``<vm>`` taking ``x.s1`` and VM ``<vm>.x`` taking ``s1`` name
         one overlay: one another domain's snapshot records is not this
