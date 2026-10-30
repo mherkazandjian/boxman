@@ -217,6 +217,10 @@ class _FakeLibvirt:
         self.probe_ok = probe_ok
         self.domstate_ok = domstate_ok
         self.stops_on_save = stops_on_save
+        # what the next start makes of the managed save: libvirt records
+        # the state the guest was saved from, unless --running or --paused
+        # says otherwise (#276)
+        self.restores_running = True
         self.calls = []
 
     def execute(self, *args, **kwargs):
@@ -235,6 +239,8 @@ class _FakeLibvirt:
 
         if cmd == 'managedsave':
             if self.managedsave_ok:
+                self.restores_running = '--running' in args or (
+                    '--paused' not in args and self.state == 'running')
                 if self.stops_on_save:
                     self.state = 'shut off'
                 self.managed_saved = True
@@ -244,7 +250,8 @@ class _FakeLibvirt:
 
         if cmd == 'start':
             if self.start_ok:
-                self.state = 'running'
+                self.state = ('paused' if self.managed_saved
+                              and not self.restores_running else 'running')
                 self.managed_saved = False
             return MagicMock(ok=self.start_ok,
                              return_code=0 if self.start_ok else 1,
@@ -338,6 +345,64 @@ class TestSaveUsesManagedSave:
 
         assert self._run(fake) is False
         assert 'managedsave' not in fake.commands()
+
+    def test_a_paused_guest_is_saved(self):
+        """
+        Its vCPUs are stopped but its memory is still on the host, and
+        libvirt saves it like a running one (#276).
+        """
+        fake = _FakeLibvirt(state='paused')
+
+        assert self._run(fake) is True
+        assert fake.state == 'shut off'
+        assert fake.managed_saved is True
+
+    @pytest.mark.parametrize('saved_from', ['running', 'paused'])
+    def test_a_saved_guest_comes_back_running_whatever_it_was_saved_from(
+            self, saved_from):
+        """
+        libvirt restores a managed save in the state it was taken from, so
+        a guest saved while paused came back paused, and the restore that
+        `up` runs read that as a failed start (#276).
+        """
+        fake = _FakeLibvirt(state=saved_from)
+
+        with patch('boxman.providers.libvirt.session.VirshCommand',
+                   return_value=fake):
+            session = _libvirt_session()
+            assert session.save_vm(VM1, '/tmp/wd') is True
+            assert session.restore_vm(VM1, '/tmp/wd') is True
+
+        assert fake.state == 'running'
+
+    def test_a_shut_off_guest_is_refused_naming_its_state(self):
+        """``control save`` still refuses it, and says why (#276)."""
+        fake = _FakeLibvirt(state='shut off', managed_saved=False)
+
+        with patch('boxman.providers.libvirt.session.VirshCommand',
+                   return_value=fake):
+            session = _libvirt_session()
+            assert session.save_vm(VM1, '/tmp/wd') is False
+
+        message = session.logger.warning.call_args.args[0]
+        assert 'is shut off' in message
+        assert 'no state to save' in message
+
+    def test_a_guest_already_saved_is_refused_saying_so(self):
+        """
+        A second ``control save`` finds the image the first one wrote, which
+        libvirt reports as a plain shut-off domain (#276).
+        """
+        fake = _FakeLibvirt(state='shut off', managed_saved=True)
+
+        with patch('boxman.providers.libvirt.session.VirshCommand',
+                   return_value=fake):
+            session = _libvirt_session()
+            assert session.save_vm(VM1, '/tmp/wd') is False
+
+        assert 'managedsave' not in fake.commands()
+        assert 'already holds a managed save' in \
+            session.logger.warning.call_args.args[0]
 
 
 class TestRestorePolicy:
