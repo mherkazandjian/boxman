@@ -2805,6 +2805,9 @@ class LibVirtSession(SessionConfigMixin):
         unused — libvirt chooses the location (``/var/lib/libvirt/qemu/save``,
         which the docker runtime persists as of #164 FB-2).
 
+        A paused guest is saved too, and comes back running: its vCPUs are
+        stopped but its memory is there to write out (#276).
+
         Args:
             vm_name: Name of the VM to save
             workdir: Ignored; libvirt owns the memory image's location
@@ -2821,13 +2824,27 @@ class LibVirtSession(SessionConfigMixin):
                     f"could not read the state of vm {vm_name}: "
                     f"{(result.stderr or '').strip()}")
                 return False
-            if "running" not in result.stdout:
+            state = (result.stdout or '').strip()
+            if "running" not in state and "paused" not in state:
+                # Shut off holds no memory to write; shut off with a managed
+                # save already holds the image this would write.
+                held = (self.has_managed_save(vm_name)
+                        if state in ('shut off', 'shutoff') else None)
                 self.logger.warning(
-                    f"vm {vm_name} is not running, cannot save state")
+                    f"vm {vm_name} already holds a managed save, nothing "
+                    f"more to save" if held else
+                    f"vm {vm_name} is {state or 'in an unknown state'}, "
+                    f"not running or paused: there is no state to save")
                 return False
 
             self.logger.info(f"saving the vm {vm_name} state (managed save)")
-            result = virsh.execute("managedsave", vm_name, warn=True)
+            # --running: the next start runs the guest whatever state it was
+            # saved from. libvirt otherwise records the state, so a guest
+            # saved while paused would come back paused, which restore_vm
+            # and start_vm both read as a start that failed — and `up`
+            # resumes a paused VM anyway (#276).
+            result = virsh.execute(
+                "managedsave", vm_name, "--running", warn=True)
             if not result.ok:
                 # A guest libvirt cannot save — one with PCI passthrough, for
                 # instance — is reported as a failure. Quietly shutting it
