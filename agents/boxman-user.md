@@ -1172,7 +1172,9 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   the guest writes to: the directory holds live disks, not backups — and
   restore writes its `<overlay>.preserve` copies there too. A take sees to
   a libvirt storage pool on it (`bprj__<project>__bprj_<cluster>_disk_snapshots`
-  unless one is already on it under that path); under `use_sudo: false` the
+  unless one is already on it under that path; with that name taken, as
+  after the directory moved, the first free `<name>_<n>`); under
+  `use_sudo: false` the
   in-use scan reads the overlays through it, and without one every
   teardown keeps what it would remove (the take warns). A teardown never decides by name there —
   another VM's full name can begin with this one's and a dot: it removes

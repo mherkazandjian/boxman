@@ -87,8 +87,10 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
     serves neither — and is that directory by identity, ``(st_dev,
     st_ino)``: spelled alike, ``hidden/link/../../ov`` can be another
     directory than ``ov``, and one that cannot be looked up is not taken
-    for it. With *name* taken by a pool on this directory under another
-    path, the first free ``<name>_<n>`` is defined instead.
+    for it. With *name* taken -- by a pool on this directory under another
+    path, or on another directory, as when a cluster's disk_snapshot_dir
+    moved with a pool still on the old one, which is left as it is -- the
+    first free ``<name>_<n>`` is defined instead.
 
     Best effort: what stops it is named in a warning, never raised.
 
@@ -115,8 +117,6 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
         return None
     names = [line.strip() for line in listing.stdout.splitlines()
              if line.strip()]
-    # on it, but under another path: no lookup by this one finds them
-    elsewhere: set[str] = set()
     for pool in names:
         dumped = virsh.execute("pool-dumpxml", pool, warn=True)
         try:
@@ -135,8 +135,7 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
         if (on.st_dev, on.st_ino) != target:
             continue
         if os.path.normpath(path) != os.path.normpath(directory):
-            elsewhere.add(pool)
-            continue
+            continue      # on it under another path: no lookup finds it
         active = virsh.execute("pool-list", "--name", warn=True)
         if active.ok and pool in (line.strip()
                                   for line in active.stdout.splitlines()):
@@ -147,15 +146,12 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
                         f"started: {(started.stderr or '').strip()}")
             return None
         return pool
-    if name in elsewhere:
-        # its name is taken on this very directory, under another path
+    if name in names:
+        # taken by a pool not on it as spelled, which stays as it is
         taken, n = name, 2
         while f"{taken}_{n}" in names:
             n += 1
         name = f"{taken}_{n}"
-    elif name in names:
-        log.warning(f"{where}: a pool named {name} is on another directory")
-        return None
     for verb in ("pool-define-as", "pool-start"):
         args = ((name, "dir", "--target", directory)
                 if verb == "pool-define-as" else (name,))

@@ -168,13 +168,19 @@ class TestEnsurePoolOn:
     def test_a_pool_of_that_name_on_another_directory_is_not_taken(
             self, tmp_path):
         """A workdir ``.../ws/web`` and an overlay directory ``.../ov/web``
-        share a basename: a pool found by name would not be on it."""
+        share a basename, and a cluster's disk_snapshot_dir can move with a
+        pool still on the old one: a pool found by name would not be on it.
+        That one is left as it is, and the first free name is defined."""
         ov = tmp_path / "ov" / "web"
         ov.mkdir(parents=True)
-        virsh = self._virsh({"web": str(tmp_path / "ws" / "web")})
+        virsh = self._virsh({"web": str(tmp_path / "ws" / "web"),
+                             "web_2": "/elsewhere"})
 
-        assert ensure_pool_on(virsh, str(ov), "web") is None
-        assert self._verbs(virsh, "pool-define-as") == []
+        assert ensure_pool_on(virsh, str(ov), "web") == "web_3"
+        assert self._verbs(virsh, "pool-define-as") == [
+            ("pool-define-as", "web_3", "dir", "--target", str(ov))]
+        for verb in ("pool-destroy", "pool-undefine", "pool-delete"):
+            assert self._verbs(virsh, verb) == []
 
     def test_one_on_it_spelled_alike_is_used(self, tmp_path):
         ov = tmp_path / "ov"
