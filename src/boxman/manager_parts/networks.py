@@ -53,7 +53,8 @@ class NetworksMixin:
     def reconcile_networks(self,
                            dry_run: bool = False,
                            allow_recreate: bool = False,
-                           auto_accept: bool = False) -> dict[str, str]:
+                           auto_accept: bool = False,
+                           prune: bool = False) -> dict[str, str]:
         """
         Bring the libvirt networks in line with the configuration.
 
@@ -70,21 +71,29 @@ class NetworksMixin:
           attached guests with a dead nic, so it only happens with
           *allow_recreate*, and the guests are re-attached afterwards.
 
+        A network the project provisioned but no longer declares is
+        reported every run, and removed only with *prune* — see
+        :meth:`_prune_orphaned_networks`.
+
         Args:
             dry_run: report the plan and change nothing
             allow_recreate: permit the disruptive path
             auto_accept: skip the confirmation prompt for a recreate
+            prune: remove networks dropped from the config, rather than
+                only reporting them
 
         Returns:
             A mapping of network name to the action taken: one of ``created``,
-            ``updated``, ``recreated``, ``skipped`` or ``failed``.
+            ``updated``, ``recreated``, ``skipped``, ``failed`` or
+            ``removed``.
         """
         if not hasattr(self.provider, 'plan_network'):
             self.logger.debug(
                 "provider does not support network reconciliation, skipping")
             return {}
 
-        results: dict[str, str] = {}
+        results: dict[str, str] = self._prune_orphaned_networks(
+            dry_run=dry_run, prune=prune)
 
         for cluster_name, cluster in self.config['clusters'].items():
             for network_name, network_info in (cluster.get('networks') or {}).items():
@@ -229,6 +238,333 @@ class NetworksMixin:
                         f"network {label}: could not apply isolation rules")
 
         return outcomes
+
+    def _declared_network_names(self) -> set:
+        """
+        The full names of every network this project's config declares.
+
+        The same construction the lifecycle loops use, so "declared" here
+        means exactly what it means to :meth:`define_networks` and
+        :meth:`destroy_networks`.
+
+        Returns:
+            set: fully qualified network names.
+        """
+        return {
+            self.full_network_name(project_config=self.config,
+                                   cluster_name=cluster_name,
+                                   network_name=network_name)
+            for cluster_name, cluster in self._vm_clusters.items()
+            for network_name in (cluster.get('networks') or {})
+        }
+
+    def _orphaned_networks(self) -> dict:
+        """
+        Networks this project provisioned and no longer declares.
+
+        Every lifecycle loop iterates the *declared* networks, so one
+        dropped from ``conf.yml`` is by construction absent from all of
+        them: it stays defined and active, holding its bridge and subnet,
+        and ``check_network_exists`` counts its cache record as a conflict
+        against any later network of the same name (#189).
+
+        The cache is the record of what was provisioned. Only this
+        project's own entries are considered, and only those whose name
+        carries this project's prefix — a ``project::cluster::net``
+        reference resolves to *another* project's network, which this
+        project may use but does not own.
+
+        Returns:
+            dict: ``{full_name: cached_info}`` for each orphan, empty when
+            the declared set accounts for everything provisioned.
+        """
+        project = (self.config or {}).get('project')
+        if not project:
+            return {}
+
+        try:
+            self.cache.read_projects_cache()
+        except (OSError, ValueError) as exc:
+            # an unreadable cache is not an empty one; saying "nothing was
+            # provisioned" here would hide every orphan there is
+            self.logger.warning(
+                f"could not read the projects cache ({exc}); not checking "
+                f"for networks dropped from the config")
+            return {}
+
+        entry = (self.cache.projects or {}).get(project) or {}
+        provisioned = entry.get('networks') or {}
+        if not provisioned:
+            return {}
+
+        declared = self._declared_network_names()
+        owned_prefix = f'bprj__{project}__bprj__'
+        return {
+            name: info for name, info in provisioned.items()
+            if name not in declared and name.startswith(owned_prefix)
+        }
+
+    def _prune_orphaned_networks(self,
+                                 dry_run: bool = False,
+                                 prune: bool = False) -> dict[str, str]:
+        """
+        Report — and with *prune*, remove — networks dropped from the config.
+
+        Removing a network from ``conf.yml`` used to leak it: every
+        lifecycle loop iterates the declared networks, so the dropped one
+        was destroyed by nothing, kept its bridge and subnet, and its cache
+        record then counted as a conflict against any later network of the
+        same name (#189).
+
+        Reporting is unconditional because the leak is otherwise invisible;
+        removal is not, because a network is infrastructure and guests may
+        still be attached to it. A network with attached domains is never
+        removed even under *prune* — the guests would be left with a dead
+        nic — and the refusal names them. Nor is one whose attachments
+        could not be determined: under *prune* that is a failure, since the
+        removal that was asked for could not be done safely.
+
+        Args:
+            dry_run: say what would happen and change nothing.
+            prune: actually remove the orphans.
+
+        Returns:
+            dict: ``{full_name: outcome}`` for each orphan — ``removed``,
+            ``failed``, or ``skipped`` when it was only reported.
+        """
+        orphans = self._orphaned_networks()
+        if not orphans:
+            return {}
+
+        results: dict[str, str] = {}
+        for full_name, cached in sorted(orphans.items()):
+            attached, unknown = self._attached_domains(full_name)
+            if unknown:
+                removing = prune and not dry_run
+                (self.logger.error if removing else self.logger.warning)(
+                    f"network {full_name} is no longer in the config, but "
+                    f"whether guests are still attached to it could not be "
+                    f"determined ({unknown}); not removing it.")
+                results[full_name] = 'failed' if removing else 'skipped'
+                continue
+
+            if attached:
+                self.logger.warning(
+                    f"network {full_name} is no longer in the config but "
+                    f"{len(attached)} guest(s) are still attached to it "
+                    f"({', '.join(sorted(attached))}); leaving it alone. "
+                    f"Detach or destroy them first.")
+                results[full_name] = 'skipped'
+                continue
+
+            if not prune:
+                self.logger.warning(
+                    f"network {full_name} is no longer in the config but is "
+                    f"still defined (bridge "
+                    f"{cached.get('bridge_name') or 'unknown'}). It is "
+                    f"holding its bridge and subnet, and will collide with a "
+                    f"later network of the same name. Remove it with "
+                    f"`boxman up --prune-networks`.")
+                results[full_name] = 'skipped'
+                continue
+
+            if dry_run:
+                self.logger.info(f"[dry-run] would remove network {full_name}")
+                results[full_name] = 'skipped'
+                continue
+
+            results[full_name] = self._remove_orphaned_network(
+                full_name, cached)
+
+        return results
+
+    def _attached_domains(self, full_name: str) -> tuple[list, str | None]:
+        """
+        The guests attached to *full_name*, as the provider reports them.
+
+        An empty list from a provider that cannot answer is the dangerous
+        direction here — it reads as "nothing is attached" and lets the
+        removal proceed — so a provider without the capability, or one that
+        fails to answer, is reported as an unknown rather than as an empty
+        list.
+
+        Args:
+            full_name: the fully qualified network name.
+
+        Returns:
+            tuple: ``(domain names, None)``, or ``([], reason)`` when the
+            question could not be answered.
+        """
+        session = self.provider
+        if not hasattr(session, 'network_attached_domains'):
+            return [], 'the provider does not report attachments'
+        try:
+            return list(session.network_attached_domains(full_name)), None
+        except Exception as exc:
+            return [], f'{type(exc).__name__}: {exc}'
+
+    def _record_orphan_state(self, full_name: str, mode: str,
+                             bridge_name: str | None) -> None:
+        """
+        Write a network's live forward mode and bridge into its cache entry.
+
+        ``remove_network`` undefines a network before it withdraws a routed
+        network's isolation rules, so a removal that fails between the two
+        leaves no definition to read the mode from on the next run. The
+        record is what lets that run finish the teardown rather than guess.
+
+        Raises:
+            KeyError: when the entry is no longer in the cache.
+            OSError, ValueError: when the cache cannot be read or written.
+        """
+        self.cache.read_projects_cache()
+        record = self.cache.projects[self.config['project']]['networks'][full_name]
+        if (record.get('mode') == mode
+                and (not bridge_name or record.get('bridge_name') == bridge_name)):
+            return
+        record['mode'] = mode
+        if bridge_name:
+            record['bridge_name'] = bridge_name
+        self.cache.write_projects_cache()
+
+    def _orphan_teardown_info(self, full_name: str,
+                              cached: dict) -> dict | None:
+        """
+        Describe an orphaned network for ``remove_network``, or refuse to.
+
+        The forward mode decides whether removal also withdraws iptables
+        rules -- only ``route`` has boxman-owned ones -- and ``Network``
+        takes a missing mode for ``nat``, which skips exactly that teardown.
+        So the mode is never left out and never guessed:
+
+        - a defined network is described from its *live* definition, and
+          that mode and bridge are recorded in the cache entry before
+          anything is torn down;
+        - a network libvirt no longer has is described from that record --
+          left by an earlier removal that stopped half way -- and a routed
+          one only while no defined network holds its bridge, whose rules
+          would otherwise be the ones withdrawn;
+        - anything that cannot be read, or was never recorded, is a refusal.
+
+        Args:
+            full_name: the fully qualified network name.
+            cached: its cache record.
+
+        Returns:
+            dict: the ``info`` for ``remove_network``, or None when it must
+            not be removed; the reason has been logged.
+        """
+        def refuse(reason: str) -> None:
+            self.logger.error(
+                f"not removing the orphaned network {full_name}: {reason}. "
+                f"Its cache entry is kept, so it is reported again on the "
+                f"next run.")
+
+        session = self.provider
+        if not hasattr(session, 'live_network_state'):
+            refuse("the provider cannot report its live definition, so its "
+                   "forward mode is unknown")
+            return None
+        try:
+            actual = session.live_network_state(full_name)
+        except Exception as exc:
+            refuse(f"its live definition could not be read "
+                   f"({type(exc).__name__}: {exc}), and its forward mode "
+                   f"decides whether isolation rules have to be removed too")
+            return None
+
+        if actual is not None:
+            mode, bridge = actual.get('mode'), actual.get('bridge_name')
+            if not mode:
+                refuse("its live definition names no forward mode")
+                return None
+            if mode == 'route' and not bridge:
+                refuse("it is a routed network with no bridge in its live "
+                       "definition, so its isolation rules cannot be found")
+                return None
+            try:
+                self._record_orphan_state(full_name, mode, bridge)
+            except (KeyError, OSError, ValueError) as exc:
+                refuse(f"its forward mode could not be recorded in the "
+                       f"projects cache first ({type(exc).__name__}: {exc})")
+                return None
+            return self._teardown_info({'actual': actual}, cached)
+
+        mode, bridge = cached.get('mode'), cached.get('bridge_name')
+        if not mode:
+            refuse(f"libvirt no longer has it and its forward mode was never "
+                   f"recorded, so whether it left isolation rules on bridge "
+                   f"{bridge or '(unknown)'} cannot be told. Check for "
+                   f"BXM_ISO_* chains on that bridge and remove the entry "
+                   f"from the projects cache by hand")
+            return None
+
+        info: dict[str, Any] = {'mode': mode}
+        if mode == 'route':
+            if not bridge:
+                refuse("it was a routed network and no bridge is recorded "
+                       "for it, so its isolation rules cannot be found")
+                return None
+            if not hasattr(session, 'network_bridges'):
+                refuse(f"the provider cannot say whether another network "
+                       f"now holds bridge {bridge}")
+                return None
+            try:
+                holders = sorted(name for name, held in
+                                 session.network_bridges().items()
+                                 if held == bridge)
+            except Exception as exc:
+                refuse(f"whether another network now holds bridge {bridge} "
+                       f"could not be determined ({type(exc).__name__}: "
+                       f"{exc})")
+                return None
+            if holders:
+                refuse(f"bridge {bridge} now belongs to "
+                       f"{', '.join(holders)}, and withdrawing the isolation "
+                       f"rules on it would withdraw that network's")
+                return None
+        if bridge:
+            info['bridge'] = {'name': bridge}
+        return info
+
+    def _remove_orphaned_network(self, full_name: str, cached: dict) -> str:
+        """
+        Remove one orphaned network and forget its cache entry.
+
+        See :meth:`_orphan_teardown_info` for how the network is described
+        to the removal, and when it is not removed at all.
+
+        Args:
+            full_name: the fully qualified network name.
+            cached: its cache record, for the address and bridge.
+
+        Returns:
+            str: ``removed`` or ``failed``.
+        """
+        info = self._orphan_teardown_info(full_name, cached)
+        if info is None:
+            return 'failed'
+
+        try:
+            removed = self.provider.remove_network(name=full_name, info=info)
+        except Exception as exc:
+            self.logger.error(
+                f"failed to remove the orphaned network {full_name}: "
+                f"{type(exc).__name__}: {exc}. Its cache entry is kept so the "
+                f"next run tries again.")
+            return 'failed'
+
+        if not removed:
+            self.logger.error(
+                f"failed to remove the orphaned network {full_name} "
+                f"completely. Its cache entry is kept so the next run tries "
+                f"again.")
+            return 'failed'
+
+        self.logger.info(
+            f"removed network {full_name}, which is no longer in the config")
+        self._forget_cached_network(full_name)
+        return 'removed'
 
     def report_network_results(self, results: dict[str, str]) -> None:
         """
