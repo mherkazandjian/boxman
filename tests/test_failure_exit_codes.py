@@ -308,6 +308,9 @@ class TestLifecycleFailuresRaise:
         monkeypatch.setattr(
             BoxmanManager, "_control_vm_targets",
             lambda cls, cli_args: [("vm1", "/tmp/ws/c1")])
+        # running, so down tries it: one already down is left alone (#276)
+        monkeypatch.setattr(
+            BoxmanManager, "_get_vm_states", lambda cls: {"vm1": "running"})
         monkeypatch.setattr(
             BoxmanManager, "_run_parallel", _sync_run_parallel)
         mgr.provider.save_vm.return_value = save_ok

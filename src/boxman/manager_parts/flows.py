@@ -590,6 +590,11 @@ class FlowsMixin:
         ``--suspend``, pauses VMs in memory instead (same as
         ``boxman control suspend``).
 
+        A VM that is already down — shut off, or saved by an earlier
+        ``down``, or paused under ``--suspend`` — is left as it is, with a
+        line saying so. A paused VM is saved, and comes back running. Only
+        a VM ``down`` tried and failed to bring down fails the run (#276).
+
         docker-compose clusters are always brought down with
         ``docker compose stop`` (containers kept, reversible via ``up``);
         ``--suspend`` does not apply to them — compose has no in-memory
@@ -610,6 +615,18 @@ class FlowsMixin:
 
         use_suspend = getattr(cli_args, 'suspend', False)
 
+        # A VM already down is left as it is and counts as done. Handing it
+        # to a save or suspend that refuses it failed the run and called the
+        # VM's state undefined, when it was plainly shut off or saved
+        # (#276). States that cannot be read leave every VM to be tried:
+        # the save or suspend then reports any it cannot bring down.
+        states = (self._vm_states_if_known() or {}) if vm_list else {}
+        vm_list = [
+            (vm_name, workdir) for vm_name, workdir in vm_list
+            if not self._already_down(
+                vm_name, states.get(vm_name), use_suspend)
+        ]
+
         if use_suspend:
             if vm_list:
                 self.logger.info("suspending all VMs (--suspend)...")
@@ -628,9 +645,13 @@ class FlowsMixin:
             if vm_list:
                 self.logger.info("saving the state of all VMs to disk...")
 
-            def _save(vm_name, workdir):
+            def _save(vm_name, workdir, state):
                 # Not "to <workdir>": the memory image belongs to libvirt
                 # now, under /var/lib/libvirt/qemu/save (#164 FB-3).
+                if state == 'paused':
+                    self.logger.info(
+                        f"VM '{vm_name}' is paused; saving it, and the next "
+                        f"'up' brings it back running")
                 self.logger.info(f"saving VM '{vm_name}' state...")
                 if not self.session_for_vm(vm_name).save_vm(vm_name, workdir):
                     raise ProvisionError(
@@ -638,7 +659,7 @@ class FlowsMixin:
                 self.logger.info(f"VM '{vm_name}' state saved")
 
             processes = [
-                (vm_name, _save, (vm_name, workdir))
+                (vm_name, _save, (vm_name, workdir, states.get(vm_name)))
                 for vm_name, workdir in vm_list
             ]
 
@@ -667,6 +688,32 @@ class FlowsMixin:
                 f"the cause.")
 
         self.logger.info("infrastructure is down")
+
+    def _already_down(self, vm_name: str, state: str | None,
+                      use_suspend: bool) -> bool:
+        """
+        Whether ``down`` finds *vm_name* already down, saying so if it does.
+
+        *state* is as _get_vm_states() reports it, where a shut-off domain
+        holding a managed save is 'managedsave' rather than 'shut off'.
+        Shut off and saved are down for either form of ``down``. Paused is
+        down only for ``--suspend``, which would have made the same of it;
+        plain ``down`` saves a paused VM, whose memory is still held on the
+        host. Any other state, or none (the VM is not listed, or the states
+        could not be read), is not down: the VM is tried, and a save or
+        suspend that refuses it is reported (#276).
+        """
+        if state in self._SHUT_OFF_STATES:
+            what = 'shut off'
+        elif state == 'managedsave':
+            what = 'saved'
+        elif state == 'paused' and use_suspend:
+            what = 'suspended'
+        else:
+            return False
+        self.logger.info(
+            f"VM '{vm_name}' is already {what}; leaving it as it is")
+        return True
 
     def deprovision(self, cli_args, finalize: bool = True):
         """
