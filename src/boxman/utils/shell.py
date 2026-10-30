@@ -47,6 +47,37 @@ class _StoppingLocal(invoke.runners.Local):
     #: how long a command has to end after its SIGINT, before it is killed
     STOP_TIMEOUT = 10
 
+    def start(self, command: str, shell: str, env: dict[str, Any]) -> None:
+        # invoke has the command only once Popen returns, and Popen forks,
+        # then waits for the command's exec: a KeyboardInterrupt in between
+        # left _stop() no command to stop, and the command ran on without
+        # boxman (#278). So a SIGINT is held back until invoke has the
+        # command, and handled then. Blocking SIGINT would not do: the
+        # command inherits the mask, so the SIGINT _stop() sends it stays
+        # pending, and another thread takes a SIGINT blocked here and has it
+        # raised here all the same. Only a Python handler is swapped, for
+        # another, which leaves the command's disposition as it was; an
+        # ignored SIGINT, or the default one, raises nothing to hold back
+        previous = signal.getsignal(signal.SIGINT)
+        held_back: list[tuple[Any, ...]] = []
+        swapped = False
+        if callable(previous):
+            try:
+                signal.signal(signal.SIGINT, lambda *received: held_back.append(received))
+                swapped = True
+            except ValueError:
+                # not the main thread, which is where SIGINT is handled anyway
+                pass
+        try:
+            super().start(command, shell, env)
+        finally:
+            if swapped:
+                signal.signal(signal.SIGINT, previous)
+                if held_back:
+                    # as if it came now, once however many came: for the
+                    # default handler, a KeyboardInterrupt
+                    previous(*held_back[0])
+
     def send_interrupt(self, interrupt: KeyboardInterrupt) -> None:
         # invoke calls this from its wait for the command, and waits on
         # afterwards without a limit: stopping it here is what gives a
@@ -93,9 +124,9 @@ class _StoppingLocal(invoke.runners.Local):
                 raise KeyboardInterrupt from None
             raise
         except KeyboardInterrupt:
-            # one invoke did not pass on: it came after the command started
-            # and before invoke began to wait for it, so the command would
-            # run on without boxman
+            # one invoke did not pass on: it came after the command started,
+            # or start() held it back until then, and before invoke began to
+            # wait for it, so the command would run on without boxman
             self._stop()
             raise
         if self.interrupted:
