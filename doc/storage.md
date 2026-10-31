@@ -315,9 +315,11 @@ clusters:
   `disk_snapshot_dir`, are not measured or compacted.
 - `snapshot restore`, `delete` and `collapse` follow the paths libvirt
   recorded, wherever they are; a restore writes its `<overlay>.preserve`
-  copies beside each overlay. An overlay the revert discarded is not put
-  back: reverting to a snapshot with no children, libvirt deletes its
-  overlays and records the new ones in their place.
+  copies beside each overlay. Reverting to a snapshot with no children,
+  libvirt deletes its overlays and records the new ones in their place: the
+  old ones are put back all the same, since whether another domain needs
+  one cannot be told while it is gone, and named in a warning. Nothing
+  removes them; remove them by hand once no other domain uses them.
 
 ---
 

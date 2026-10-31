@@ -1958,27 +1958,7 @@ class TestSnapshotRestore:
         assert [call.args[0] for call in execute.call_args_list
                 if call.args] == ["snapshot-revert"]
         # a revert that succeeded: what it discarded is not put back
-        restore.assert_called_once_with(preserved_pairs, vm_name="vm01",
-                                        used_elsewhere=None)
-
-    @pytest.mark.parametrize("revert_ok", [True, False])
-    def test_the_look_at_other_domains_reaches_only_a_revert_that_succeeded(
-            self, sm: SnapshotManager, revert_ok):
-        def elsewhere(paths):
-            return set()
-
-        with _not_running(sm), \
-             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
-             patch.object(sm, "_memory_path_from_xml", return_value=None), \
-             patch.object(sm.virsh, "execute",
-                          return_value=_result(ok=revert_ok, stderr="boom")), \
-             patch.object(sm, "_restore_preserved_overlays",
-                          return_value=[]) as restore:
-            sm.snapshot_restore("vm01", "snap1", used_elsewhere=elsewhere)
-
-        restore.assert_called_once_with(
-            [], vm_name="vm01" if revert_ok else None,
-            used_elsewhere=elsewhere if revert_ok else None)
+        restore.assert_called_once_with(preserved_pairs, vm_name="vm01")
 
     def test_restore_called_even_when_revert_fails(self, sm: SnapshotManager):
         with _not_running(sm), \
@@ -1990,8 +1970,7 @@ class TestSnapshotRestore:
                           return_value=[]) as restore:
             assert sm.snapshot_restore("vm01", "snap1") is False
         # one that failed tells nothing of what it discarded: all go back
-        restore.assert_called_once_with([], vm_name=None,
-                                        used_elsewhere=None)
+        restore.assert_called_once_with([], vm_name=None)
 
     def test_retries_on_write_lock_contention(self, sm: SnapshotManager):
         results = [
@@ -3327,155 +3306,81 @@ class TestCollapseKeepsTheLiveDisk:
 class TestWhatTheRevertDiscards:
     """Reverting to a snapshot with no children, libvirt deletes its
     overlays and records the new ones it made in their place
-    (qemuSnapshotRevertExternalFinish). One put back from its backup is
-    then recorded by nothing, and nothing ever removes it."""
+    (qemuSnapshotRevertExternalFinish). Every overlay the revert deleted is
+    put back all the same: whether another domain needs one cannot be told
+    while it is gone. One no snapshot of the VM records any more is named,
+    to remove by hand."""
 
     @staticmethod
-    def _reverted(tmp_path):
-        """s1's old overlay as the backup and the revert leave it, and the
-        new one the revert made on the base."""
-        base = tmp_path / "vm01_disk.qcow2"
-        _qemu("qemu-img", "create", "-q", "-f", "qcow2", str(base), "1M")
+    def _deleted(tmp_path):
         old = tmp_path / "vm01_disk.s1"
-        _qemu("qemu-img", "create", "-q", "-f", "qcow2",
-              "-b", str(base), "-F", "qcow2", str(old))
         backup = tmp_path / "vm01_disk.s1.preserve"
-        os.rename(old, backup)
-        new = tmp_path / "vm01_disk.1785187700"
-        _qemu("qemu-img", "create", "-q", "-f", "qcow2",
-              "-b", str(base), "-F", "qcow2", str(new))
-        return base, old, backup, new
+        backup.write_bytes(b"the only copy")
+        return old, backup
 
-    @needs_qemu
-    def test_one_nothing_records_or_is_built_on_is_not_put_back(
+    @staticmethod
+    def _warned(warning):
+        return " ".join(str(c.args[0]) for c in warning.call_args_list)
+
+    def test_one_no_snapshot_records_is_put_back_and_named(
             self, sm, tmp_path):
-        base, old, backup, new = self._reverted(tmp_path)
-
-        with _inventory(sm, {"s1": [str(new)]}, ["s1"]), \
-             patch.object(sm, "_data_disk_targets",
-                          return_value=[("vda", str(new))]), \
-             patch.object(sm.virsh, "execute_shell",
-                          side_effect=_shell_that_runs()):
-            unrecovered = sm._restore_preserved_overlays(
-                [(str(old), str(backup))], vm_name="vm01",
-                used_elsewhere=_nowhere)
-
-        assert unrecovered == []
-        assert not old.exists() and not backup.exists()
-        assert _chain(new) == [str(new), str(base)]
-
-    @needs_qemu
-    def test_one_a_snapshot_still_records_is_put_back(self, sm, tmp_path):
-        _base, old, backup, new = self._reverted(tmp_path)
-
-        with _inventory(sm, {"s1": [str(new)], "s2": [str(old)]},
-                        ["s1", "s2"]), \
-             patch.object(sm, "_data_disk_targets",
-                          return_value=[("vda", str(new))]), \
-             patch.object(sm.virsh, "execute_shell",
-                          side_effect=_shell_that_runs()):
-            assert sm._restore_preserved_overlays(
-                [(str(old), str(backup))], vm_name="vm01",
-                used_elsewhere=_nowhere) == []
-
-        assert old.is_file() and not backup.exists()
-
-    @needs_qemu
-    def test_one_a_disk_may_be_built_on_is_put_back(self, sm, tmp_path):
-        # the disk the domain is on is built on it: with it gone, that
-        # chain cannot be read, and nothing shows it is not needed
-        _base, old, backup, _new = self._reverted(tmp_path)
-        above = tmp_path / "vm01_disk.above"
-        os.rename(backup, old)
-        _qemu("qemu-img", "create", "-q", "-f", "qcow2",
-              "-b", str(old), "-F", "qcow2", str(above))
-        os.rename(old, backup)
-
-        with _inventory(sm, {"s1": [str(above)]}, ["s1"]), \
-             patch.object(sm, "_data_disk_targets",
-                          return_value=[("vda", str(above))]), \
-             patch.object(sm.virsh, "execute_shell",
-                          side_effect=_shell_that_runs()):
-            assert sm._restore_preserved_overlays(
-                [(str(old), str(backup))], vm_name="vm01",
-                used_elsewhere=_nowhere) == []
-
-        assert old.is_file() and not backup.exists()
-
-    @pytest.mark.parametrize("unread", ["inventory", "disks"])
-    def test_with_what_is_needed_unread_it_is_put_back(
-            self, sm, tmp_path, unread):
-        old = tmp_path / "vm01_disk.s1"
-        backup = tmp_path / "vm01_disk.s1.preserve"
-        backup.write_bytes(b"the only copy")
-        inventory = (patch.object(sm, "_strict_overlay_inventory",
-                                  side_effect=SnapshotError("unreadable"))
-                     if unread == "inventory"
-                     else _inventory(sm, {"s1": ["/new"]}, ["s1"]))
-        disks = [] if unread == "disks" else [("vda", "/new")]
-
-        with inventory, \
-             patch.object(sm, "_data_disk_targets", return_value=disks), \
-             patch.object(sm.virsh, "execute_shell",
-                          side_effect=_shell_that_runs()):
-            assert sm._restore_preserved_overlays(
-                [(str(old), str(backup))], vm_name="vm01",
-                used_elsewhere=_nowhere) == []
-
-        assert old.read_bytes() == b"the only copy"
-
-    @needs_qemu
-    @pytest.mark.parametrize("elsewhere", ["needed", "unread", "not asked"])
-    def test_one_another_domain_may_need_is_put_back(
-            self, sm, tmp_path, elsewhere):
-        # another domain's disk or snapshot can be built on it, or record
-        # it: only a look at every domain shows it is needed by none
-        _base, old, backup, new = self._reverted(tmp_path)
-        kwargs = {"needed": {"used_elsewhere": lambda paths: set(paths)},
-                  "unread": {"used_elsewhere": lambda paths: None},
-                  "not asked": {}}[elsewhere]
-
-        with _inventory(sm, {"s1": [str(new)]}, ["s1"]), \
-             patch.object(sm, "_data_disk_targets",
-                          return_value=[("vda", str(new))]), \
-             patch.object(sm.virsh, "execute_shell",
-                          side_effect=_shell_that_runs()):
-            assert sm._restore_preserved_overlays(
-                [(str(old), str(backup))], vm_name="vm01", **kwargs) == []
-
-        assert old.is_file() and not backup.exists()
-
-    @pytest.mark.parametrize("raising", ["disks", "chains", "elsewhere"])
-    def test_a_probe_that_raises_puts_it_back(self, sm, tmp_path, raising):
-        old = tmp_path / "vm01_disk.s1"
-        backup = tmp_path / "vm01_disk.s1.preserve"
-        backup.write_bytes(b"the only copy")
-        boom = BlockingIOError(11, "Resource temporarily unavailable")
-
-        def elsewhere(paths):
-            if raising == "elsewhere":
-                raise boom
-            return set()
+        old, backup = self._deleted(tmp_path)
 
         with _inventory(sm, {"s1": ["/new"]}, ["s1"]), \
-             patch.object(sm, "_data_disk_targets",
-                          side_effect=boom if raising == "disks" else None,
-                          return_value=[("vda", "/new")]), \
-             patch.object(sm, "_backing_chain_where_qemu_runs",
-                          side_effect=boom if raising == "chains" else None,
-                          return_value=["/new"]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()), \
+             patch.object(sm.logger, "warning") as warning:
+            assert sm._restore_preserved_overlays(
+                [(str(old), str(backup))], vm_name="vm01") == []
+
+        assert old.read_bytes() == b"the only copy" and not backup.exists()
+        warned = self._warned(warning)
+        assert str(old) in warned and "remove" in warned
+
+    def test_one_a_snapshot_still_records_is_put_back_unnamed(
+            self, sm, tmp_path):
+        old, backup = self._deleted(tmp_path)
+
+        with _inventory(sm, {"s1": ["/new"], "s2": [str(old)]},
+                        ["s1", "s2"]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()), \
+             patch.object(sm.logger, "warning") as warning:
+            assert sm._restore_preserved_overlays(
+                [(str(old), str(backup))], vm_name="vm01") == []
+
+        assert old.read_bytes() == b"the only copy"
+        assert str(old) not in self._warned(warning)
+
+    @pytest.mark.parametrize("error", [SnapshotError("unreadable"),
+                                       BlockingIOError(11, "busy")],
+                             ids=["unreadable", "raises"])
+    def test_with_the_snapshots_unread_it_is_put_back_unnamed(
+            self, sm, tmp_path, error):
+        old, backup = self._deleted(tmp_path)
+
+        with patch.object(sm, "_strict_overlay_inventory",
+                          side_effect=error), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()), \
+             patch.object(sm.logger, "warning") as warning:
+            assert sm._restore_preserved_overlays(
+                [(str(old), str(backup))], vm_name="vm01") == []
+
+        assert old.read_bytes() == b"the only copy"
+        assert str(old) not in self._warned(warning)
+
+    def test_after_a_failed_revert_nothing_is_named(self, sm, tmp_path):
+        old, backup = self._deleted(tmp_path)
+
+        with patch.object(sm, "_strict_overlay_inventory") as inventory, \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs()):
             assert sm._restore_preserved_overlays(
-                [(str(old), str(backup))], vm_name="vm01",
-                used_elsewhere=elsewhere) == []
+                [(str(old), str(backup))]) == []
 
         assert old.read_bytes() == b"the only copy"
-
-
-def _nowhere(paths):
-    """A look at every domain that finds none of *paths* used."""
-    return set()
+        inventory.assert_not_called()
 
 
 class TestFlattenCdromOverlays:

@@ -3073,38 +3073,3 @@ class TestSnapshotMemoryInUseThroughVirsh:
 
         assert in_use[str(raw)] == "vm-a"
         assert [sub for sub, _ in host.log].count("list") == 2
-
-
-class TestWhatAnyDomainNeeds:
-    """What a restore asks before it drops an overlay the revert discarded:
-    whether any domain runs on it, its snapshots record it, or either is
-    built on it."""
-
-    def test_the_paths_a_domain_uses_or_records(self, tmp_path):
-        session = _session()
-        disks = disk_cleanup.FilesInUse({"/a/x": "other"})
-        recorded = disk_cleanup.FilesInUse({"/b/y": "third"})
-        with patch.object(session, "disk_paths_in_use", return_value=disks), \
-             patch.object(session, "snapshot_files_in_use",
-                          return_value=recorded) as scan:
-            assert session._files_any_domain_needs(
-                ["/a/x", "/b/y", "/c/z"]) == {"/a/x", "/b/y"}
-        scan.assert_called_once_with(overlays_too=True)
-
-    @pytest.mark.parametrize("unread", ["disks", "snapshots"])
-    def test_one_scan_unread_tells_nothing(self, unread):
-        session = _session()
-        with patch.object(session, "disk_paths_in_use",
-                          return_value=(None if unread == "disks"
-                                        else disk_cleanup.FilesInUse())), \
-             patch.object(session, "snapshot_files_in_use",
-                          return_value=(None if unread == "snapshots"
-                                        else disk_cleanup.FilesInUse())):
-            assert session._files_any_domain_needs(["/a/x"]) is None
-
-    def test_a_restore_is_given_the_look(self):
-        session = _session()
-        with patch("boxman.providers.libvirt.session.SnapshotManager") as sm:
-            session.snapshot_restore("vm01", "s1")
-        sm.return_value.snapshot_restore.assert_called_once_with(
-            "vm01", "s1", used_elsewhere=session._files_any_domain_needs)

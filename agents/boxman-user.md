@@ -1200,7 +1200,9 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   source as it was when the snapshot was taken (`<disk>.<epoch>`), not in a
   `disk_snapshot_dir`; the next take goes back to it. An overlay the revert
   discarded (reverting to a snapshot with no children, libvirt records the
-  new overlays in its place) is not put back.
+  new overlays in its place) is put back all the same and named in a
+  warning: nothing removes it, so remove it by hand once no other domain
+  uses it.
 - A VM holding a managed save (after `boxman down`) cannot be reverted to a
   snapshot that captured no memory; the restore refuses up front. Run `boxman
   up` first, or discard the saved memory with `virsh managedsave-remove`.
