@@ -68,7 +68,7 @@ class TestSnapshotOverlayPreservation057eb7d:
                 return _result(ok=True, stdout="shut off\n")
             return _result(ok=True)
 
-        def record_restore(_pairs, vm_name=None):
+        def record_restore(_pairs, vm_name=None, used_elsewhere=None):
             call_order.append("restore")
 
         with patch.object(sm, "_preserve_snapshot_overlays",

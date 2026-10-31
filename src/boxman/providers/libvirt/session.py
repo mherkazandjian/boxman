@@ -2602,7 +2602,29 @@ class LibVirtSession(SessionConfigMixin):
             self.logger.info(f"restoring latest snapshot '{snapshot_name}' for vm {vm_name}")
         else:
             self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
-        return snapshot_mgr.snapshot_restore(vm_name, snapshot_name)
+        return snapshot_mgr.snapshot_restore(
+            vm_name, snapshot_name, used_elsewhere=self._files_any_domain_needs)
+
+    def _files_any_domain_needs(self, paths: list[str]) -> set[str] | None:
+        """
+        Of *paths*, those a defined domain runs on, its snapshots record, or
+        either is built on (:meth:`disk_paths_in_use`,
+        :meth:`snapshot_files_in_use`), by path, resolved too — or None when
+        that cannot be read for every domain. A restore asks it before it
+        drops an overlay the revert discarded; such an overlay is gone by
+        then, so a domain built on it reads as a chain that cannot be read,
+        and the answer is None.
+        """
+        disks = self.disk_paths_in_use()
+        if disks is None:
+            return None
+        recorded = self.snapshot_files_in_use(overlays_too=True)
+        if recorded is None:
+            return None
+        used = {*disks, *recorded}
+        used |= {os.path.realpath(path) for path in used}
+        return {path for path in paths
+                if path in used or os.path.realpath(path) in used}
 
     def eject_cdrom(self, vm_name: str) -> None:
         """

@@ -10,6 +10,7 @@ import os
 import shlex
 import stat
 import time
+from collections.abc import Callable
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -1867,22 +1868,51 @@ class SnapshotManager:
             return None
         return [image["filename"] for image in images]
 
-    def _overlays_the_revert_discarded(self, vm_name: str,
-                                       originals: list[str]) -> set[str]:
+    def _overlays_the_revert_discarded(
+            self, vm_name: str, originals: list[str],
+            used_elsewhere: Callable[[list[str]], set[str] | None] | None,
+    ) -> set[str]:
         """
         Of *originals*, overlays a successful revert of *vm_name* deleted,
-        those it discarded: no snapshot records one any more, and nothing
-        the snapshots record or the domain runs on is built on it.
+        those it discarded: no snapshot records one any more, nothing the
+        snapshots record or the domain runs on is built on it
+        (:meth:`_unneeded_by_the_vm`), and no other domain uses, records or
+        is built on it either -- *used_elsewhere*, given the paths, answers
+        which of them any domain needs, or None.
 
         Reverting to a snapshot with no children, libvirt deletes its
         overlays and records the new ones it made in their place
         (``qemuSnapshotRevertExternalFinish``): put back, the old ones are
-        recorded by nothing, and nothing ever removes them. What any of
-        this cannot be read for is kept: the empty set, every one put back.
+        recorded by nothing, and nothing ever removes them. Without
+        *used_elsewhere*, or when anything cannot be read or raises, the
+        empty set: every one is put back.
+        """
+        if used_elsewhere is None:
+            return set()
+        try:
+            unneeded = self._unneeded_by_the_vm(vm_name, originals)
+            elsewhere = (used_elsewhere(sorted(unneeded)) if unneeded
+                         else set())
+        except Exception as exc:
+            self.logger.warning(
+                f"could not tell what the revert of {vm_name} discarded "
+                f"({type(exc).__name__}: {exc}); putting every overlay back")
+            return set()
+        if elsewhere is None:
+            return set()
+        return unneeded - set(elsewhere)
+
+    def _unneeded_by_the_vm(self, vm_name: str,
+                            originals: list[str]) -> set[str]:
+        """
+        Of *originals*, those no snapshot of *vm_name* records now and that
+        nothing they record or the domain runs on is built on (read with
+        :meth:`_backing_chain_where_qemu_runs`); the empty set when any of
+        that cannot be read.
         """
         try:
             recorded, _order = self._strict_overlay_inventory(vm_name)
-        except Exception:
+        except SnapshotError:
             return set()
         disks = [source for _target, source in self._data_disk_targets(vm_name)]
         if not disks:
@@ -1901,19 +1931,24 @@ class SnapshotManager:
 
     def _restore_preserved_overlays(
             self, preserved: list[tuple],
-            vm_name: str | None = None) -> list[tuple]:
+            vm_name: str | None = None,
+            used_elsewhere: Callable[[list[str]], set[str] | None]
+            | None = None) -> list[tuple]:
         """
         Put back the overlay files the revert deleted, and reap the backups
         that turned out not to be needed.
 
-        With *vm_name*, the revert of it succeeded: one it discarded (see
-        :meth:`_overlays_the_revert_discarded`) is not put back, and its
+        With *vm_name*, the revert of it succeeded: one it discarded, which
+        *used_elsewhere* finds no other domain needs (see
+        :meth:`_overlays_the_revert_discarded`), is not put back, and its
         backup is reaped.
 
         Args:
             preserved: ``(original_path, backup_path)`` pairs as returned by
                 :meth:`_preserve_snapshot_overlays`.
             vm_name: the domain reverted, when the revert succeeded.
+            used_elsewhere: which of the paths given any domain needs, or
+                None when that cannot be told.
 
         Returns:
             list: the pairs still waiting to be put back, empty when every
@@ -1929,7 +1964,7 @@ class SnapshotManager:
                       and self._is_regular_file(b)]
 
         discarded = (self._overlays_the_revert_discarded(
-            vm_name, [o for o, _b in to_restore])
+            vm_name, [o for o, _b in to_restore], used_elsewhere)
             if vm_name is not None and to_restore else set())
         if discarded:
             for original in sorted(discarded):
@@ -2010,7 +2045,9 @@ class SnapshotManager:
                         preserved: list[tuple],
                         mem_path: str | None,
                         decompressed_for_revert: bool,
-                        vm_name: str | None = None) -> None:
+                        vm_name: str | None = None,
+                        used_elsewhere: Callable[[list[str]], set[str] | None]
+                        | None = None) -> None:
         """
         Close out a revert: put the overlays back, re-compress the memory
         file, and refuse to call the result a success if an overlay is
@@ -2020,7 +2057,8 @@ class SnapshotManager:
             preserved: pairs from :meth:`_preserve_snapshot_overlays`.
             mem_path: the snapshot's memory file, if it has one.
             decompressed_for_revert: whether this call decompressed it.
-            vm_name: the domain reverted, when the revert succeeded (see
+            vm_name: the domain reverted, when the revert succeeded, and
+            used_elsewhere: the look at other domains then (see
                 :meth:`_restore_preserved_overlays`).
 
         Raises:
@@ -2028,8 +2066,8 @@ class SnapshotManager:
                 be put back. Terminal by design — the revert has already
                 run, so retrying the restore would run it a second time.
         """
-        unrecovered = self._restore_preserved_overlays(preserved,
-                                                       vm_name=vm_name)
+        unrecovered = self._restore_preserved_overlays(
+            preserved, vm_name=vm_name, used_elsewhere=used_elsewhere)
 
         # re-compressing the memory image is housekeeping. It runs after
         # the overlays have been judged, and inside its own guard, so that
@@ -2056,7 +2094,10 @@ class SnapshotManager:
             + ". Clear whatever occupies the destination first if that "
               "move refuses.")
 
-    def snapshot_restore(self, vm_name: str, snapshot_name: str) -> bool:
+    def snapshot_restore(self, vm_name: str, snapshot_name: str,
+                         used_elsewhere: Callable[[list[str]],
+                                                  set[str] | None]
+                         | None = None) -> bool:
         """
         Revert a VM to a specific snapshot.
 
@@ -2093,6 +2134,11 @@ class SnapshotManager:
         Args:
             vm_name: Name of the vm
             snapshot_name: Name of the snapshot to revert to
+            used_elsewhere: which of the paths given any domain needs, or
+                None when that cannot be told: with it, an overlay the
+                revert discarded is not put back
+                (:meth:`_restore_preserved_overlays`); without it, every
+                overlay is.
 
         Returns:
             bool: True if successful, False otherwise
@@ -2176,8 +2222,10 @@ class SnapshotManager:
         if not success:
             self._report_pause_after_failed_revert(vm_name, paused)
         # only a revert that succeeded tells what it discarded
-        self._finish_restore(preserved, mem_path, decompressed_for_revert,
-                             vm_name=vm_name if success else None)
+        self._finish_restore(
+            preserved, mem_path, decompressed_for_revert,
+            vm_name=vm_name if success else None,
+            used_elsewhere=used_elsewhere if success else None)
 
         if success:
             # a successful revert sets the domain state itself, from the
