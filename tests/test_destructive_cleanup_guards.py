@@ -28,10 +28,13 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
+import fake_libvirt_pools
 from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.disk_cleanup import FilesInUse, StorageOutcome
+from boxman.providers.libvirt.session import LibVirtSession
 from boxman.utils import retained_tree
+from fake_libvirt_pools import FakePools
 
 pytestmark = pytest.mark.unit
 
@@ -410,6 +413,9 @@ def _destroy_manager(workspace):
     mgr.cache = MagicMock()
     mgr.cache.projects = {"demo": {}}
     mgr._runtime_instance = MagicMock()   # not a DockerComposeRuntime
+    # no storage pool on the trees destroy removes (#277): the tests of
+    # retiring them (TestDestroyRetiresPools) give each its own libvirt
+    mgr._pools_on_trees = MagicMock(return_value={})
     return mgr
 
 
@@ -1482,6 +1488,438 @@ class TestDestroySparesFilesInUse:
         mgr.destroy(ARGS)
 
         mgr.provider.disk_paths_in_use.assert_called_once_with()
+
+
+class TestDestroyRetiresPools:
+    """``destroy`` removed a cluster's workdir and left its storage pool,
+    still active, on a directory that was gone; the next workdir of that
+    basename got a ``<basename>-<n>`` pool from virt-install, which leaked
+    the same way (#277). Each pool on a directory ``destroy`` removed is
+    retired now, whatever its name, once that directory is confirmed gone
+    and no domain names it: stopped and undefined, never with
+    ``pool-delete``, which removes the directory. A test, or two, per case
+    of the teardown table in the design of #277."""
+
+    @pytest.fixture(autouse=True)
+    def _libvirt(self, monkeypatch):
+        """This libvirt's pools and domains, for every virsh destroy runs;
+        the absence probe is the real one (it runs no virsh)."""
+        fake_libvirt_pools.reset()
+        self.virsh = FakePools()
+        monkeypatch.setattr("boxman.manager_parts.flows.VirshCommand",
+                            lambda provider_config=None: self.virsh)
+        yield
+        deleted = [c for c in fake_libvirt_pools.ISSUED
+                   if c[0] == "pool-delete"]
+        assert not deleted, f"pool-delete was issued: {deleted}"
+
+    def _manager(self, tmp_path):
+        workspace = _tree(tmp_path / "workspaces" / "demo",
+                          "cluster_1/vm.qcow2", "env.sh")
+        mgr = _destroy_manager(workspace)
+        del mgr._pools_on_trees           # the real one, on self.virsh
+        mgr.deprovision = MagicMock()
+        mgr.destroy_compose_clusters = MagicMock()
+        mgr.deprovision_files = MagicMock()
+        mgr.unregister_from_cache = MagicMock()
+        mgr._confirm_project_torn_down = MagicMock(return_value=(True, ''))
+        mgr._retire_stale_teardown_locators = MagicMock()
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse()
+        probe = LibVirtSession({"provider": {"libvirt": {"use_sudo": False}}})
+        mgr.provider.path_absent.side_effect = probe.path_absent
+        mgr.provider.virsh_invocation.side_effect = (
+            lambda *args: " ".join(("virsh -c qemu:///system", *args)))
+        return mgr, workspace
+
+    def _in_use(self, mgr, path, domain="other-vm"):
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse(
+            {os.path.realpath(path): domain})
+
+    @staticmethod
+    def _warnings(mgr):
+        return " ".join(str(c.args[0])
+                        for c in mgr.logger.warning.call_args_list)
+
+    # ---- the teardown table, row by row ----------------------------------
+
+    @pytest.mark.parametrize("name", [
+        "bprj__demo__bprj_cluster_1_workdir", "cluster_1", "cluster_1-7"])
+    def test_the_pool_on_a_removed_workdir_goes_whatever_its_name(
+            self, tmp_path, name):
+        mgr, workspace = self._manager(tmp_path)
+        pool = self.virsh.define(name, str(workspace / "cluster_1"))
+
+        mgr.destroy(ARGS)
+
+        assert not workspace.exists()
+        assert self.virsh.verbs("pool-destroy", "pool-undefine") == [
+            ("pool-destroy", pool.uuid), ("pool-undefine", pool.uuid)]
+        assert self.virsh.pools == {}
+        assert self._warnings(mgr) == ""
+        mgr.unregister_from_cache.assert_called_once()
+
+    def test_a_workdir_kept_for_a_file_another_domain_uses_keeps_its_pool(
+            self, tmp_path):
+        """The in-use scan reads root-owned files through the pool on their
+        directory (#221): it goes when the directory does."""
+        mgr, workspace = self._manager(tmp_path)
+        self._in_use(mgr, workspace / "cluster_1" / "vm.qcow2")
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+
+        mgr.destroy(ARGS)
+
+        assert (workspace / "cluster_1" / "vm.qcow2").exists()
+        assert self.virsh.retired() == []
+        assert self.virsh.verbs("list") == []     # nothing left to ask
+        mgr.unregister_from_cache.assert_called_once()
+
+    @pytest.mark.parametrize("kept", [False, True])
+    def test_a_workspace_that_is_the_cluster_workdir(self, tmp_path, kept):
+        mgr, workspace = self._manager(tmp_path)
+        mgr.config["clusters"]["cluster_1"]["workdir"] = str(workspace)
+        if kept:
+            self._in_use(mgr, workspace / "cluster_1" / "vm.qcow2")
+        self.virsh.define("demo", str(workspace))
+
+        mgr.destroy(ARGS)
+
+        assert workspace.exists() is kept
+        assert self.virsh.retired() == ([] if kept else ["demo"])
+
+    def test_a_workdir_several_clusters_share_has_its_pool_retired_once(
+            self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        shared = workspace / "cluster_1"
+        mgr.config["clusters"]["cluster_2"] = {"workdir": str(shared),
+                                               "vms": {"node01": {}}}
+        pool = self.virsh.define("cluster_1", str(shared))
+
+        mgr.destroy(ARGS)
+
+        assert self.virsh.verbs("pool-destroy", "pool-undefine") == [
+            ("pool-destroy", pool.uuid), ("pool-undefine", pool.uuid)]
+
+    def test_a_workdir_outside_the_workspace_keeps_its_pool(self, tmp_path):
+        """destroy never removes it, so its pool stays."""
+        mgr, _workspace = self._manager(tmp_path)
+        outside = _tree(tmp_path / "elsewhere" / "cluster_1", "vm.qcow2")
+        mgr.config["clusters"]["cluster_1"]["workdir"] = str(outside)
+        self.virsh.define("cluster_1", str(outside))
+
+        mgr.destroy(ARGS)
+
+        assert (outside / "vm.qcow2").exists()
+        assert self.virsh.retired() == []
+        assert self.virsh.pools["cluster_1"].active
+
+    @pytest.mark.parametrize("in_use", [True, False])
+    def test_another_projects_directory_nested_in_the_workspace(
+            self, tmp_path, in_use):
+        """Kept while one of its files is used, as the directory is;
+        retired once it goes, as the directory does today."""
+        mgr, workspace = self._manager(tmp_path)
+        nested = _tree(workspace / "other" / "cluster_1", "disk.qcow2")
+        if in_use:
+            self._in_use(mgr, nested / "disk.qcow2",
+                         "bprj__other__bprj_cluster_1_node01")
+        self.virsh.define("cluster_1-2", str(nested))
+
+        mgr.destroy(ARGS)
+
+        assert nested.exists() is in_use
+        assert self.virsh.retired() == ([] if in_use else ["cluster_1-2"])
+
+    def test_a_workdir_another_running_project_shares_keeps_its_pool(
+            self, tmp_path):
+        """Destroying B while A runs in the same workdir: A's disks are in
+        use, so the directory stays, and its pool with it."""
+        mgr, workspace = self._manager(tmp_path)
+        a_disk = _tree(workspace / "cluster_1",
+                       "bprj__a__bprj_cluster_1_node01.qcow2")
+        self._in_use(mgr, a_disk / "bprj__a__bprj_cluster_1_node01.qcow2",
+                     "bprj__a__bprj_cluster_1_node01")
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+
+        mgr.destroy(ARGS)
+
+        assert (workspace / "cluster_1").is_dir()
+        assert self.virsh.retired() == []
+
+    def test_a_same_named_pool_on_another_directory_is_never_touched(
+            self, tmp_path):
+        """boxman named its pool ``cluster_1``, but that name was another
+        project's, so virt-install defined ``cluster_1-3`` here (#277):
+        only that one goes. A pool on another directory that is gone too is
+        not this destroy's either."""
+        mgr, workspace = self._manager(tmp_path)
+        foreign = _tree(tmp_path / "other_project" / "cluster_1", "x.qcow2")
+        self.virsh.define("cluster_1", str(foreign))
+        self.virsh.define("cluster_1-1", str(tmp_path / "old" / "cluster_1"))
+        self.virsh.define("cluster_1-3", str(workspace / "cluster_1"))
+
+        mgr.destroy(ARGS)
+
+        assert self.virsh.retired() == ["cluster_1-3"]
+        assert set(self.virsh.pools) == {"cluster_1", "cluster_1-1"}
+        assert self.virsh.pools["cluster_1"].active
+
+    def test_a_symlink_in_the_workspace_leading_out_leaves_its_pools(
+            self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        outside = _tree(tmp_path / "outside", "keep.qcow2")
+        (workspace / "cluster_1" / "link").symlink_to(
+            outside, target_is_directory=True)
+        self.virsh.define("via-link", str(workspace / "cluster_1" / "link"))
+        self.virsh.define("outside", str(outside))
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+
+        mgr.destroy(ARGS)
+
+        assert (outside / "keep.qcow2").exists()
+        assert self.virsh.retired() == ["cluster_1"]
+
+    def test_a_mount_point_in_the_workspace_leaves_every_pool(
+            self, tmp_path, monkeypatch):
+        """destroy stops before removing anything (#221 review R2b), so it
+        retires nothing either."""
+        mgr, workspace = self._manager(tmp_path)
+        (workspace / "cluster_1" / "nocloud").mkdir()
+        _fake_mounts(monkeypatch, workspace / "cluster_1" / "nocloud")
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+
+        with pytest.raises(ProvisionError, match="unmount it first"):
+            mgr.destroy(ARGS)
+
+        assert self.virsh.calls == []
+        mgr.unregister_from_cache.assert_not_called()
+
+    def test_a_mount_point_found_by_the_removal_leaves_every_pool(
+            self, tmp_path, monkeypatch):
+        """One that appears after the scan stops step 5, before 6c."""
+        mgr, workspace = self._manager(tmp_path)
+        nocloud = workspace / "cluster_1" / "nocloud"
+        nocloud.mkdir()
+        mgr.deprovision_files.side_effect = (
+            lambda *_: _fake_mounts(monkeypatch, nocloud))
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+
+        with pytest.raises(ProvisionError, match="is a mount point"):
+            mgr.destroy(ARGS)
+
+        assert self.virsh.retired() == []
+
+    @pytest.mark.parametrize("templates", [True, False])
+    def test_the_pools_on_template_dirs_go_only_with_templates(
+            self, tmp_path, templates):
+        mgr, _workspace = self._manager(tmp_path)
+        tpl = _tree(tmp_path / "boxman-templates", "tpl1/disk.qcow2")
+        mgr.config["templates"] = {"tpl1": {"workdir": str(tpl)}}
+        self.virsh.define("boxman-templates", str(tpl))
+
+        mgr.destroy(SimpleNamespace(auto_accept=True, templates=templates))
+
+        assert tpl.exists() is not templates
+        assert self.virsh.retired() == (["boxman-templates"] if templates
+                                        else [])
+
+    def test_a_snapshot_dir_goes_with_its_pool_inside_the_workspace_only(
+            self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        inside = _tree(workspace / "snapshots", "node01.s1.raw")
+        outside = _tree(tmp_path / "snapshots", "node01.s1.raw")
+        mgr.config["clusters"]["cluster_1"]["memory_snapshot_dir"] = str(
+            inside)
+        mgr.config["clusters"]["cluster_2"] = {
+            "workdir": str(workspace / "cluster_2"),
+            "memory_snapshot_dir": str(outside), "vms": {}}
+        self.virsh.define("snapshots", str(inside))
+        self.virsh.define("snapshots-1", str(outside))
+
+        mgr.destroy(ARGS)
+
+        assert outside.exists()
+        assert self.virsh.retired() == ["snapshots"]
+
+    def test_a_pool_a_domain_names_in_a_volume_disk_is_kept_and_named(
+            self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+        self.virsh.domain("other-vm", "cluster_1")
+
+        mgr.destroy(ARGS)
+
+        assert self.virsh.retired() == []
+        warnings = self._warnings(mgr)
+        assert "left storage pool cluster_1 in place" in warnings
+        assert "other-vm name(s) it in a volume disk" in warnings
+        mgr.unregister_from_cache.assert_called_once()
+
+    def test_a_target_not_normalized_is_kept(self, tmp_path):
+        """The absence probe answers only for a normalized path."""
+        mgr, workspace = self._manager(tmp_path)
+        self.virsh.define("cluster_1",
+                          f"{workspace}/cluster_1/../cluster_1")
+
+        mgr.destroy(ARGS)
+
+        assert not workspace.exists()
+        assert self.virsh.retired() == []
+
+    @unless_root
+    def test_a_target_the_probe_cannot_search_is_kept(self, tmp_path):
+        """Gone, but under a directory the probe cannot search, which proves
+        nothing."""
+        mgr, workspace = self._manager(tmp_path)
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+        remove = mgr._remove_workspace
+
+        def remove_then_lock(*args):
+            remove(*args)
+            workspace.parent.chmod(0)
+        mgr._remove_workspace = remove_then_lock
+        try:
+            mgr.destroy(ARGS)
+        finally:
+            workspace.parent.chmod(0o755)
+
+        assert self.virsh.retired() == []
+
+    def test_the_docker_runtime_issues_no_pool_command(self, tmp_path,
+                                                       capsys):
+        """Its pools go with the container's .boxman (step 3)."""
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+
+        mgr, workspace = self._manager(tmp_path)
+        runtime = MagicMock(spec=DockerComposeRuntime)
+        runtime.name = "docker-compose"
+        runtime.ready_timeout = 60
+        runtime.plan_destroy_runtime.return_value = {
+            "actions": ["tear down docker-compose environment"],
+            "commands": [], "paths_to_delete": [], "container_running": True}
+        runtime.destroy_runtime.return_value = None
+        mgr._runtime_instance = runtime
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+
+        mgr.destroy(ARGS)
+
+        assert not workspace.exists()
+        assert self.virsh.calls == []
+        assert "storage pools" not in capsys.readouterr().out
+
+    def test_deprovision_retires_no_pool(self, tmp_path):
+        """It removes no directory (nor does ``provision --force``, which
+        deprovisions first)."""
+        mgr, workspace = self._manager(tmp_path)
+        del mgr.deprovision                       # the real one
+        mgr._update_sessions_with_runtime = MagicMock()
+        mgr.destroy_netlab = MagicMock()
+        mgr.deprovision_compose_clusters = MagicMock()
+        mgr._run_parallel = MagicMock(return_value=({}, {}))
+        mgr.destroy_networks = MagicMock(return_value={})
+        self.virsh.define("cluster_1", str(tmp_path / "gone"))
+
+        mgr.deprovision(SimpleNamespace(cleanup=True))
+
+        assert workspace.exists()
+        assert self.virsh.calls == []
+
+    # ---- partial failure --------------------------------------------------
+
+    def test_a_pool_list_it_cannot_read_still_lets_destroy_finish(
+            self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+        self.virsh.failing["pool-list"] = "error: failed to connect"
+
+        mgr.destroy(ARGS)
+
+        assert not workspace.exists()
+        assert "cluster_1" in self.virsh.pools
+        assert "could not read libvirt's storage pools" in self._warnings(mgr)
+        mgr.unregister_from_cache.assert_called_once()
+
+    def test_domains_it_cannot_read_leave_every_pool_in_place(self,
+                                                              tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+        self.virsh.failing["dumpxml"] = "error: failed to connect"
+        self.virsh.domain("other-vm")
+
+        mgr.destroy(ARGS)
+
+        assert self.virsh.retired() == []
+        assert "which domains use it could not be read" in self._warnings(
+            mgr)
+        mgr.unregister_from_cache.assert_called_once()
+
+    def test_a_failed_retire_is_a_warning_and_the_project_still_goes(
+            self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        target = str(workspace / "cluster_1")
+        self.virsh.define("cluster_1-4", target)
+        self.virsh.failing["pool-destroy"] = "error: device busy"
+
+        mgr.destroy(ARGS)
+
+        warnings = self._warnings(mgr)
+        assert f"left storage pool cluster_1-4 in place, although its " \
+               f"directory {target} is gone" in warnings
+        assert "virsh -c qemu:///system pool-destroy cluster_1-4" in warnings
+        assert "virsh -c qemu:///system pool-undefine cluster_1-4" in warnings
+        assert self.virsh.verbs("pool-undefine") == []
+        mgr.unregister_from_cache.assert_called_once()
+
+    def test_a_retried_destroy_retires_the_pool_on_a_workdir_already_gone(
+            self, tmp_path):
+        """The first one was interrupted after removing the workspace; the
+        project is still registered, and the pool counts by its target's
+        spelling."""
+        mgr, workspace = self._manager(tmp_path)
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+        shutil.rmtree(workspace)
+
+        mgr.destroy(ARGS)
+
+        assert self.virsh.retired() == ["cluster_1"]
+
+    def test_a_failed_teardown_reads_no_pool(self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+        mgr._confirm_project_torn_down = MagicMock(
+            return_value=(False, "VMs are still defined: node01"))
+
+        with pytest.raises(ProvisionError, match="still defined"):
+            mgr.destroy(ARGS)
+
+        assert self.virsh.calls == []
+
+    def test_pools_are_read_before_and_retired_after_the_removals(
+            self, tmp_path):
+        """Read while their targets still resolve; retired once the
+        workspace is gone, and before the project is forgotten."""
+        mgr, workspace = self._manager(tmp_path)
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+        order = MagicMock()
+        for name in ("_pools_on_trees", "_remove_workspace",
+                     "_retire_pools_on_removed_dirs"):
+            spy = MagicMock(wraps=getattr(mgr, name))
+            setattr(mgr, name, spy)
+            order.attach_mock(spy, name)
+        order.attach_mock(mgr.unregister_from_cache, "unregister")
+
+        mgr.destroy(ARGS)
+
+        assert [c[0] for c in order.mock_calls] == [
+            "_pools_on_trees", "_remove_workspace",
+            "_retire_pools_on_removed_dirs", "unregister"]
+        assert self.virsh.retired() == ["cluster_1"]
+
+    def test_the_plan_names_the_pools(self, tmp_path, capsys):
+        mgr, _workspace = self._manager(tmp_path)
+        mgr.destroy(ARGS)
+        assert ("remove the libvirt storage pools on the directories "
+                "removed above (their files are not touched)"
+                in capsys.readouterr().out)
 
 
 def _scanned(workspace, *kept):

@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import time
+from typing import Any
 
 from boxman import log
 from boxman.exceptions import (
@@ -14,6 +15,14 @@ from boxman.exceptions import (
     ConfigError,
     ProvisionError,
     SSHAccessError,
+)
+from boxman.providers.libvirt.commands import VirshCommand
+from boxman.providers.libvirt.storage_pools import (
+    Pool,
+    domain_pool_refs,
+    pools_under,
+    read_pools,
+    retire_pool,
 )
 from boxman.utils.retained_tree import (
     InUse,
@@ -1131,11 +1140,7 @@ class FlowsMixin:
         real = os.path.realpath(workspace_path)
         entry = self._lookup(real)
         # the libvirt session of every libvirt cluster, each scanned once
-        sessions = {}
-        for name in ((self.config or {}).get('clusters') or {}):
-            if self.provider_type_for_cluster(name) == 'libvirt':
-                session = self.session_for_cluster(name)
-                sessions[id(session)] = session
+        sessions = self._libvirt_sessions()
         if not sessions:
             return None
         in_use = InUse()
@@ -1174,6 +1179,107 @@ class FlowsMixin:
                 f"left {tree.path(rel)} in place: {why}; the directories on "
                 f"the way to it stay too")
 
+    def _libvirt_sessions(self) -> dict[int, Any]:
+        """The libvirt session of every libvirt cluster, by ``id()``, each
+        once: clusters on one connection share one."""
+        sessions = {}
+        for name in ((self.config or {}).get('clusters') or {}):
+            if self.provider_type_for_cluster(name) == 'libvirt':
+                session = self.session_for_cluster(name)
+                sessions[id(session)] = session
+        return sessions
+
+    def _pools_on_trees(
+            self, trees: list[str]) -> dict[int, tuple[Any, list[Pool]]]:
+        """
+        Step 2d of ``destroy``, once the in-use scan has passed: the storage
+        pools on the trees steps 5 and 6 remove (the workspace, and the
+        template directories with ``--templates``), on each libvirt session
+        of the project, once each (:func:`pools_under`). Read before the
+        removal, since whether a pool's target is in a tree is told by where
+        it resolves to, and a removed directory resolves nowhere.
+
+        Never raises: when a session's pools cannot be read, a warning says
+        so, and none of them is retired.
+
+        Returns:
+            ``{id(session): (session, pools)}`` for each session with a pool
+            on one of *trees*.
+        """
+        trees = [tree for tree in trees if tree]
+        captured: dict[int, tuple[Any, list[Pool]]] = {}
+        if not trees:
+            return captured
+        for key, session in self._libvirt_sessions().items():
+            pools = read_pools(
+                VirshCommand(provider_config=session.provider_config))
+            if pools is None:
+                self.logger.warning(
+                    f"could not read libvirt's storage pools, so none on "
+                    f"{', '.join(trees)} is removed along with it; a pool "
+                    f"left on a directory that "
+                    f"is gone can be removed by hand with "
+                    f"`{session.virsh_invocation('pool-destroy', 'POOL')}` "
+                    f"(if it is active), then "
+                    f"`{session.virsh_invocation('pool-undefine', 'POOL')}`")
+                continue
+            found = pools_under(pools, trees)
+            if found:
+                captured[key] = (session, found)
+        return captured
+
+    def _retire_pools_on_removed_dirs(
+            self, captured: dict[int, tuple[Any, list[Pool]]]) -> None:
+        """
+        Step 6c of ``destroy``: retire each storage pool found on the trees
+        steps 5 and 6 removed (:meth:`_pools_on_trees`) whose target is now
+        confirmed gone (``LibVirtSession.path_absent``) and that no domain
+        names in a volume disk (:func:`domain_pool_refs`, read only once a
+        target is gone). The pool is stopped and undefined, never deleted
+        (:func:`retire_pool`), whatever its name: boxman's, or one
+        virt-install defined as ``<basename>-<n>`` because boxman's name for
+        it was taken by a pool on another directory (#277).
+
+        A pool whose directory stays is kept: a file another domain uses was
+        kept in it, and the in-use scan reads root-owned files through the
+        pool on their directory (#221). Nothing here fails ``destroy``: a
+        pool that is not retired is named in a warning, with the commands
+        that retire it by hand.
+        """
+        for session, pools in captured.values():
+            gone = []
+            for pool in pools:
+                if session.path_absent(pool.target):
+                    gone.append(pool)
+                else:
+                    self.logger.info(
+                        f"kept storage pool {pool.name}: its directory "
+                        f"{pool.target} is not confirmed gone")
+            if not gone:
+                continue
+            virsh = VirshCommand(provider_config=session.provider_config)
+            refs = domain_pool_refs(virsh)
+            for pool in gone:
+                if refs is None:
+                    why = "which domains use it could not be read"
+                elif pool.name in refs:
+                    why = (f"{', '.join(refs[pool.name])} name(s) it in a "
+                           f"volume disk")
+                else:
+                    why = retire_pool(virsh, pool)
+                    if why is None:
+                        self.logger.info(
+                            f"removed storage pool {pool.name}: its "
+                            f"directory {pool.target} is gone")
+                        continue
+                self.logger.warning(
+                    f"left storage pool {pool.name} in place, although its "
+                    f"directory {pool.target} is gone: {why}. Once nothing "
+                    f"needs it, remove it with "
+                    f"`{session.virsh_invocation('pool-destroy', pool.name)}`"
+                    f" (if it is active), then "
+                    f"`{session.virsh_invocation('pool-undefine', pool.name)}`")
+
     def destroy(self, cli_args):
         """
         Full-teardown command: deprovision VMs and networks, tear down
@@ -1183,8 +1289,10 @@ class FlowsMixin:
         once the project's VMs are gone and which stay, named in a warning;
         a scan that cannot complete keeps the whole workspace and fails the
         command like an incomplete teardown (#221). Optionally also removes
-        template workdirs when ``--templates`` is passed (not scanned).
-        Prompts for confirmation unless ``--auto-accept`` is set.
+        template workdirs when ``--templates`` is passed (not scanned). The
+        libvirt storage pools on what it removed go too, once their
+        directories are confirmed gone (#277). Prompts for confirmation
+        unless ``--auto-accept`` is set.
 
         This is the inverse of ``boxman up`` — it aims to leave the
         machine in the state it was in before the project was first
@@ -1305,6 +1413,13 @@ class FlowsMixin:
         for tpl_dir in template_dirs:
             print(f"  {step}. remove template workdir '{tpl_dir}'")
             step += 1
+        # the docker runtime's pools go with its .boxman (step 3)
+        retires_pools = (not is_docker and self._has_libvirt_clusters()
+                         and bool(workspace_path or template_dirs))
+        if retires_pools:
+            print(f"  {step}. remove the libvirt storage pools on the "
+                  f"directories removed above (their files are not touched)")
+            step += 1
 
         paths = []
         if is_docker and runtime_plan:
@@ -1420,6 +1535,13 @@ class FlowsMixin:
             except ProvisionError as exc:
                 teardown_ok = False
                 problems.append(str(exc))
+        #     The storage pools on the trees steps 5 and 6 remove are read
+        #     now too, while their targets still resolve; 6c retires the ones
+        #     whose directory is then gone (#277). Under the docker runtime,
+        #     step 3 takes the container's pools away with its .boxman.
+        pools = {}
+        if teardown_ok and retires_pools:
+            pools = self._pools_on_trees([workspace_path, *template_dirs])
 
         if not teardown_ok:
             summary = " | ".join(problems)
@@ -1464,6 +1586,12 @@ class FlowsMixin:
         # 6. nuke template workdirs (only when --templates was passed)
         for tpl_dir in template_dirs:
             self._force_rmtree(tpl_dir)
+
+        # 6c. retire the storage pools on the directories 5 and 6 removed
+        #     (2d); one whose directory stays, holding a file another domain
+        #     uses, stays too. A pool not retired is a warning, never a
+        #     failure: the project is still unregistered (#277)
+        self._retire_pools_on_removed_dirs(pools)
 
         # 6b. a VM teardown that kept a file left its saved inventory, and a
         #     locator to it under boxman's state dir; the inventory went with
