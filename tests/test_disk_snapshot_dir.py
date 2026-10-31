@@ -283,16 +283,31 @@ class TestTake:
 
         assert self._mode(memory) == 0o711
 
-    def test_an_existing_one_for_both_keeps_its_mode(self, tmp_path,
-                                                     monkeypatch):
-        """Not this take's to change, as for one set for the overlays
-        alone."""
+    @pytest.mark.parametrize("disk", ["the same", "inside it"])
+    def test_an_existing_memory_dir_on_the_way_is_made_searchable(
+            self, tmp_path, monkeypatch, disk):
+        """A memory_snapshot_dir an earlier take made ``0700``, and the
+        disk_snapshot_dir now set to it or inside it: QEMU must search it to
+        reach the overlays, so it is made ``0711`` -- search, never list --
+        and a warning says so."""
         snaps = tmp_path / "snaps"
-        snaps.mkdir(mode=0o700)
+        snaps.mkdir()
+        os.chmod(snaps, 0o700)
+        ov = snaps if disk == "the same" else snaps / "ov"
+        mgr = _manager({"workdir": str(tmp_path / "c1"),
+                        "memory_snapshot_dir": str(snaps),
+                        "disk_snapshot_dir": str(ov)})
+        old = os.umask(0o077)
+        try:
+            _take(mgr, monkeypatch)
+        finally:
+            os.umask(old)
 
-        self._take_under_umask_077(tmp_path, monkeypatch, snaps, snaps)
-
-        assert self._mode(snaps) == 0o700
+        assert self._mode(snaps) == 0o711
+        assert self._mode(ov) == 0o711
+        warned = " ".join(str(c.args[0])
+                          for c in mgr.logger.warning.call_args_list)
+        assert f"made {snaps} searchable" in warned
 
     def test_an_existing_one_keeps_its_mode(self, tmp_path, monkeypatch):
         ov = tmp_path / "ov"

@@ -82,20 +82,30 @@ def _searched_on_the_way(path: str) -> list[str]:
     return searched
 
 
-def _search_through(path: str, identities: set[tuple[int, int]]) -> None:
+def _search_through(path: str, identities: set[tuple[int, int]],
+                    ) -> list[tuple[str, tuple[int, int], int, int]]:
     """
     Give search permission, to everyone, to each directory resolving *path*
     searches (:func:`_searched_on_the_way`) that is one of *identities* —
     told by ``(st_dev, st_ino)``: ``memory/../disk`` searches ``memory``,
     which no walk up from ``disk`` meets.
 
+    Returns:
+        ``(directory, identity, mode before, mode after)`` for each one
+        whose mode it changed.
+
     Raises:
         OSError: one cannot be looked up or changed.
     """
+    changed = []
     for directory in _searched_on_the_way(path):
         st = os.stat(directory)
-        if (st.st_dev, st.st_ino) in identities:
-            os.chmod(directory, stat.S_IMODE(st.st_mode) | 0o111)
+        identity = (st.st_dev, st.st_ino)
+        before = stat.S_IMODE(st.st_mode)
+        if identity in identities and before | 0o111 != before:
+            os.chmod(directory, before | 0o111)
+            changed.append((directory, identity, before, before | 0o111))
+    return changed
 
 
 class SnapshotsMixin:
@@ -260,10 +270,12 @@ class SnapshotsMixin:
         be able to search the directory, not list it — and see to a storage
         pool on it, named after *cluster_name*.
 
-        A directory this take made ``0700`` for the memory images
-        (*made_for_memory*) that is *path*, or on the way to it, is given
-        search permission too: one ``snapshot_dir`` for both, or one inside
-        the other, would otherwise stop QEMU there.
+        A ``memory_snapshot_dir`` -- one this take made ``0700`` for the
+        memory images (*made_for_memory*), or any that exists -- that is
+        *path*, or on the way to it, is given search permission too: one
+        directory for both, or one inside the other, would otherwise stop
+        QEMU there. One this take did not make is named in a warning; the
+        memory images in it keep their own modes.
 
         Under ``use_sudo: false`` the in-use scan reads a file the user
         cannot through its pool (#221). Without one the overlays there go
@@ -274,13 +286,27 @@ class SnapshotsMixin:
             SnapshotError: it could not be created or made searchable.
         """
         self._ensure_snapshot_dir(path, 0o711)
-        if made_for_memory:
+        memory_dirs = set(made_for_memory)
+        for memory_snapshot_dir in self._cluster_memory_snapshot_dirs():
             try:
-                _search_through(path, made_for_memory)
-            except OSError as exc:
-                raise SnapshotError(
-                    f"could not make the snapshot directory {path} "
-                    f"searchable ({exc})") from exc
+                st = os.stat(memory_snapshot_dir)
+            except OSError:
+                continue      # not there: nothing for QEMU to pass
+            memory_dirs.add((st.st_dev, st.st_ino))
+        try:
+            changed = _search_through(path, memory_dirs)
+        except OSError as exc:
+            raise SnapshotError(
+                f"could not make the snapshot directory {path} "
+                f"searchable ({exc})") from exc
+        for directory, identity, before, after in changed:
+            if identity not in made_for_memory:
+                self.logger.warning(
+                    f"made {directory} searchable ({before:04o} -> "
+                    f"{after:04o}): it is a memory_snapshot_dir, and QEMU "
+                    f"must pass through it to the overlays in the "
+                    f"disk_snapshot_dir {path}; the memory images there "
+                    f"keep their own modes")
         prj_name = f'bprj__{self.config["project"]}__bprj'
         pool = self.session_for_cluster(cluster_name).ensure_pool_on(
             path, f"{prj_name}_{cluster_name}_disk_snapshots")
