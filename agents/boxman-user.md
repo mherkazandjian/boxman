@@ -1180,11 +1180,14 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   another VM's full name can begin with this one's and a dot: it removes
   the boot disk's overlays libvirt names as the VM's (its disks, the layers
   below them, the overlays its snapshots recorded), a data disk's only as a
-  layer of a chain proven the VM's own, and nothing else; one another
+  layer of a chain proven the VM's own (the one it is attached through, or
+  one only its snapshots record that is built on it), and nothing else; one
+  another
   domain's snapshot records is kept. One directory may serve as both
   `memory_snapshot_dir` and `disk_snapshot_dir`, or one sit inside the
   other: a take makes the directories it creates on QEMU's way to the
-  overlays `0711`. Local runtime only, like `memory_snapshot_dir`.
+  overlays `0711`, and an existing `memory_snapshot_dir` there searchable
+  too, named in a warning. Local runtime only, like `memory_snapshot_dir`.
 - `snapshot restore [--name N]` restores (latest if omitted). `boxman restore`
   is the shortcut for "all VMs to latest".
 - **A restore backs up the overlays the revert deletes, and refuses if it
@@ -1193,6 +1196,11 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   are copied. If the revert itself fails the guest is deliberately left
   paused — check `virsh domstate` first. Do not name a snapshot
   `<something>.preserve`.
+- A restore puts the guest on new overlays libvirt makes beside each disk's
+  source as it was when the snapshot was taken (`<disk>.<epoch>`), not in a
+  `disk_snapshot_dir`; the next take goes back to it. An overlay the revert
+  discarded (reverting to a snapshot with no children, libvirt records the
+  new overlays in its place) is not put back.
 - A VM holding a managed save (after `boxman down`) cannot be reverted to a
   snapshot that captured no memory; the restore refuses up front. Run `boxman
   up` first, or discard the saved memory with `virsh managedsave-remove`.

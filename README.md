@@ -398,7 +398,8 @@ The `--compress-memory` flag zstd-compresses the snapshot memory dump
 transparently — no flag needed at revert time. The memory dumps go to
 the cluster's `memory_snapshot_dir` when it sets one, else to its `workdir`;
 the disk overlays to its `disk_snapshot_dir` when it sets one, else beside
-their disks. See
+their disks (a restore's are made beside the disks as they were when the
+snapshot was taken). See
 [Disk Reclaim and Storage](doc/storage.md) for the full reclaim
 workflow and the `boxman storage` subcommand.
 
@@ -886,7 +887,8 @@ Details worth knowing:
   in a cluster's `disk_snapshot_dir` — the boot disk's that libvirt names
   as the VM's (its disks, the layers below them, the overlays its snapshots
   recorded), never by name, and a recorded extra disk's as part of its own
-  chain — and the memory
+  chain, or of one only its snapshots record that is built on it — and the
+  memory
   images its own snapshots recorded in a cluster workdir or
   `memory_snapshot_dir`) and the extra
   disks boxman recorded creating for it. Never: a CD-ROM or ISO it has

@@ -289,14 +289,22 @@ clusters:
   refused. A missing one is made on first use: `0700` for memory images
   (the guest's RAM), `0711` for overlays (QEMU opens them as another user).
   One directory for both, or one inside the other, is made `0711` wherever
-  QEMU must pass to reach the overlays. Local runtime only.
+  QEMU must pass to reach the overlays, an existing `memory_snapshot_dir`
+  too, which a warning then names. Local runtime only.
 - After a take the newest overlay is the disk the guest writes to, so a
   `disk_snapshot_dir` holds live disks, not backups. A take sees to a
   libvirt storage pool on it, which the in-use scan reads the overlays
   through under `use_sudo: false`.
+- A `snapshot restore` does not put the guest back in the
+  `disk_snapshot_dir`: libvirt makes the overlays it reverts onto beside
+  each disk's source as it was when the snapshot was taken, named
+  `<disk>.<epoch>` (in the workdir, after restoring the first snapshot).
+  The next take puts the new overlays in the `disk_snapshot_dir` again.
 - A teardown removes from a `disk_snapshot_dir` only what libvirt names as
   the VM's: its disks, the layers below them, and the overlays its
-  snapshots recorded. Never what is there under its name, since another
+  snapshots recorded; a data disk's only as layers of its own chain, the
+  one it is attached through or one only its snapshots record that is built
+  on it. Never what is there under its name, since another
   VM's full name can begin with this one's and a dot, and never a file
   another domain's snapshot records. Run again after an interruption, it
   goes on only while the backing chains of the overlays only its snapshots
@@ -307,7 +315,9 @@ clusters:
   `disk_snapshot_dir`, are not measured or compacted.
 - `snapshot restore`, `delete` and `collapse` follow the paths libvirt
   recorded, wherever they are; a restore writes its `<overlay>.preserve`
-  copies beside each overlay.
+  copies beside each overlay. An overlay the revert discarded is not put
+  back: reverting to a snapshot with no children, libvirt deletes its
+  overlays and records the new ones in their place.
 
 ---
 
