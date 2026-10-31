@@ -47,6 +47,67 @@ def _dirs_made_for(path: str) -> tuple[tuple[int, int], tuple[str, ...]]:
     return (st.st_dev, st.st_ino), tuple(reversed(missing))
 
 
+def _searched_on_the_way(path: str) -> list[str]:
+    """
+    Every directory the kernel searches to resolve *path*, each named by a
+    path that reaches it: the one each component is looked up in — a ``..``
+    as much as a name, through every symlink on the way and the components
+    of its target — and the directory *path* names.
+
+    Raises:
+        OSError: a symlink cannot be read, or there are too many on the way.
+    """
+    searched: list[str] = []
+    links = 0
+
+    def walk(current: str, spelled: str) -> str:
+        nonlocal links
+        for name in spelled.split(os.sep):
+            if name in ('', os.curdir):
+                continue
+            searched.append(current)
+            step = os.path.join(current, name)
+            if name != os.pardir and os.path.islink(step):
+                links += 1
+                if links > 40:
+                    raise OSError(errno.ELOOP, "too many symlinks on the way",
+                                  path)
+                target = os.readlink(step)
+                step = walk(os.sep if os.path.isabs(target) else current,
+                            target)
+            current = step
+        return current
+
+    searched.append(walk(os.sep if os.path.isabs(path) else os.curdir, path))
+    return searched
+
+
+def _search_through(path: str, identities: set[tuple[int, int]],
+                    ) -> list[tuple[str, tuple[int, int], int, int]]:
+    """
+    Give search permission, to everyone, to each directory resolving *path*
+    searches (:func:`_searched_on_the_way`) that is one of *identities* —
+    told by ``(st_dev, st_ino)``: ``memory/../disk`` searches ``memory``,
+    which no walk up from ``disk`` meets.
+
+    Returns:
+        ``(directory, identity, mode before, mode after)`` for each one
+        whose mode it changed.
+
+    Raises:
+        OSError: one cannot be looked up or changed.
+    """
+    changed = []
+    for directory in _searched_on_the_way(path):
+        st = os.stat(directory)
+        identity = (st.st_dev, st.st_ino)
+        before = stat.S_IMODE(st.st_mode)
+        if identity in identities and before | 0o111 != before:
+            os.chmod(directory, before | 0o111)
+            changed.append((directory, identity, before, before | 0o111))
+    return changed
+
+
 class SnapshotsMixin:
 
     ### snapshot directories ####
@@ -60,8 +121,9 @@ class SnapshotsMixin:
 
         Only the memory images (``<vm>_snapshot_<name>.raw``, and the
         ``.raw.zst`` that compression leaves) go there. A disk snapshot is
-        an overlay libvirt names after its disk and creates beside it, and
-        the newest overlay is the disk the guest writes to.
+        an overlay libvirt names after its disk, created beside it or in the
+        ``disk_snapshot_dir`` (:meth:`cluster_disk_snapshot_dir`), and the
+        newest overlay is the disk the guest writes to.
 
         Raises:
             ConfigError: the ``memory_snapshot_dir`` it sets is not usable
@@ -73,11 +135,37 @@ class SnapshotsMixin:
         cluster = self.config['clusters'][cluster_name]
         return os.path.expanduser(cluster['workdir'])
 
-    def _configured_memory_snapshot_dir(self, cluster_name: str) -> str | None:
+    def cluster_disk_snapshot_dir(self, cluster_name: str) -> str | None:
         """
-        The ``memory_snapshot_dir`` *cluster_name* sets, ``~`` expanded
-        (:meth:`cluster_memory_snapshot_dir`); ``None`` when it sets none.
-        Its ``workdir`` is not looked
+        Where ``snapshot take`` creates the disk overlays of *cluster_name*'s
+        VMs: its ``disk_snapshot_dir`` — ``~`` expanded and otherwise as
+        written, like :meth:`cluster_memory_snapshot_dir` — or ``None``,
+        beside each disk, where libvirt puts them by default.
+
+        After a take the newest overlay is the disk the guest writes to, so
+        the directory holds live VM disks, not backups.
+
+        Raises:
+            ConfigError: the ``disk_snapshot_dir`` it sets is not usable
+                (:meth:`_configured_snapshot_dir`).
+        """
+        return self._configured_snapshot_dir(
+            cluster_name, 'disk_snapshot_dir',
+            unset_means="the overlays are created beside their disks")
+
+    def _configured_memory_snapshot_dir(self, cluster_name: str) -> str | None:
+        """:meth:`_configured_snapshot_dir` of ``memory_snapshot_dir``."""
+        return self._configured_snapshot_dir(
+            cluster_name, 'memory_snapshot_dir',
+            unset_means="the memory images go to the cluster workdir")
+
+    def _configured_snapshot_dir(self, cluster_name: str, key: str,
+                                 unset_means: str) -> str | None:
+        """
+        The snapshot directory *cluster_name* sets as *key*
+        (``memory_snapshot_dir``, ``disk_snapshot_dir``), ``~`` expanded and
+        otherwise as written (:meth:`cluster_memory_snapshot_dir`); ``None``
+        when it sets none. Its ``workdir`` is not looked
         at: a cluster may have none yet (no ``workspace.path`` to derive one
         from), and that is not this key's to refuse.
 
@@ -88,20 +176,20 @@ class SnapshotsMixin:
                 from elsewhere would look in another directory than the
                 take wrote to), or is set under a container runtime,
                 which bind-mounts the workspace and the workdirs into the
-                libvirt container but not this directory.
+                libvirt container but not this directory — the refusal
+                says what leaving it unset does (*unset_means*).
         """
         cluster = self.config['clusters'][cluster_name]
         if not isinstance(cluster, dict):
             return None
-        configured = cluster.get('memory_snapshot_dir')
+        configured = cluster.get(key)
         if configured is None:
             return None
-        where = f"clusters.{cluster_name}.memory_snapshot_dir"
+        where = f"clusters.{cluster_name}.{key}"
         if self._is_compose_cluster(cluster_name):
             raise ConfigError(
-                f"{where}: a docker-compose cluster takes no "
-                f"memory_snapshot_dir — its snapshots are images, not memory "
-                f"files")
+                f"{where}: a docker-compose cluster takes no {key} — its "
+                f"snapshots are container images")
         if not isinstance(configured, str) or not configured.strip():
             raise ConfigError(
                 f"{where} must be a directory path, not {configured!r}")
@@ -115,27 +203,27 @@ class SnapshotsMixin:
             raise ConfigError(
                 f"{where} is not supported under the '{runtime_name}' "
                 f"runtime, whose libvirt container does not see that "
-                f"directory; use the local runtime, or leave it unset so the "
-                f"memory images go to the cluster workdir")
+                f"directory; use the local runtime, or leave it unset so "
+                f"{unset_means}")
         return path
 
-    def validate_memory_snapshot_dirs(self) -> None:
+    def validate_snapshot_dirs(self) -> None:
         """
-        Check every cluster's ``memory_snapshot_dir`` up front
-        (:meth:`_configured_memory_snapshot_dir`), before a command builds
-        anything.
+        Check every cluster's ``memory_snapshot_dir`` and
+        ``disk_snapshot_dir`` up front (:meth:`_configured_snapshot_dir`),
+        before a command builds anything.
 
         Raises:
             ConfigError: one of them is not usable.
         """
         self._cluster_memory_snapshot_dirs()
+        self._cluster_disk_snapshot_dirs()
 
     def _cluster_memory_snapshot_dirs(self) -> list[str]:
         """
         The ``memory_snapshot_dir`` of every cluster that sets one, resolved
-        (:meth:`_configured_memory_snapshot_dir`): where a VM teardown also
-        looks for the VM's memory images, and the only files it may remove
-        there.
+        (:meth:`_configured_snapshot_dir`): where a VM teardown also looks
+        for the VM's memory images, and the only files it may remove there.
 
         Raises:
             ConfigError: one of them is not usable.
@@ -144,15 +232,106 @@ class SnapshotsMixin:
                       for cluster_name in (self.config.get('clusters') or {}))
         return sorted({path for path in configured if path is not None})
 
-    def _ensure_memory_snapshot_dir(self, path: str) -> None:
+    def _cluster_disk_snapshot_dirs(self) -> list[str]:
+        """
+        The ``disk_snapshot_dir`` of every cluster that sets one, resolved
+        (:meth:`cluster_disk_snapshot_dir`): where a VM teardown also looks
+        for the VM's disk overlays.
+
+        Raises:
+            ConfigError: one of them is not usable.
+        """
+        configured = (self.cluster_disk_snapshot_dir(cluster_name)
+                      for cluster_name in (self.config.get('clusters') or {}))
+        return sorted({path for path in configured if path is not None})
+
+    def _ensure_memory_snapshot_dir(self, path: str) -> set[tuple[int, int]]:
         """
         Create *path*, and the directories on the way to it, when it is
         missing — the directory itself ``0700``: a memory image is the
-        guest's RAM. An existing directory is left as it is.
+        guest's RAM, and libvirt writes it as root. An existing directory
+        is left as it is.
+
+        Returns:
+            The identities of the directories it made
+            (:meth:`_ensure_snapshot_dir`).
+
+        Raises:
+            SnapshotError: it could not be created.
+        """
+        return self._ensure_snapshot_dir(path, 0o700)
+
+    def _ensure_disk_snapshot_dir(self, path: str, cluster_name: str,
+                                  made_for_memory: set[tuple[int, int]]
+                                  = frozenset()) -> None:
+        """
+        Create *path* when it is missing — ``0711``: QEMU, running as another
+        user under ``qemu:///system``, opens the overlays there, so it must
+        be able to search the directory, not list it — and see to a storage
+        pool on it, named after *cluster_name*.
+
+        A ``memory_snapshot_dir`` -- one this take made ``0700`` for the
+        memory images (*made_for_memory*), or any that exists -- that is
+        *path*, or on the way to it, is given search permission too: one
+        directory for both, or one inside the other, would otherwise stop
+        QEMU there. One this take did not make is named in a warning; the
+        memory images in it keep their own modes.
+
+        Under ``use_sudo: false`` the in-use scan reads a file the user
+        cannot through its pool (#221). Without one the overlays there go
+        unread, the scan fails, and every teardown keeps what it would have
+        removed: the take still goes on, and a warning says so.
+
+        Raises:
+            SnapshotError: it could not be created or made searchable.
+        """
+        self._ensure_snapshot_dir(path, 0o711)
+        memory_dirs = set(made_for_memory)
+        for memory_snapshot_dir in self._cluster_memory_snapshot_dirs():
+            try:
+                st = os.stat(memory_snapshot_dir)
+            except OSError:
+                continue      # not there: nothing for QEMU to pass
+            memory_dirs.add((st.st_dev, st.st_ino))
+        try:
+            changed = _search_through(path, memory_dirs)
+        except OSError as exc:
+            raise SnapshotError(
+                f"could not make the snapshot directory {path} "
+                f"searchable ({exc})") from exc
+        for directory, identity, before, after in changed:
+            if identity not in made_for_memory:
+                self.logger.warning(
+                    f"made {directory} searchable ({before:04o} -> "
+                    f"{after:04o}): it is a memory_snapshot_dir, and QEMU "
+                    f"must pass through it to the overlays in the "
+                    f"disk_snapshot_dir {path}; the memory images there "
+                    f"keep their own modes")
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        pool = self.session_for_cluster(cluster_name).ensure_pool_on(
+            path, f"{prj_name}_{cluster_name}_disk_snapshots")
+        if pool is None:
+            self.logger.warning(
+                f"no storage pool on the disk_snapshot_dir {path}: under "
+                f"use_sudo: false the in-use scan cannot read the overlays "
+                f"there, and every teardown keeps what it would remove until "
+                f"one is defined on it")
+
+    def _ensure_snapshot_dir(self, path: str,
+                             mode: int) -> set[tuple[int, int]]:
+        """
+        Create *path*, and the directories on the way to it, when it is
+        missing — the directory itself with *mode*, whatever the umask, and
+        each one made on the way searchable by whoever *mode* lets search
+        it. An existing directory is left as it is.
 
         Never a cluster workdir that does not exist, under any name: that is
         not this command's to create, so a *path* inside one, or equal to
         it, is refused (:func:`_dirs_made_for`).
+
+        Returns:
+            The identities — ``(st_dev, st_ino)`` — of the directories it
+            made; none when *path* exists.
 
         Raises:
             SnapshotError: it could not be created, or creating it would also
@@ -169,7 +348,7 @@ class SnapshotsMixin:
             if not os.path.isdir(path):
                 raise SnapshotError(
                     f"the snapshot directory {path} is not a directory")
-            return
+            return set()
         for cluster_name, cluster in (self.config.get('clusters') or {}).items():
             workdir = cluster.get('workdir') if isinstance(cluster, dict) else None
             if not workdir:
@@ -188,13 +367,25 @@ class SnapshotsMixin:
                     f"could not create the snapshot directory {path}: that "
                     f"would also create {workdir}, the workdir of cluster "
                     f"{cluster_name}, which does not exist — provision that "
-                    f"cluster first, or set a memory_snapshot_dir outside it")
+                    f"cluster first, or set the snapshot directory outside it")
+        identities: set[tuple[int, int]] = set()
         try:
-            os.makedirs(path, mode=0o700, exist_ok=True)
+            os.makedirs(path, mode=mode, exist_ok=True)
+            # makedirs gives *mode* to the last one only, through the umask
+            head = path.rstrip(os.sep)
+            for depth in range(len(made)):
+                st = os.stat(head)
+                if depth:
+                    os.chmod(head, stat.S_IMODE(st.st_mode) | (mode & 0o111))
+                else:
+                    os.chmod(head, mode)
+                identities.add((st.st_dev, st.st_ino))
+                head = os.path.dirname(head)
         except OSError as exc:
             raise SnapshotError(
                 f"could not create the snapshot directory {path} "
                 f"({exc})") from exc
+        return identities
 
     ### start snapshot functions ####
     def snapshot_list(self, cli_args):
@@ -419,17 +610,27 @@ class SnapshotsMixin:
 
         # Every check, and every directory made, before anything is
         # snapshotted: the docker-compose clusters are, first.
-        self.validate_memory_snapshot_dirs()
-        # each VM's memory image goes to its cluster's memory_snapshot_dir
+        self.validate_snapshot_dirs()
+        # each VM's memory image goes to its cluster's memory_snapshot_dir,
+        # its disk overlays to its disk_snapshot_dir (None: beside the disks)
         vm_targets = [
-            (full_vm_name, self.cluster_memory_snapshot_dir(cluster_name))
+            (full_vm_name, cluster_name,
+             self.cluster_memory_snapshot_dir(cluster_name),
+             self.cluster_disk_snapshot_dir(cluster_name))
             for full_vm_name, cluster_name, _vm_name, _workdir
             in self._select_vm_targets(cli_args)
         ]
         # a memory_snapshot_dir is made on first use; a workdir exists by now
+        made_for_memory: set[tuple[int, int]] = set()
         for memory_snapshot_dir in self._cluster_memory_snapshot_dirs():
-            if any(d == memory_snapshot_dir for _vm, d in vm_targets):
-                self._ensure_memory_snapshot_dir(memory_snapshot_dir)
+            if any(d == memory_snapshot_dir for _vm, _c, d, _o in vm_targets):
+                made_for_memory |= self._ensure_memory_snapshot_dir(
+                    memory_snapshot_dir)
+        for disk_snapshot_dir in self._cluster_disk_snapshot_dirs():
+            users = [c for _vm, c, _d, o in vm_targets if o == disk_snapshot_dir]
+            if users:
+                self._ensure_disk_snapshot_dir(disk_snapshot_dir, users[0],
+                                               made_for_memory)
 
         # docker-compose clusters first (cluster-scoped, D3). Failures are
         # isolated per cluster so a dc cluster that isn't up can't stop the
@@ -452,7 +653,7 @@ class SnapshotsMixin:
         compress_level = getattr(cli_args, 'memory_compress_level', 3)
         force = getattr(cli_args, 'force', False)
 
-        def _take(full_vm_name, vm_dir, snapshot_name, description):
+        def _take(full_vm_name, vm_dir, disk_dir, snapshot_name, description):
             # The provider returns False for a take it refused. Dropping
             # that made the worker succeed on a snapshot it never wrote —
             # and the verification below can pass an *older* snapshot of
@@ -464,7 +665,8 @@ class SnapshotsMixin:
                 description=description,
                 compress_memory=compress_memory,
                 compress_level=compress_level,
-                force=force)
+                force=force,
+                disk_dir=disk_dir)
             if not created:
                 raise SnapshotError(
                     f"provider refused to create snapshot "
@@ -472,9 +674,9 @@ class SnapshotsMixin:
 
         processes = [
             (full_vm_name, _take,
-             (full_vm_name, vm_dir,
+             (full_vm_name, vm_dir, disk_dir,
               cli_args.snapshot_name, cli_args.snapshot_descr))
-            for full_vm_name, vm_dir in vm_targets
+            for full_vm_name, _cluster, vm_dir, disk_dir in vm_targets
         ]
         _results, take_failures = self._run_parallel(
             processes, op_label='snapshot take')
@@ -482,7 +684,7 @@ class SnapshotsMixin:
         # Verify every snapshot in the main process after all takes complete.
         self.logger.info("verifying snapshots after take...")
         invalid: list[str] = []
-        for full_vm_name, _ in vm_targets:
+        for full_vm_name, *_dirs in vm_targets:
             valid, errors = self.session_for_vm(full_vm_name).validate_snapshot(
                 full_vm_name, cli_args.snapshot_name)
             if valid:

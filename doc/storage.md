@@ -272,6 +272,57 @@ work — `<backingStore>` elements nest.
 
 ---
 
+## Where snapshot files go
+
+Two optional cluster keys move a snapshot's files off the disks'
+filesystem; unset, nothing changes:
+
+```yaml
+clusters:
+  web:
+    workdir: ~/boxman/ws/web
+    memory_snapshot_dir: /mnt/bulk/snapshots/web   # memory images; default: the workdir
+    disk_snapshot_dir: /mnt/fast/overlays/web      # disk overlays; default: beside each disk
+```
+
+- Each is `~` expanded and otherwise taken as written; a relative path is
+  refused. A missing one is made on first use: `0700` for memory images
+  (the guest's RAM), `0711` for overlays (QEMU opens them as another user).
+  One directory for both, or one inside the other, is made `0711` wherever
+  QEMU must pass to reach the overlays, an existing `memory_snapshot_dir`
+  too, which a warning then names. Local runtime only.
+- After a take the newest overlay is the disk the guest writes to, so a
+  `disk_snapshot_dir` holds live disks, not backups. A take sees to a
+  libvirt storage pool on it, which the in-use scan reads the overlays
+  through under `use_sudo: false`.
+- A `snapshot restore` does not put the guest back in the
+  `disk_snapshot_dir`: libvirt makes the overlays it reverts onto beside
+  each disk's source as it was when the snapshot was taken, named
+  `<disk>.<epoch>` (in the workdir, after restoring the first snapshot).
+  The next take puts the new overlays in the `disk_snapshot_dir` again.
+- A teardown removes from a `disk_snapshot_dir` only what libvirt names as
+  the VM's: its disks, the layers below them, and the overlays its
+  snapshots recorded; a data disk's only as layers of its own chain, the
+  one it is attached through or one only its snapshots record that is built
+  on it. Never what is there under its name, since another
+  VM's full name can begin with this one's and a dot, and never a file
+  another domain's snapshot records. Run again after an interruption, it
+  goes on only while the backing chains of the overlays only its snapshots
+  recorded are as first read, less the layers it removed; one rebased or
+  replaced since keeps everything from then on, and is named.
+- `storage df` and `storage compact` work from each VM's base disks in the
+  workdir, as before: the overlays above them, beside the disk or in a
+  `disk_snapshot_dir`, are not measured or compacted.
+- `snapshot restore`, `delete` and `collapse` follow the paths libvirt
+  recorded, wherever they are; a restore writes its `<overlay>.preserve`
+  copies beside each overlay. Reverting to a snapshot with no children,
+  libvirt deletes its overlays and records the new ones in their place: the
+  old ones are put back all the same, since whether another domain needs
+  one cannot be told while it is gone, and named in a warning. Nothing
+  removes them; remove them by hand once no other domain uses them.
+
+---
+
 ## Snapshot memory compression (zstd)
 
 A live snapshot taken with `virsh snapshot-create-as --memspec=…` writes

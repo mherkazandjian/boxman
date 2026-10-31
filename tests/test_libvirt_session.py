@@ -2588,6 +2588,25 @@ class TestFilesAPoolHasNotListedYet:
             ("vol-pool", (TOP,)), ("vol-dumpxml", (TOP,)),
             ("vol-pool", (BASE,)), ("vol-dumpxml", (BASE,))]
 
+    def test_of_pools_whose_targets_read_alike_the_one_on_it_is_used(
+            self, tmp_path):
+        """``x/../ov``, ``x`` leading into ``actual/deep``, reads as ``ov``
+        but is ``actual/ov``: which of the two is on the directory is told
+        by its identity."""
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        (tmp_path / "actual" / "deep").mkdir(parents=True)
+        (tmp_path / "actual" / "ov").mkdir()
+        (tmp_path / "x").symlink_to(tmp_path / "actual" / "deep")
+        overlay = str(ov / "vm01.s1")
+        host = FakeHost()
+        host.define_pool("a-mine", str(ov))
+        host.define_pool("z-other", os.path.join(tmp_path, "x", "..", "ov"))
+        host.add(overlay)
+
+        assert _chains(host, [overlay]) == {overlay: [overlay]}
+        assert host.asked("pool-refresh") == [("a-mine",)]
+
     def test_the_pools_are_read_once_per_read(self):
         other = "/ws/cluster_2/vm02.s1"
         host = self._host()
@@ -2664,14 +2683,34 @@ class TestSnapshotMemoryInUse:
     identity, which no teardown or ``--force`` retake may remove. Fails
     closed: ``None`` once any of them cannot be told."""
 
-    def _run(self, images, relists=(), listing_ok=True, by_name=None):
+    def _run(self, images, relists=(), listing_ok=True, by_name=None,
+             overlays=None, chains=None, **scan):
         """Domains vm-a, vm-b and vm-x; *images* maps a domain to what
         ``SnapshotManager.memory_images`` answers when asked by that
-        domain's UUID. Asked by a name, it answers from *by_name* — a domain
-        defined under that name since — and fails the test otherwise."""
+        domain's UUID, and *overlays* to what ``overlay_files`` answers (by
+        default none). Asked by a name, they answer from *by_name* — a
+        domain defined under that name since — and fail the test
+        otherwise."""
         relists = iter(relists)
         listed = []
         by_uuid = {domain_uuid(name): answer for name, answer in images.items()}
+        overlays_by_uuid = {domain_uuid(name): answer
+                            for name, answer in (overlays or {}).items()}
+
+        def overlay_files(_self, domain):
+            if domain in overlays_by_uuid:
+                return overlays_by_uuid[domain]
+            if domain in by_uuid or (by_name is not None
+                                     and domain in by_name):
+                return {}
+            raise AssertionError(f"overlay_files asked for {domain!r}")
+
+        def recorded_files(_self, domain):
+            images_ = memory_images(_self, domain)
+            overlays_ = overlay_files(_self, domain)
+            if images_ is None or overlays_ is None:
+                return None
+            return images_, overlays_, False
 
         def memory_images(_self, domain):
             if domain in by_uuid:
@@ -2693,10 +2732,82 @@ class TestSnapshotMemoryInUse:
 
         with patch("boxman.providers.libvirt.session.VirshCommand") as virsh, \
              patch("boxman.providers.libvirt.session.SnapshotManager."
-                   "memory_images", autospec=True,
-                   side_effect=memory_images):
+                   "recorded_files", autospec=True,
+                   side_effect=recorded_files):
             virsh.return_value.execute.side_effect = virsh_execute
-            return _session({}).snapshot_memory_in_use()
+            session = _session({})
+            with patch.object(session, "backing_chains", side_effect=(
+                    chains if callable(chains)
+                    else lambda sources: {src: (chains or {}).get(src, [src])
+                                          for src in sources})):
+                return session.snapshot_files_in_use(**scan)
+
+    def test_what_other_domains_recorded_overlays_are_built_on(self,
+                                                              tmp_path):
+        """``db.s2``, an inactive overlay of vm-b, built on ``web.s1`` on
+        a base: removing those would break it, whatever vm-b runs on."""
+        names = ("db.s2", "web.s1", "base.qcow2")
+        db_s2, web_s1, base = (tmp_path / name for name in names)
+        for path in (db_s2, web_s1, base):
+            path.write_bytes(b"image")
+
+        in_use = self._run({"vm-a": {}, "vm-b": {}, "vm-x": {}},
+                           overlays={"vm-b": {"s2": [str(db_s2)]}},
+                           chains={str(db_s2): [str(db_s2), str(web_s1),
+                                                str(base)]})
+
+        assert {in_use[str(p)] for p in (db_s2, web_s1, base)} == {"vm-b"}
+
+    def test_their_chains_that_cannot_be_read_fail_it(self, tmp_path):
+        overlay = tmp_path / "b.s1"
+        overlay.write_bytes(b"overlay")
+
+        assert self._run({"vm-a": {}, "vm-b": {}, "vm-x": {}},
+                         overlays={"vm-b": {"s1": [str(overlay)]}},
+                         chains=lambda sources: None) is None
+
+    def test_without_overlays_no_chain_is_read(self, tmp_path):
+        overlay = tmp_path / "b.s1"
+        overlay.write_bytes(b"overlay")
+
+        def unread(sources):
+            raise AssertionError(f"read the chains of {sources}")
+
+        assert self._run({"vm-a": {}, "vm-b": {}, "vm-x": {}},
+                         overlays={"vm-b": {"s1": [str(overlay)]}},
+                         chains=unread, overlays_too=False) == {}
+
+    def test_without_overlays_it_holds_the_memory_images_alone(self, tmp_path):
+        """For a cluster with no disk_snapshot_dir: what it held before
+        overlays could be there, so it fails only where it failed then."""
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+        overlay = tmp_path / "b.s1"
+        overlay.write_bytes(b"overlay")
+
+        in_use = self._run({"vm-a": {"s1": str(raw)}, "vm-b": {}, "vm-x": {}},
+                           overlays={"vm-b": {"s1": [str(overlay)]}},
+                           overlays_too=False)
+
+        assert in_use[str(raw)] == "vm-a"
+        assert str(overlay) not in in_use
+
+    def test_the_overlays_other_domains_snapshots_record(self, tmp_path):
+        """Run on or not: one only a snapshot records is that snapshot's."""
+        overlay = tmp_path / "b.s1"
+        overlay.write_bytes(b"overlay")
+
+        in_use = self._run({"vm-a": {}, "vm-b": {}, "vm-x": {}},
+                           overlays={"vm-b": {"s1": [str(overlay)]}})
+
+        assert in_use[str(overlay)] == "vm-b"
+        st = os.stat(overlay)
+        assert in_use.identities == {(st.st_dev, st.st_ino): "vm-b"}
+
+    def test_overlays_that_cannot_be_told_fail_it(self, tmp_path):
+        assert self._run({"vm-a": {}, "vm-b": {}, "vm-x": {}},
+                         overlays={"vm-b": None},
+                         relists=[("vm-a", "vm-b", "vm-x")]) is None
 
     def test_what_other_domains_snapshots_record_by_path_and_identity(
             self, tmp_path):
@@ -2783,9 +2894,15 @@ class _SnapshotHost:
         #: ``(subcommand, args)`` of every command, in order
         self.log: list[tuple[str, tuple]] = []
 
-    def define(self, name: str, uid: str | None = None, **snapshots) -> str:
+    def define(self, name: str, uid: str | None = None,
+               overlays: dict | None = None, disks: dict | None = None,
+               **snapshots) -> str:
+        """*snapshots*: each one's memory file, or None; *overlays*: the
+        overlay a snapshot created, by snapshot name; *disks*: a
+        snapshot's ``<disks>`` content as written, in place of either."""
         uid = uid or domain_uuid(name)
-        self.domains.append([uid, name, snapshots])
+        self.domains.append([uid, name, snapshots, overlays or {},
+                             disks or {}])
         return uid
 
     def rename(self, old: str, new: str) -> None:
@@ -2812,7 +2929,7 @@ class _SnapshotHost:
         self.log.append((sub, args))
         if sub == "list":
             return FakeResult(stdout=domain_listing(
-                args, *[(uid, name) for uid, name, _ in self.domains]) + "\n")
+                args, *[(uid, name) for uid, name, *_ in self.domains]) + "\n")
         domain = self._get(args[0])
         if domain is None:
             return FakeResult(
@@ -2825,8 +2942,14 @@ class _SnapshotHost:
             memory = snapshots[args[1]]
             element = (f"<memory snapshot='external' file='{memory}'/>"
                        if memory else "<memory snapshot='no'/>")
+            overlay = domain[3].get(args[1])
+            disk = domain[4].get(args[1]) or (
+                f"<disk name='vda' snapshot='external'>"
+                f"<source file='{overlay}'/></disk>" if overlay
+                else "<disk name='vda' snapshot='no'/>")
             return FakeResult(stdout=f"<domainsnapshot><name>{args[1]}</name>"
-                                     f"{element}</domainsnapshot>\n")
+                                     f"{element}<disks>{disk}</disks>"
+                                     f"</domainsnapshot>\n")
         if sub == "snapshot-dumpxml":
             return FakeResult(
                 stderr="error: Domain snapshot not found\n", code=1)
@@ -2839,10 +2962,16 @@ class TestSnapshotMemoryInUseThroughVirsh:
     on the host those commands reach (Codex's fifth review of #252)."""
 
     @staticmethod
-    def _scan(host: _SnapshotHost):
+    def _scan(host: _SnapshotHost, **scan):
+        """The scan, each overlay's chain read as the overlay alone: the
+        fake host answers virsh, not qemu-img."""
+        session = _session({})
         with patch("boxman.providers.libvirt.commands._shell_run",
-                   side_effect=host.run):
-            return _session({}).snapshot_memory_in_use()
+                   side_effect=host.run), \
+             patch.object(session, "backing_chains",
+                          side_effect=lambda sources: {s: [s]
+                                                       for s in sources}):
+            return session.snapshot_files_in_use(**scan)
 
     def test_both_reads_name_each_domain_by_its_uuid(self, tmp_path):
         raw = tmp_path / "a_snapshot_s1.raw"
@@ -2859,6 +2988,44 @@ class TestSnapshotMemoryInUseThroughVirsh:
         assert {sub for sub, _ in reads} == {"snapshot-list",
                                              "snapshot-dumpxml"}
         assert {domain for _, domain in reads} == uuids
+
+    def test_a_disk_in_a_mode_that_names_no_file_does_not_fail_it(
+            self, tmp_path):
+        """libvirt's ``manual`` mode, say: an unrelated domain's snapshot
+        in it must not make every teardown keep its memory images."""
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+        host = _SnapshotHost()
+        host.define("vm-a", s1=str(raw))
+        host.define("vm-b", disks={"m": "<disk name='vda' snapshot='manual'/>"},
+                    m=None)
+
+        in_use = self._scan(host)
+
+        assert in_use is not None and in_use[str(raw)] == "vm-a"
+
+    def test_a_network_overlay_another_domain_records_fails_it(self):
+        """Where overlays are asked about, one whose file cannot be named
+        could be built on anything; the memory images alone still read."""
+        host = _SnapshotHost()
+        host.define("vm-a", s1=None)
+        host.define("vm-b", disks={
+            "n": "<disk name='vda' snapshot='external' type='network'>"
+                 "<source protocol='nbd' name='b.s1'/></disk>"}, n=None)
+
+        assert self._scan(host) is None
+        assert self._scan(host, overlays_too=False) == {}
+
+    def test_the_overlays_a_domains_snapshots_record(self, tmp_path):
+        overlay = tmp_path / "b.x.s1"
+        overlay.write_bytes(b"overlay")
+        host = _SnapshotHost()
+        host.define("vm-a", s1=None)
+        host.define("vm-b", overlays={"x.s1": str(overlay)}, **{"x.s1": None})
+
+        in_use = self._scan(host)
+
+        assert in_use[str(overlay)] == "vm-b"
 
     @pytest.mark.parametrize("reused", [False, True],
                              ids=["renamed", "its-name-reused"])

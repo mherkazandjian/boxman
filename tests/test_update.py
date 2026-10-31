@@ -967,7 +967,7 @@ class TestRemovedVmLeftoverDisks:
         mgr.provider.confirm_vm_absent.return_value = True
         mgr.provider.disk_paths_in_use.return_value = in_use or {}
         mgr.provider.snapshot_memory_images.return_value = {}
-        mgr.provider.snapshot_memory_in_use.return_value = {}
+        mgr.provider.snapshot_files_in_use.return_value = {}
         mgr.provider.vm_storage_devices.return_value = device_rows(
             attached, media)
         mgr._vm_disk_records = MagicMock(return_value=records)

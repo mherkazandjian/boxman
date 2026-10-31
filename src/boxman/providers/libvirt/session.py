@@ -31,7 +31,7 @@ from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
 from .storage import StorageManager
-from .storage_pools import refresh_pools_holding
+from .storage_pools import ensure_pool_on, refresh_pools_holding
 from .virsh_edit import VirshEdit
 from .virsh_parse import (
     LOCAL_SOURCE_TYPES,
@@ -273,6 +273,11 @@ class _ChainReads:
         :meth:`LibVirtSession.backing_chains` call. A pool with no local
         directory (RBD, say) is passed over.
 
+        Several pools whose targets read alike once normalized — a target
+        ``x/../ov`` with ``x`` a symlink is not ``ov`` — are told apart by
+        identity, ``(st_dev, st_ino)``: the one that is *directory*, if one
+        can be told to be.
+
         Returns:
             Its name, or ``None`` when no active pool is on *directory* or
             that cannot be told: the pools cannot be listed, or one's
@@ -282,15 +287,30 @@ class _ChainReads:
             self._pool_targets = self._read_pool_targets()
         if self._pool_targets is None:
             return None
-        return self._pool_targets.get(os.path.normpath(directory))
+        pools = self._pool_targets.get(os.path.normpath(directory), [])
+        if len(pools) <= 1:
+            return pools[0][0] if pools else None
+        try:
+            st = os.stat(directory)
+        except OSError:
+            return None
+        for name, target in pools:
+            try:
+                on = os.stat(target)
+            except OSError:
+                continue
+            if (on.st_dev, on.st_ino) == (st.st_dev, st.st_ino):
+                return name
+        return None
 
-    def _read_pool_targets(self) -> dict[str, str] | None:
-        """``{target directory: pool}`` of every active pool, or ``None``
-        when any of it cannot be read (see :meth:`pool_on`)."""
+    def _read_pool_targets(self) -> dict[str, list[tuple[str, str]]] | None:
+        """``{normalized target directory: [(pool, its target), ...]}`` of
+        every active pool, or ``None`` when any of it cannot be read (see
+        :meth:`pool_on`)."""
         listing = self.virsh.execute("pool-list", "--name", warn=True)
         if not listing.ok:
             return None
-        targets: dict[str, str] = {}
+        targets: dict[str, list[tuple[str, str]]] = {}
         for name in (line.strip() for line in listing.stdout.splitlines()):
             if not name:
                 continue
@@ -302,7 +322,8 @@ class _ChainReads:
             except ET.ParseError:
                 return None
             if target:
-                targets[os.path.normpath(target)] = name
+                targets.setdefault(os.path.normpath(target), []).append(
+                    (name, target))
         return targets
 
 
@@ -2339,7 +2360,8 @@ class LibVirtSession(SessionConfigMixin):
                       description=None,
                       compress_memory: bool = False,
                       compress_level: int = 3,
-                      force: bool = False):
+                      force: bool = False,
+                      disk_dir: str | None = None):
         """
         Create a snapshot of a specific VM
 
@@ -2347,6 +2369,9 @@ class LibVirtSession(SessionConfigMixin):
             vm_name (str, optional): Full name of the VM to snapshot
             vm_dir (str): Directory the memory image is written to (the
                 cluster's ``memory_snapshot_dir``, by default its workdir)
+            disk_dir: Directory the disk overlays are created in (the
+                cluster's ``disk_snapshot_dir``); ``None``, beside their
+                disks
             snapshot_name (str): Name for the snapshot
             description (str, optional): Description for the snapshot
             compress_memory: zstd-compress the memory ``.raw`` file after
@@ -2372,7 +2397,18 @@ class LibVirtSession(SessionConfigMixin):
             compress_level=compress_level,
             force=force,
             paths_in_use=self.disk_paths_in_use,
-            memory_in_use=self.snapshot_memory_in_use)
+            recorded_in_use=lambda: self.snapshot_files_in_use(
+                overlays_too=disk_dir is not None),
+            disk_dir=disk_dir)
+
+    def ensure_pool_on(self, directory: str, name: str) -> str | None:
+        """
+        An active storage pool on *directory* — the one there, or a new
+        one named *name* — or ``None``, the reason in a warning
+        (:func:`storage_pools.ensure_pool_on`).
+        """
+        return ensure_pool_on(VirshCommand(provider_config=self.provider_config),
+                              directory, name)
 
     def snapshot_log_data(self, vm_name: str) -> dict:
         """
@@ -2462,16 +2498,33 @@ class LibVirtSession(SessionConfigMixin):
         """
         return SnapshotManager(self.provider_config).memory_images(vm_name)
 
-    def snapshot_memory_in_use(self) -> FilesInUse | None:
+    def snapshot_overlay_files(self,
+                               vm_name: str) -> dict[str, list[str]] | None:
         """
-        The memory images the snapshots of every defined domain record —
-        each ``.raw`` as libvirt recorded it, and the ``.raw.zst``
-        compression leaves beside it — mapped, as :meth:`disk_paths_in_use`
-        maps files, by path and by identity to the domain. A teardown or a
-        ``snapshot take --force`` that removes a memory image must not
-        remove one of these: two domains' snapshots can record one path, in
-        a memory_snapshot_dir their clusters share, when one VM's full name
-        begins with the other's.
+        The external overlays libvirt recorded for each of *vm_name*'s
+        snapshots that created any, by snapshot name; ``None`` when they
+        cannot all be told (:meth:`SnapshotManager.overlay_files`).
+        """
+        return SnapshotManager(self.provider_config).overlay_files(vm_name)
+
+    def snapshot_files_in_use(self,
+                              overlays_too: bool = True) -> FilesInUse | None:
+        """
+        The files the snapshots of every defined domain record — each
+        memory image as libvirt recorded it, with the ``.raw.zst``
+        compression leaves beside it, and, *overlays_too*, each external
+        overlay — mapped,
+        as :meth:`disk_paths_in_use` maps files, by path and by identity to
+        the domain. A teardown or a ``snapshot take --force`` that removes
+        a memory image, or a file in a disk_snapshot_dir, must not remove
+        one of these: two domains' snapshots can record one path, in a
+        directory their clusters share, when one VM's full name begins with
+        the other's (``v`` taking ``x.s1`` and ``v.x`` taking ``s1`` both
+        name the overlay ``v.x.s1``), and an overlay no domain runs on any
+        more is still its snapshot's — and so is everything it is built on
+        (:meth:`backing_chains`). Without a disk_snapshot_dir the
+        memory images alone are asked about, as before overlays could be
+        there: an overlay whose identity cannot be read fails no such scan.
 
         No domain is left out, not even by the name of the VM being torn
         down: that one is undefined by the time this is asked, so a domain
@@ -2483,8 +2536,9 @@ class LibVirtSession(SessionConfigMixin):
         otherwise answer for the newcomer.
 
         Fails closed: ``None`` when the domain list cannot be read, or the
-        snapshots of a domain cannot — unless it went away meanwhile
-        (:meth:`_raise_if_gone`) — or an image's identity cannot be read
+        snapshots of a domain cannot, or a recorded overlay's chain cannot
+        — unless it went away meanwhile
+        (:meth:`_raise_if_gone`) — or a file's identity cannot be read
         other than for naming no file.
         """
         virsh = VirshCommand(provider_config=self.provider_config)
@@ -2498,8 +2552,8 @@ class LibVirtSession(SessionConfigMixin):
         snapshots = SnapshotManager(self.provider_config)
         recorded = FilesInUse()
         for domain, uuid in domains:
-            images = snapshots.memory_images(uuid)
-            if images is None:
+            files = snapshots.recorded_files(uuid)
+            if files is None:
                 try:
                     self._raise_if_gone(virsh, domain, uuid)
                 except _DomainGoneError:
@@ -2507,8 +2561,21 @@ class LibVirtSession(SessionConfigMixin):
                 except _DomainRenamedError:
                     return None
                 return None
+            images, overlays, unnamed = files
+            if overlays_too and unnamed:
+                return None     # an overlay of its somewhere unknown
             paths = [path for image in images.values()
                      for path in (image, f"{image}.zst")]
+            its_overlays = ([path for layers in overlays.values()
+                             for path in layers] if overlays_too else [])
+            if its_overlays:
+                # and what they are built on: an inactive overlay of another
+                # domain can be built on this one's files, and needs them
+                chains = self.backing_chains(its_overlays)
+                if chains is None:
+                    return None
+                paths += [*its_overlays, *(layer for chain in chains.values()
+                                           for layer in chain)]
             if not self._record_in_use(recorded, domain, paths):
                 return None
         return recorded

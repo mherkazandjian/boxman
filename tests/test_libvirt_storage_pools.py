@@ -5,11 +5,15 @@ removes a VM's files itself, the pools that listed them are refreshed.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import os
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boxman.providers.libvirt.storage_pools import refresh_pools_holding
+from boxman.providers.libvirt.storage_pools import (
+    ensure_pool_on,
+    refresh_pools_holding,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -88,3 +92,193 @@ def test_an_unlistable_pool_set_is_a_warning(tmp_path, monkeypatch):
     virsh = _virsh({"cluster_1": str(tmp_path)}, list_ok=False)
     assert refresh_pools_holding(virsh, [str(tmp_path / "vm.qcow2")]) == []
     assert warnings
+
+
+class TestEnsurePoolOn:
+    """A storage pool on a cluster's disk_snapshot_dir: without one, the
+    overlays there cannot be read under ``use_sudo: false`` (#221), and
+    every teardown keeps everything."""
+
+    @staticmethod
+    def _virsh(pools, active=None, define_ok=True, list_ok=True):
+        """*pools*: name -> target path; *active*: the running ones (all
+        by default)."""
+        pools = dict(pools)
+        running = set(pools) if active is None else set(active)
+        virsh = MagicMock()
+
+        def execute(*args, **kwargs):
+            verb = args[0]
+            if verb == "pool-list":
+                names = pools if "--all" in args else running
+                return _result(stdout="".join(f"{p}\n" for p in names),
+                               ok=list_ok, stderr="error: no connection")
+            if verb == "pool-dumpxml":
+                return _result(stdout=f"<pool type='dir'><name>{args[1]}"
+                                      f"</name><target><path>"
+                                      f"{pools[args[1]]}</path></target>"
+                                      f"</pool>")
+            if verb == "pool-define-as":
+                if define_ok:
+                    pools[args[1]] = args[args.index("--target") + 1]
+                return _result(ok=define_ok, stderr="error: define failed")
+            if verb in ("pool-start", "pool-autostart"):
+                if verb == "pool-start":
+                    running.add(args[1])
+                return _result()
+            raise AssertionError(args)
+
+        virsh.execute.side_effect = execute
+        return virsh
+
+    @staticmethod
+    def _verbs(virsh, *wanted):
+        return [c.args for c in virsh.execute.call_args_list
+                if c.args[0] in wanted]
+
+    def test_one_already_on_it_is_used_whatever_its_name(self, tmp_path):
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        virsh = self._virsh({"web": str(tmp_path / "web"), "mine": str(ov)})
+
+        assert ensure_pool_on(virsh, str(ov), "bprj_ov") == "mine"
+        assert self._verbs(virsh, "pool-define-as", "pool-start") == []
+
+    def test_an_inactive_one_on_it_is_started(self, tmp_path):
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        virsh = self._virsh({"mine": str(ov)}, active=[])
+
+        assert ensure_pool_on(virsh, str(ov), "bprj_ov") == "mine"
+        assert self._verbs(virsh, "pool-start") == [("pool-start", "mine")]
+
+    def test_with_none_one_is_defined_started_and_autostarted(self, tmp_path):
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        virsh = self._virsh({"web": str(tmp_path / "web")})
+
+        assert ensure_pool_on(virsh, str(ov), "bprj_ov") == "bprj_ov"
+        assert self._verbs(virsh, "pool-define-as", "pool-start",
+                           "pool-autostart") == [
+            ("pool-define-as", "bprj_ov", "dir", "--target", str(ov)),
+            ("pool-start", "bprj_ov"),
+            ("pool-autostart", "bprj_ov"),
+        ]
+
+    def test_a_pool_of_that_name_on_another_directory_is_not_taken(
+            self, tmp_path):
+        """A workdir ``.../ws/web`` and an overlay directory ``.../ov/web``
+        share a basename, and a cluster's disk_snapshot_dir can move with a
+        pool still on the old one: a pool found by name would not be on it.
+        That one is left as it is, and the first free name is defined."""
+        ov = tmp_path / "ov" / "web"
+        ov.mkdir(parents=True)
+        virsh = self._virsh({"web": str(tmp_path / "ws" / "web"),
+                             "web_2": "/elsewhere"})
+
+        assert ensure_pool_on(virsh, str(ov), "web") == "web_3"
+        assert self._verbs(virsh, "pool-define-as") == [
+            ("pool-define-as", "web_3", "dir", "--target", str(ov))]
+        for verb in ("pool-destroy", "pool-undefine", "pool-delete"):
+            assert self._verbs(virsh, verb) == []
+
+    def test_one_on_it_spelled_alike_is_used(self, tmp_path):
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        virsh = self._virsh({"mine": f"{ov}/"})
+
+        assert ensure_pool_on(virsh, str(ov), "bprj_ov") == "mine"
+
+    @pytest.mark.parametrize("alias", ["symlink", "bind mount"])
+    def test_one_on_it_only_under_another_spelling_gets_one_of_its_own(
+            self, tmp_path, alias):
+        """The chain reads find the pool on a file's directory by its
+        spelling, and libvirt a volume by its path (#221): one on the same
+        directory under another name serves neither."""
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        other = tmp_path / "alias"
+        real_stat = os.stat
+        if alias == "symlink":
+            other.symlink_to(ov)
+            looked_up = real_stat
+        else:
+            # a bind mount: another directory with ov's identity
+            other.mkdir()
+
+            def looked_up(path, *args, **kwargs):
+                return real_stat(ov if str(path) == str(other) else path,
+                                 *args, **kwargs)
+        virsh = self._virsh({"mine": str(other)})
+
+        with patch("boxman.providers.libvirt.storage_pools.os.stat",
+                   side_effect=looked_up):
+            pool = ensure_pool_on(virsh, str(ov), "bprj_ov")
+
+        assert pool == "bprj_ov"
+        assert self._verbs(virsh, "pool-define-as") == [
+            ("pool-define-as", "bprj_ov", "dir", "--target", str(ov))]
+
+    @pytest.mark.parametrize("alias", ["symlink", "bind mount"])
+    def test_its_name_taken_on_it_under_another_spelling_gets_another(
+            self, tmp_path, alias):
+        """Defined on an alias by an earlier version, say: that pool serves
+        no lookup by this spelling, and its name cannot be given again."""
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        other = tmp_path / "alias"
+        real_stat = os.stat
+        if alias == "symlink":
+            other.symlink_to(ov)
+            looked_up = real_stat
+        else:
+            other.mkdir()
+
+            def looked_up(path, *args, **kwargs):
+                return real_stat(ov if str(path) == str(other) else path,
+                                 *args, **kwargs)
+        virsh = self._virsh({"bprj_ov": str(other), "bprj_ov_2": "/elsewhere"})
+
+        with patch("boxman.providers.libvirt.storage_pools.os.stat",
+                   side_effect=looked_up):
+            pool = ensure_pool_on(virsh, str(ov), "bprj_ov")
+
+        assert pool == "bprj_ov_3"
+        assert self._verbs(virsh, "pool-define-as") == [
+            ("pool-define-as", "bprj_ov_3", "dir", "--target", str(ov))]
+
+    @pytest.mark.skipif(os.geteuid() == 0,
+                        reason="root searches a mode-000 directory")
+    def test_one_whose_directory_cannot_be_looked_up_is_not_taken_for_it(
+            self, tmp_path):
+        """``hidden/link/../../ov``, ``link`` leading into ``actual/a/b``, is
+        ``actual/ov``; under an unsearchable ``hidden``, ``realpath`` folds
+        it as text into the directory asked for."""
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        (tmp_path / "actual" / "a" / "b").mkdir(parents=True)
+        (tmp_path / "actual" / "ov").mkdir()
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        (hidden / "link").symlink_to(tmp_path / "actual" / "a" / "b")
+        virsh = self._virsh(
+            {"other": os.path.join(hidden, "link", "..", "..", "ov")})
+        hidden.chmod(0)
+        try:
+            pool = ensure_pool_on(virsh, str(ov), "bprj_ov")
+        finally:
+            hidden.chmod(0o700)
+
+        assert pool == "bprj_ov"
+        assert self._verbs(virsh, "pool-define-as") == [
+            ("pool-define-as", "bprj_ov", "dir", "--target", str(ov))]
+
+    def test_pools_that_cannot_be_listed_give_none(self, tmp_path):
+        virsh = self._virsh({}, list_ok=False)
+
+        assert ensure_pool_on(virsh, str(tmp_path), "bprj_ov") is None
+
+    def test_a_definition_that_fails_gives_none(self, tmp_path):
+        virsh = self._virsh({}, define_ok=False)
+
+        assert ensure_pool_on(virsh, str(tmp_path), "bprj_ov") is None
