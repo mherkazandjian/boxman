@@ -3800,6 +3800,39 @@ class TestOverlaysInADiskSnapshotDir:
         assert t.warnings == ''
 
     @needs_qemu_img
+    @PATHS
+    def test_the_layout_a_real_restore_leaves_goes(self, tmp_path, path):
+        """As libvirt 10.10 left it on a real VM: take s0 beside the disks,
+        take s1 and s2 into the disk_snapshot_dir, restore s1. Each disk is
+        then on a new overlay on its s0, and s1 and s2 record theirs, built
+        on that s0 too."""
+        workdir, ov = self._dirs(tmp_path)
+        disks = {}
+        for stem in (VM, f'{VM}_disk01'):
+            base = _image(workdir / f'{stem}.qcow2')
+            s0 = _image(workdir / f'{stem}.s0', base)
+            s1 = _image(ov / f'{stem}.s1', s0)
+            s2 = _image(ov / f'{stem}.s2', s1)
+            live = _image(workdir / f'{stem}.1793407690', s0)
+            disks[stem] = (base, s0, s1, s2, live)
+        boot, data = disks[VM], disks[f'{VM}_disk01']
+        t = _Teardown(workdir, disks=[boot[4], data[4]],
+                      disk_snapshot_dir=ov, records=[_record('disk01', data[0])],
+                      overlays={'s0': [str(boot[1]), str(data[1])],
+                                's1': [str(boot[2]), str(data[2])],
+                                's2': [str(boot[3]), str(data[3])]})
+        _production_chains(t)
+
+        if path == "deprovision":
+            t.deprovision([{'name': 'disk01'}])
+        else:
+            t.update_remove()
+
+        assert sorted(p.name for p in workdir.iterdir()) == []
+        assert sorted(p.name for p in ov.iterdir()) == []
+        assert t.warnings == ''
+
+    @needs_qemu_img
     @pytest.mark.parametrize("layer", ["misnamed", "elsewhere"])
     def test_a_data_disks_overlay_not_proven_its_own_keeps_the_disk(
             self, tmp_path, layer):
