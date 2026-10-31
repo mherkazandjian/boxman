@@ -3767,6 +3767,61 @@ class TestOverlaysInADiskSnapshotDir:
         assert boot.exists() and link.is_symlink()
         assert f'left {link} in place because it is a symlink' in t.warnings
 
+    @needs_qemu_img
+    @PATHS
+    def test_after_a_restore_a_data_disks_overlays_there_go_with_it(
+            self, tmp_path, path):
+        """take s1, take s2, restore s1: libvirt puts each disk on a new
+        overlay beside its snapshot-time source, and s1 and s2 keep
+        recording theirs. Those of the data disk only its snapshots record
+        are built on its base: the vm's own, they go with it."""
+        workdir, ov = self._dirs(tmp_path)
+        boot = _image(workdir / f'{VM}.qcow2')
+        data = _image(workdir / f'{VM}_disk01.qcow2')
+        b1 = _image(ov / f'{VM}.s1', boot)
+        b2 = _image(ov / f'{VM}.s2', b1)
+        d1 = _image(ov / f'{VM}_disk01.s1', data)
+        d2 = _image(ov / f'{VM}_disk01.s2', d1)
+        live_boot = _image(workdir / f'{VM}.1785187648', boot)
+        live_data = _image(workdir / f'{VM}_disk01.1785187648', data)
+        t = _Teardown(workdir, disks=[live_boot, live_data],
+                      disk_snapshot_dir=ov, records=[_record('disk01', data)],
+                      overlays={'s1': [str(b1), str(d1)],
+                                's2': [str(b2), str(d2)]})
+        _production_chains(t)
+
+        if path == "deprovision":
+            t.deprovision([{'name': 'disk01'}])
+        else:
+            t.update_remove()
+
+        assert sorted(p.name for p in workdir.iterdir()) == []
+        assert sorted(p.name for p in ov.iterdir()) == []
+        assert t.warnings == ''
+
+    @needs_qemu_img
+    @pytest.mark.parametrize("layer", ["misnamed", "elsewhere"])
+    def test_a_data_disks_overlay_not_proven_its_own_keeps_the_disk(
+            self, tmp_path, layer):
+        """An overlay only its snapshots record, built on the data disk's
+        base, goes with it only as a layer of its own chain would: named
+        for the disk, in the base's directory or a disk_snapshot_dir."""
+        workdir, ov = self._dirs(tmp_path)
+        boot = _image(workdir / f'{VM}.qcow2')
+        data = _image(workdir / f'{VM}_disk01.qcow2')
+        d1 = _image((ov / f'{VM}_extra.s1') if layer == "misnamed"
+                    else (tmp_path / 'other' / f'{VM}_disk01.s1'), data)
+        live_data = _image(workdir / f'{VM}_disk01.1785187648', data)
+        t = _Teardown(workdir, disks=[boot, live_data],
+                      disk_snapshot_dir=ov, records=[_record('disk01', data)],
+                      overlays={'s1': [str(d1)]})
+        _production_chains(t)
+
+        t.deprovision([{'name': 'disk01'}])
+
+        assert data.exists() and live_data.exists() and d1.exists()
+        assert f'left {data} in place because' in t.warnings
+
     @PATHS
     def test_the_boot_disks_overlays_there_go_with_its_base(self, tmp_path,
                                                             path):
@@ -4217,9 +4272,13 @@ class TestOverlaysInADiskSnapshotDir:
                 f'when its teardown began, and was built on {middle} -> {s1} '
                 f'-> {base} at a retry') in t.warnings
 
-    def test_one_kept_unadmitted_keeps_what_it_is_built_on(self, tmp_path):
-        """A data disk's inactive overlay is never admitted, but it is
-        still there, built on the disk's chain: that chain stays."""
+    def test_one_its_snapshots_record_on_its_chain_goes_with_it(
+            self, tmp_path):
+        """A data disk's inactive overlay only its snapshots record, built
+        on the disk's chain, named for it, in a disk_snapshot_dir, is its
+        own as the layers of that chain are: it goes with the disk. One not
+        shown its own keeps that chain
+        (test_a_data_disks_overlay_not_proven_its_own_keeps_the_disk)."""
         workdir, ov = self._dirs(tmp_path)
         boot = _qcow2(workdir / f'{VM}.qcow2')
         data = _file(workdir / f'{VM}_disk01.qcow2')
@@ -4233,8 +4292,8 @@ class TestOverlaysInADiskSnapshotDir:
 
         t.deprovision()
 
-        assert not boot.exists()
-        assert all(p.exists() for p in (s2, s1, data))
+        assert not any(p.exists() for p in (boot, s2, s1, data))
+        assert t.warnings == ''
 
     def test_a_retry_rewrites_no_saved_chain_and_no_locator(self, tmp_path):
         """A retry saves that a chain changed, and nothing it read: the

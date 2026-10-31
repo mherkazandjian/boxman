@@ -1273,11 +1273,32 @@ def remove_vm_storage(
             if _may_exist(path):
                 admission.refuse(path, _WHY_NO_RECORD[state])
 
+    # -- 2b. a data disk's overlays only its snapshots record -------------
+    # a revert puts each disk on a new overlay beside its snapshot-time
+    # source, and the snapshots keep recording theirs. Built on a data disk
+    # that goes, they are its own as the layers of its chain are (named for
+    # it, beside it or in a disk_snapshot_dir), and go with it; any other
+    # keeps it, below
+    if state == RECORDS_PRESENT and overlays_known:
+        for record in records:
+            if (record.role != ROLE_DATA
+                    or not admission.is_admitted(record.source)):
+                continue
+            directory = real(os.path.dirname(record.source))
+            for layers in (inventory.overlay_chains or {}).values():
+                if not layers or real(layers[-1]) != real(record.source):
+                    continue
+                if not any(_owned_layer_refusal(vm, record, layer, directory,
+                                                overlay_ids, media)
+                           for layer in layers):
+                    for layer in layers:
+                        admission.admit(layer)
+
     # -- dependencies across the whole inventory ---------------------------
     # an overlay only a snapshot records is held up by its chain as a disk
-    # is by its own: kept — never admitted, as a data disk's, or refused —
-    # it keeps what it is built on, and so does what is left of one a first
-    # attempt removed
+    # is by its own: kept, unless it goes with its data disk (2b) — else
+    # never admitted, as a data disk's, or refused — it keeps what it is
+    # built on, and so does what is left of one a first attempt removed
     overlay_chains = inventory.overlay_chains
     if chains is not None and overlay_chains is not None:
         chains = {**overlay_chains, **chains}
@@ -1473,23 +1494,34 @@ def _owned_snapshot_chain(inventory: StorageInventory,
         return None, _OUTSIDE
     if media is None:
         media = _FileSet(_Identities({}, ()), inventory.media_sources)
-    stem = f"{vm}_{record.name}."
     chain = inventory.chains[head]
     for layer in chain:
-        if os.path.islink(layer):
-            return None, f"{layer} in its chain is a symlink"
-        if not os.path.basename(layer).startswith(stem):
-            return None, (f"{layer} in its chain is not named for disk "
-                          f"{record.name!r}")
-        if (real(os.path.dirname(layer)) != directory
-                and not _directory_is_one_of(layer, overlay_dirs)):
-            return None, f"{layer} in its chain is in another directory"
-        if layer in media:
-            return None, f"{layer} in its chain is a media source of the vm"
-        reason = _regular_file_refusal(layer)
+        reason = _owned_layer_refusal(vm, record, layer, directory,
+                                      overlay_dirs, media)
         if reason:
-            return None, f"{layer} in its chain: {reason}"
+            return None, reason
     return chain, None
+
+
+def _owned_layer_refusal(vm: str, record: DiskRecord, layer: str,
+                         directory: str, overlay_dirs: set[tuple[int, int]],
+                         media: _FileSet) -> str | None:
+    """Why *layer* is not one of the chain of *record*, the data disk in
+    the resolved *directory*, as :func:`_owned_snapshot_chain` tells it,
+    or None when it is."""
+    if os.path.islink(layer):
+        return f"{layer} in its chain is a symlink"
+    if not os.path.basename(layer).startswith(f"{vm}_{record.name}."):
+        return f"{layer} in its chain is not named for disk {record.name!r}"
+    if (os.path.realpath(os.path.dirname(layer)) != directory
+            and not _directory_is_one_of(layer, overlay_dirs)):
+        return f"{layer} in its chain is in another directory"
+    if layer in media:
+        return f"{layer} in its chain is a media source of the vm"
+    reason = _regular_file_refusal(layer)
+    if reason:
+        return f"{layer} in its chain: {reason}"
+    return None
 
 
 def remove_if_unchanged(path: str,
