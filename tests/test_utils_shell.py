@@ -129,18 +129,45 @@ _IGNORES_SIGINT = (
 #: reaches it. With INJECT=<Popen method>:<n>, the n-th call of that method
 #: once the runner is stopping the command first creates the file
 #: INJECT_MARKER names and pauses, so that a SIGINT lands inside it.
-#: STOP_TIMEOUT shortens the runner's grace before a kill
+#: STOP_TIMEOUT shortens the runner's grace before a kill. With
+#: IN_POPEN=before-exec or after-exec, invoke is held up inside ``Popen``
+#: instead, before invoke has the command: in the forked child before it
+#: execs the command, or in boxman once it has. The PID goes to the same
+#: file, and the hold lasts until the file IN_POPEN_GO names appears
 _RUN_STOPPABLE_IN_A_CHILD = """
 import os, subprocess, sys, time
 from boxman.utils import shell
 if os.environ.get("STOP_TIMEOUT"):
     shell._StoppingLocal.STOP_TIMEOUT = float(os.environ["STOP_TIMEOUT"])
-if len(sys.argv) > 2:
+def write_pid(pid):
+    with open(sys.argv[2] + ".tmp", "w") as pid_file:
+        pid_file.write(str(pid))
+    os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+in_popen = os.environ.get("IN_POPEN")
+if in_popen:
+    def hold():
+        deadline = time.monotonic() + 30
+        while not os.path.exists(os.environ["IN_POPEN_GO"]) and time.monotonic() < deadline:
+            time.sleep(0.01)
+    if in_popen == "before-exec":
+        real_init = subprocess.Popen.__init__
+        def init(self, *args, **kwargs):
+            def before_exec():
+                write_pid(os.getpid())
+                hold()
+            real_init(self, *args, preexec_fn=before_exec, **kwargs)
+        subprocess.Popen.__init__ = init
+    else:
+        real_execute = subprocess.Popen._execute_child
+        def execute(self, *args, **kwargs):
+            real_execute(self, *args, **kwargs)
+            write_pid(self.pid)
+            hold()
+        subprocess.Popen._execute_child = execute
+elif len(sys.argv) > 2:
     real = shell._StoppingLocal.create_io_threads
     def held_up(self):
-        with open(sys.argv[2] + ".tmp", "w") as pid_file:
-            pid_file.write(str(self.process.pid))
-        os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+        write_pid(self.process.pid)
         time.sleep(60)
         return real(self)
     shell._StoppingLocal.create_io_threads = held_up
@@ -187,8 +214,56 @@ class TestRunStoppable:
         from boxman.utils.shell import run_stoppable
         assert run_stoppable("true").ok
 
+    def test_leaves_the_sigint_handler_as_it_found_it(self):
+        """The runner swaps it while ``Popen`` starts the command (#278)."""
+        import signal
+
+        from boxman.utils.shell import run_stoppable
+
+        before = signal.getsignal(signal.SIGINT)
+        assert run_stoppable("true").ok
+        assert signal.getsignal(signal.SIGINT) is before
+
+    def test_runs_on_a_thread_other_than_the_main_one(self):
+        """Only the main thread may set a SIGINT handler: elsewhere, the
+        runner leaves it alone rather than fail (#278)."""
+        import threading
+
+        from boxman.utils.shell import run_stoppable
+
+        results = []
+        thread = threading.Thread(target=lambda: results.append(run_stoppable("true").ok))
+        thread.start()
+        thread.join(30)
+        assert results == [True]
+
+    @pytest.mark.parametrize("ignored", [False, True], ids=["handled", "ignored"])
+    def test_the_command_takes_sigint_as_boxman_did(self, ignored):
+        """Blocked and ignored just as in boxman: holding a SIGINT back
+        while the command starts (#278) must not change how the command
+        takes one, or the SIGINT that stops it would not reach it. Blocking
+        it there would leave it blocked in the command."""
+        import signal
+        from pathlib import Path
+
+        from boxman.utils.shell import run_stoppable
+
+        def sigint_in(status):
+            return {line.split(":")[0]: bool(int(line.split()[1], 16) >> (signal.SIGINT - 1) & 1)
+                    for line in status.splitlines() if line.startswith(("SigBlk:", "SigIgn:"))}
+
+        previous = signal.signal(
+            signal.SIGINT, signal.SIG_IGN if ignored else signal.default_int_handler)
+        try:
+            boxman = sigint_in(Path("/proc/self/status").read_text())
+            out = run_stoppable("grep -E '^Sig(Blk|Ign):' /proc/self/status", hide=True).stdout
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        assert boxman["SigIgn"] is ignored
+        assert sigint_in(out) == boxman
+
     def _sigint_boxman_alone(self, tmp_path, signal_at, held_up=None, env=None,
-                             program=_TRAPS_SIGINT):
+                             program=_TRAPS_SIGINT, release=None):
         """Run the child, and SIGINT its Python alone at each point in
         *signal_at*: once the file there, or every file of a tuple there, has
         appeared; return what it printed, and how it exited.
@@ -196,7 +271,12 @@ class TestRunStoppable:
         A held-up run's PID file appears as soon as the command is started,
         when it may not have set up its SIGINT handler yet: a SIGINT then
         ends it there and then, so a point that needs that handler to run
-        waits for the command to be up too (#258)."""
+        waits for the command to be up too (#258).
+
+        After the last SIGINT, the file *release* is created, to let a run
+        held up inside ``Popen`` go on: once the child has ended, as it does
+        when the interrupt goes straight through, or a couple of seconds on,
+        as the runner holds it back until ``Popen`` has returned."""
         import os
         import shlex
         import signal
@@ -223,6 +303,12 @@ class TestRunStoppable:
                         child.stderr.read()
                     time.sleep(0.05)
                 os.kill(child.pid, signal.SIGINT)
+            if release:
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                release.touch()
             out, err = child.communicate(timeout=30)
         finally:
             if child.poll() is None:
@@ -266,6 +352,29 @@ class TestRunStoppable:
         assert (tmp_path / "up.sigint").exists()
         with pytest.raises(ProcessLookupError):
             os.kill(int(pid_file.read_text()), 0)
+
+    @pytest.mark.parametrize("in_popen", ["before-exec", "after-exec"],
+                             ids=["before-its-exec", "after-its-exec"])
+    def test_a_sigint_before_popen_returns_stops_the_command(self, in_popen, tmp_path):
+        """invoke has the command only once ``Popen`` returns. A SIGINT that
+        came before, while the forked child had still to exec the command or
+        once it had, found no command to stop: the KeyboardInterrupt reached
+        the caller, and the command ran on without boxman (#278)."""
+        import os
+
+        pid_file, go = tmp_path / "pid", tmp_path / "go"
+        env = dict(os.environ, IN_POPEN=in_popen, IN_POPEN_GO=str(go))
+        # held before its exec, the command cannot be up yet; held after it,
+        # the SIGINT waits for it to be up, as above (#258)
+        signal_at = [pid_file] if in_popen == "before-exec" else [(pid_file, tmp_path / "up")]
+        out, err, code = self._sigint_boxman_alone(
+            tmp_path, signal_at, held_up=pid_file, env=env, release=go)
+        assert (out.split(), code) == (["STOPPED", "GONE"], 0), err
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
+        if in_popen == "after-exec":
+            # up before its SIGINT, so stopped by it rather than killed
+            assert (tmp_path / "up.sigint").exists()
 
     @pytest.mark.parametrize(("inject", "escalated", "killed"), [
         # the graceful stage: a SIGINT at its very start, in the SIGINT it
