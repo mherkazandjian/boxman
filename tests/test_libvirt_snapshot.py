@@ -1957,7 +1957,8 @@ class TestSnapshotRestore:
         preserve.assert_called_once_with("vm01", "snap1")
         assert [call.args[0] for call in execute.call_args_list
                 if call.args] == ["snapshot-revert"]
-        restore.assert_called_once_with(preserved_pairs)
+        # a revert that succeeded: what it discarded is not put back
+        restore.assert_called_once_with(preserved_pairs, vm_name="vm01")
 
     def test_restore_called_even_when_revert_fails(self, sm: SnapshotManager):
         with _not_running(sm), \
@@ -1968,7 +1969,8 @@ class TestSnapshotRestore:
              patch.object(sm, "_restore_preserved_overlays",
                           return_value=[]) as restore:
             assert sm.snapshot_restore("vm01", "snap1") is False
-        restore.assert_called_once()
+        # one that failed tells nothing of what it discarded: all go back
+        restore.assert_called_once_with([], vm_name=None)
 
     def test_retries_on_write_lock_contention(self, sm: SnapshotManager):
         results = [
@@ -3299,6 +3301,103 @@ class TestCollapseKeepsTheLiveDisk:
         assert not any("would remove" in line and str(head) in line
                        for line in lines)
         assert virsh.snapshots == ["s1", "s2", "s3"]
+
+
+class TestWhatTheRevertDiscards:
+    """Reverting to a snapshot with no children, libvirt deletes its
+    overlays and records the new ones it made in their place
+    (qemuSnapshotRevertExternalFinish). One put back from its backup is
+    then recorded by nothing, and nothing ever removes it."""
+
+    @staticmethod
+    def _reverted(tmp_path):
+        """s1's old overlay as the backup and the revert leave it, and the
+        new one the revert made on the base."""
+        base = tmp_path / "vm01_disk.qcow2"
+        _qemu("qemu-img", "create", "-q", "-f", "qcow2", str(base), "1M")
+        old = tmp_path / "vm01_disk.s1"
+        _qemu("qemu-img", "create", "-q", "-f", "qcow2",
+              "-b", str(base), "-F", "qcow2", str(old))
+        backup = tmp_path / "vm01_disk.s1.preserve"
+        os.rename(old, backup)
+        new = tmp_path / "vm01_disk.1785187700"
+        _qemu("qemu-img", "create", "-q", "-f", "qcow2",
+              "-b", str(base), "-F", "qcow2", str(new))
+        return base, old, backup, new
+
+    @needs_qemu
+    def test_one_nothing_records_or_is_built_on_is_not_put_back(
+            self, sm, tmp_path):
+        base, old, backup, new = self._reverted(tmp_path)
+
+        with _inventory(sm, {"s1": [str(new)]}, ["s1"]), \
+             patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", str(new))]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()):
+            unrecovered = sm._restore_preserved_overlays(
+                [(str(old), str(backup))], vm_name="vm01")
+
+        assert unrecovered == []
+        assert not old.exists() and not backup.exists()
+        assert _chain(new) == [str(new), str(base)]
+
+    @needs_qemu
+    def test_one_a_snapshot_still_records_is_put_back(self, sm, tmp_path):
+        _base, old, backup, new = self._reverted(tmp_path)
+
+        with _inventory(sm, {"s1": [str(new)], "s2": [str(old)]},
+                        ["s1", "s2"]), \
+             patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", str(new))]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()):
+            assert sm._restore_preserved_overlays(
+                [(str(old), str(backup))], vm_name="vm01") == []
+
+        assert old.is_file() and not backup.exists()
+
+    @needs_qemu
+    def test_one_a_disk_may_be_built_on_is_put_back(self, sm, tmp_path):
+        # the disk the domain is on is built on it: with it gone, that
+        # chain cannot be read, and nothing shows it is not needed
+        _base, old, backup, _new = self._reverted(tmp_path)
+        above = tmp_path / "vm01_disk.above"
+        os.rename(backup, old)
+        _qemu("qemu-img", "create", "-q", "-f", "qcow2",
+              "-b", str(old), "-F", "qcow2", str(above))
+        os.rename(old, backup)
+
+        with _inventory(sm, {"s1": [str(above)]}, ["s1"]), \
+             patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", str(above))]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()):
+            assert sm._restore_preserved_overlays(
+                [(str(old), str(backup))], vm_name="vm01") == []
+
+        assert old.is_file() and not backup.exists()
+
+    @pytest.mark.parametrize("unread", ["inventory", "disks"])
+    def test_with_what_is_needed_unread_it_is_put_back(
+            self, sm, tmp_path, unread):
+        old = tmp_path / "vm01_disk.s1"
+        backup = tmp_path / "vm01_disk.s1.preserve"
+        backup.write_bytes(b"the only copy")
+        inventory = (patch.object(sm, "_strict_overlay_inventory",
+                                  side_effect=SnapshotError("unreadable"))
+                     if unread == "inventory"
+                     else _inventory(sm, {"s1": ["/new"]}, ["s1"]))
+        disks = [] if unread == "disks" else [("vda", "/new")]
+
+        with inventory, \
+             patch.object(sm, "_data_disk_targets", return_value=disks), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()):
+            assert sm._restore_preserved_overlays(
+                [(str(old), str(backup))], vm_name="vm01") == []
+
+        assert old.read_bytes() == b"the only copy"
 
 
 class TestFlattenCdromOverlays:
