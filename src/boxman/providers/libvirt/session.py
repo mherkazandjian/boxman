@@ -1668,6 +1668,17 @@ class LibVirtSession(SessionConfigMixin):
         result = probe.execute_shell(_absence_probe(path), warn=True)
         return bool(result.ok) and (result.stdout or "").strip() == _ABSENT
 
+    def path_absent(self, path: str) -> bool:
+        """
+        Whether *path* positively does not exist where this session's
+        libvirt sees it (:meth:`_source_absent`): no directory entry, under a
+        directory the probe can search, asked through the runtime's wrapper
+        and never with ``sudo``. Anything else is not absent, a path not
+        absolute and normalised included. ``destroy`` retires a storage pool
+        only once its target is (#277).
+        """
+        return self._source_absent(path)
+
     def _read_backing_chain(self, reads: _ChainReads,
                             source: str) -> list[dict] | None:
         """
