@@ -18,6 +18,7 @@ from boxman.manager_parts.netlab import NetlabMixin
 from boxman.manager_parts.networks import NetworksMixin
 from boxman.manager_parts.snapshots import SnapshotsMixin
 from boxman.manager_parts.ssh import SSHMixin
+from boxman.manager_parts.storage_pools import StoragePoolsMixin
 from boxman.manager_parts.vms import VMsMixin
 from boxman.manager_parts.workspace import WorkspaceMixin
 from boxman.netlab import ContainerlabManager
@@ -65,7 +66,7 @@ class BoxmanManager(
     ConfigMixin, WorkspaceMixin, NamingMixin, SSHMixin,
     ImagesMixin, NetworksMixin, VMsMixin,
     SnapshotsMixin, FlowsMixin, ComposeMixin, ControlMixin, NetlabMixin,
-    MiscMixin, GuestOSMixin,
+    MiscMixin, GuestOSMixin, StoragePoolsMixin,
 ):
     def __init__(self,
                  config: dict[str, Any] | None = None):

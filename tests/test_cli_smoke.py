@@ -89,7 +89,7 @@ class TestSubcommandHelps:
 
     @pytest.mark.parametrize("subverb",
                              ["df", "trim", "compact", "optimize",
-                              "compress-snapshots"])
+                              "compress-snapshots", "pools"])
     def test_storage_subverb_help_exits_zero(self, subverb: str, capsys):
         assert _run_cli(["storage", subverb, "--help"]) == 0
         out = capsys.readouterr().out
@@ -169,6 +169,35 @@ class TestStorageDispatch:
                                   "--decompress", "--level", "10"])
         assert args.decompress is True
         assert args.level == 10
+
+    def test_storage_pools_dispatch(self):
+        from boxman.scripts.app import _CLI_HANDLERS, parse_args
+        args = parse_args().parse_args(["storage", "pools"])
+        assert (args.handler, args.stale, args.prune, args.dry_run,
+                args.yes) == ('storage_pools', False, None, False, False)
+        assert 'storage_pools' in _CLI_HANDLERS
+
+    def test_storage_pools_stale_and_prune_flags(self):
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        assert parser.parse_args(["storage", "pools", "--stale"]).stale
+        args = parser.parse_args(["storage", "pools", "--prune", "-y"])
+        assert (args.prune, args.yes) == ([], True)
+        args = parser.parse_args(["storage", "pools", "--dry-run",
+                                  "--prune", "cluster_1-3", "cluster_1-11"])
+        assert (args.prune, args.dry_run) == (["cluster_1-3", "cluster_1-11"],
+                                              True)
+
+    def test_storage_pools_stale_and_prune_exclude_each_other(self):
+        from boxman.scripts.app import parse_args
+        with pytest.raises(SystemExit):
+            parse_args().parse_args(["storage", "pools", "--stale",
+                                     "--prune"])
+
+    def test_storage_pools_help_warns_of_unmounted_nfs(self, capsys):
+        assert _run_cli(["storage", "pools", "--help"]) == 0
+        out = " ".join(capsys.readouterr().out.split())
+        assert "NFS export that is not mounted reads as gone" in out
 
     def test_snapshot_take_compress_memory_flag(self):
         from boxman.scripts.app import parse_args

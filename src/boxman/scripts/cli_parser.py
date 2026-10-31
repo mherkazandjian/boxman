@@ -824,6 +824,58 @@ def parse_args():
     )
 
     #
+    # sub parser for the 'storage pools' subsubcommand
+    #
+    parser_storage_pools = subparsers_storage.add_parser(
+        'pools', parents=[common],
+        formatter_class=RawTextHelpFormatter,
+        help="list libvirt's storage pools, and remove the ones left on "
+             "directories that are gone",
+        description=(
+            "List libvirt's storage pools: state, autostart, target, whether\n"
+            "the target is there, gone or unknown (cannot be told), and a\n"
+            "note (a workdir of this project, a bprj__ name, the domains\n"
+            "using it). Works without a conf.yml, on boxman.yml's libvirt\n"
+            "provider and the local runtime; under the docker runtime, run\n"
+            "it beside the project's conf.yml.\n"
+            "\n"
+            "--prune stops and undefines a directory pool whose target is\n"
+            "gone and that no domain uses; it never deletes anything on\n"
+            "disk. A target on an NFS export that is not mounted reads as\n"
+            "gone: mount it first, or give --prune the names of only the\n"
+            "pools to remove."),
+    )
+    parser_storage_pools.set_defaults(handler='storage_pools')
+    pools_which = parser_storage_pools.add_mutually_exclusive_group()
+    pools_which.add_argument(
+        '--stale',
+        action='store_true',
+        dest='stale',
+        help='list only the directory pools whose target is gone',
+    )
+    pools_which.add_argument(
+        '--prune',
+        nargs='*',
+        metavar='POOL',
+        dest='prune',
+        default=None,
+        help='remove the stale pools (every one, or only the POOLs named)\n'
+             'after a prompt that lists them',
+    )
+    parser_storage_pools.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='with --prune: list what would be removed; change nothing',
+    )
+    parser_storage_pools.add_argument(
+        '-y', '--yes',
+        action='store_true',
+        dest='yes',
+        help='with --prune: skip the confirmation prompt',
+    )
+
+    #
     # sub parser for the 'control' subcommand
     #
     parser_ctrl = subparsers.add_parser('control', parents=[common], help='control the state of vms')
