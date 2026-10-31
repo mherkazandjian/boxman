@@ -14,6 +14,7 @@ section has the quick-start.
 | `boxman storage compact` | host-side qcow2 reclaim — `virt-sparsify --in-place` (preserves snapshot chain) or `qemu-img convert [-c]` (flattens it) | off — auto-shutdown by default | yes |
 | `boxman storage optimize` | orchestrator: `trim` → `compact` → restart | manages itself | yes |
 | `boxman storage compress-snapshots` | zstd-compress (or `--decompress`) snapshot memory `.raw` files retroactively | any | yes |
+| `boxman storage pools` | list libvirt's storage pools; `--prune` removes the ones left on directories that are gone | any | only `--prune` |
 | `boxman snapshot collapse --to <name>` | merge snapshots newer than `<name>` into the live head; `<name>` and older remain revertable | off — auto-shutdown by default | yes |
 
 `boxman snapshot take --compress-memory` is the *primary* surface for
@@ -188,6 +189,52 @@ verb.
 | `--no-shutdown` | Don't auto-shutdown; running VMs are skipped during compact |
 | `--drop-snapshots` | Same as `compact` |
 | `--dry-run` | Same as `compact` |
+
+---
+
+## `boxman storage pools`
+
+libvirt keeps a storage pool on each directory a VM's disks are created
+in: virt-install and virt-clone define one when there is none. `destroy`
+retires the pools on the directories it removes. A pool left on a
+directory that is gone some other way (by an older boxman, by a
+`destroy` that could not read which domains use it, or by a directory
+removed by hand) shows up here.
+
+```bash
+boxman storage pools                         # every pool: state, autostart, target, status, note
+boxman storage pools --stale                 # only directory pools whose target is gone
+boxman storage pools --prune --dry-run       # what --prune would remove
+boxman storage pools --prune                 # remove them, after a prompt that lists them
+boxman storage pools --prune cluster_1-3 -y  # remove only the pools named
+```
+
+`STATUS` is one of:
+
+- `there`;
+- `gone`: positively absent;
+- `unknown`: a directory on the way cannot be searched. Such a pool is
+  never pruned.
+
+The note says whether the pool is a workdir of this project, has a
+`bprj__` name, or is named by a domain's volume disk.
+
+`--prune` acts on a directory pool only if its target is gone and no
+domain names it. It stops the pool with `pool-destroy` and forgets it
+with `pool-undefine`. It never runs `pool-delete`, and nothing on disk is
+touched. The command exits non-zero in two cases:
+
+- a pool named on the command line does not qualify: then nothing is
+  pruned;
+- a pool cannot be retired.
+
+A target on an NFS export that is not mounted reads as gone, so mount it
+first, or name only the pools to remove.
+
+No conf.yml is needed: without one, the command uses boxman.yml's libvirt
+provider on the local runtime. Under the docker runtime, run it beside
+the project's conf.yml, because libvirt there is that project's
+container.
 
 ---
 

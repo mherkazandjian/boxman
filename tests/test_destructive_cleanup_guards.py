@@ -1836,6 +1836,7 @@ class TestDestroyRetiresPools:
         assert not workspace.exists()
         assert "cluster_1" in self.virsh.pools
         assert "could not read libvirt's storage pools" in self._warnings(mgr)
+        assert "boxman storage pools --stale" in self._warnings(mgr)
         mgr.unregister_from_cache.assert_called_once()
 
     def test_domains_it_cannot_read_leave_every_pool_in_place(self,
@@ -1866,6 +1867,7 @@ class TestDestroyRetiresPools:
                f"directory {target} is gone" in warnings
         assert "virsh -c qemu:///system pool-destroy cluster_1-4" in warnings
         assert "virsh -c qemu:///system pool-undefine cluster_1-4" in warnings
+        assert "boxman storage pools --prune cluster_1-4" in warnings
         assert self.virsh.verbs("pool-undefine") == []
         mgr.unregister_from_cache.assert_called_once()
 
