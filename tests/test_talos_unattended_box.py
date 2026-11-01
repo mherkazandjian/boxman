@@ -339,9 +339,6 @@ def lab(tmp_path):
     env = {
         "PATH": f"{bin_dir}:/usr/bin:/bin",
         "HOME": str(tmp_path),
-        # tmp_path is outside any git work tree on a normal runner; the
-        # repo-guard test below proves the check itself
-        "GIT_CEILING_DIRECTORIES": str(tmp_path.parent),
         "FAKE_LOG": str(log),
         "FAKE_TALOS_VERSION": TALOS_VERSION,
         "TALOS_STATE_DIR": str(tmp_path / "state"),
@@ -358,6 +355,7 @@ def lab(tmp_path):
 
     class Lab:
         root = tmp_path
+        bin = bin_dir
         state = tmp_path / "state"
         nodes = _node_table(tmp_path / "nodes.txt")
 
@@ -486,14 +484,77 @@ def test_no_secret_reaches_the_output(lab):
         assert SECRET_MARK not in proc.stdout + proc.stderr
 
 
-def test_state_inside_a_git_work_tree_is_refused(lab, tmp_path):
+# ---- B4: the repository guard fails closed -------------------------------- #
+def _without_git(lab, tmp_path) -> str:
+    """A PATH with the fake bin and every system tool except git."""
+    sysbin = tmp_path / "sysbin-no-git"
+    sysbin.mkdir()
+    for d in ("/usr/bin", "/bin"):
+        for entry in os.listdir(d):
+            target = os.path.join(d, entry)
+            if not entry.startswith("git") and not os.path.lexists(sysbin / entry):
+                os.symlink(target, sysbin / entry)
+    return f"{lab.bin}:{sysbin}"
+
+
+def _assert_refused_before_state(lab, proc, state, message):
+    assert proc.returncode != 0
+    assert message in proc.stderr, proc.stderr
+    assert not state.exists()
+    assert lab.calls() == []
+
+
+def test_state_inside_a_git_checkout_is_refused(lab, tmp_path):
     repo = tmp_path / "checkout"
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    proc = lab.run(TALOS_STATE_DIR=str(repo / "state"), GIT_CEILING_DIRECTORIES=None)
+    state = repo / "deep" / "state"
+    _assert_refused_before_state(lab, lab.run(TALOS_STATE_DIR=str(state)),
+                                 state, "inside a git checkout")
+
+
+@pytest.mark.parametrize("dot_git", ["directory", "worktree-file"])
+def test_a_checkout_is_refused_even_without_git(lab, tmp_path, dot_git):
+    repo = tmp_path / "checkout"
+    if dot_git == "directory":
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    else:   # what `git worktree add` and submodules leave behind
+        repo.mkdir()
+        (repo / ".git").write_text("gitdir: /elsewhere/.git/worktrees/checkout\n")
+    state = repo / "state"
+    proc = lab.run(TALOS_STATE_DIR=str(state), PATH=_without_git(lab, tmp_path))
+    _assert_refused_before_state(lab, proc, state, "inside a git checkout")
+
+
+def test_a_failing_git_is_a_refusal_not_a_pass(lab, tmp_path):
+    # e.g. "detected dubious ownership": git cannot say, so the answer is no
+    broken = tmp_path / "broken-git"
+    broken.mkdir()
+    (broken / "git").write_text("#!/bin/sh\necho 'fatal: something unexpected' >&2\nexit 128\n")
+    (broken / "git").chmod(0o755)
+    state = tmp_path / "state"
+    proc = lab.run(PATH=f"{broken}:{lab.bin}:/usr/bin:/bin")
+    _assert_refused_before_state(lab, proc, state, "cannot tell whether")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can search any directory")
+def test_an_uninspectable_ancestor_is_a_refusal(lab, tmp_path):
+    locked = tmp_path / "locked"
+    (locked / "inner").mkdir(parents=True)
+    state = locked / "inner" / "state"
+    locked.chmod(0o600)   # readable listing, but not searchable
+    try:
+        proc = lab.run(TALOS_STATE_DIR=str(state))
+    finally:
+        locked.chmod(0o700)
     assert proc.returncode != 0
-    assert "inside a git work tree" in proc.stderr
-    assert not (repo / "state").exists()
+    assert "cannot inspect" in proc.stderr or "not searchable" in proc.stderr, proc.stderr
     assert lab.calls() == []
+
+
+def test_an_empty_dot_git_directory_is_not_a_checkout(lab, tmp_path):
+    # git's own test: no HEAD, no repository -- and git agrees
+    (tmp_path / "plain" / ".git").mkdir(parents=True)
+    _ok(lab.run(TALOS_STATE_DIR=str(tmp_path / "plain" / "state")))
 
 
 def test_lost_secrets_stop_the_run_instead_of_a_new_identity(lab):

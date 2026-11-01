@@ -19,7 +19,8 @@
 #           applied in that order, before the generated per-node patch, which
 #           is applied last so hostname, NIC and VIP cannot be overridden.
 #
-# State (TALOS_STATE_DIR, 0700, never inside a git work tree):
+# State (TALOS_STATE_DIR, 0700; refused when it is, or might be, inside a git
+# checkout -- a .git in any ancestor, or git not positively saying "no"):
 #   secrets.yaml + secrets.sha256   cluster identity: created once, only in an
 #                                   empty state directory, reused on every
 #                                   rerun, never regenerated
@@ -94,13 +95,41 @@ if [ -n "${TALOS_PATCH_DIR:-}" ]; then
     [ -d "$TALOS_PATCH_DIR" ] || die "TALOS_PATCH_DIR $TALOS_PATCH_DIR is not a directory"
 fi
 
-# Secrets must never land in a repository checkout: walk up to the nearest
-# existing ancestor and ask git about it.
+# Secrets must never land in a repository checkout, and an uncertain answer
+# counts as "yes". Two independent checks, both fail closed:
+#  1. every ancestor of the state directory is searchable, and none holds a
+#     checkout's .git: the file or link a worktree or submodule uses, or a
+#     directory with a HEAD (git's own test). A .git directory that cannot be
+#     read is a refusal; a readable one without HEAD is not a repository.
+#     This needs no git at all;
+#  2. when git is installed, it must positively say "not a git repository";
+#     any other failure (dubious ownership, a broken repo) is a refusal.
+in_repo() { die "TALOS_STATE_DIR $TALOS_STATE_DIR is $1; keep cluster secrets out of repositories"; }
 probe=$TALOS_STATE_DIR
-while [ ! -d "$probe" ]; do probe=$(dirname "$probe"); done
-if command -v git >/dev/null 2>&1 \
-        && git -C "$probe" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    die "TALOS_STATE_DIR $TALOS_STATE_DIR is inside a git work tree; keep cluster secrets out of repositories"
+while [ ! -e "$probe" ]; do probe=$(dirname "$probe"); done
+[ -d "$probe" ] || die "TALOS_STATE_DIR $TALOS_STATE_DIR: $probe is not a directory"
+dir=$probe
+while :; do
+    [ -x "$dir" ] || die "cannot inspect $dir for a git checkout (not searchable); refusing to place secrets below it"
+    git_dir=$dir/.git
+    if [ -L "$git_dir" ] || { [ -e "$git_dir" ] && [ ! -d "$git_dir" ]; }; then
+        in_repo "inside a git checkout ($git_dir)"
+    elif [ -d "$git_dir" ]; then
+        [ -r "$git_dir" ] && [ -x "$git_dir" ] \
+            || die "cannot inspect $git_dir; refusing to place secrets below it"
+        [ ! -e "$git_dir/HEAD" ] || in_repo "inside a git checkout ($git_dir)"
+    fi
+    [ "$dir" = / ] && break
+    dir=$(dirname "$dir")
+done
+if command -v git >/dev/null 2>&1; then
+    if answer=$(LC_ALL=C git -C "$probe" rev-parse --is-inside-work-tree 2>&1); then
+        in_repo "inside a git repository (git rev-parse: $answer)"
+    fi
+    case "$answer" in
+        *"not a git repository"*) ;;
+        *) die "cannot tell whether $probe is in a git repository (git rev-parse: ${answer:-no output}); refusing to place secrets there" ;;
+    esac
 fi
 
 [ -n "$NODES_FILE" ] || die "--nodes is required"
