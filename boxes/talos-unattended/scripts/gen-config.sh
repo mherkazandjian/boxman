@@ -16,8 +16,11 @@
 #           TALOS_INSTALLER_IMAGE TALOS_INSTALL_DISK TALOS_VIP
 #           TALOS_NTP_SERVERS TALOS_POD_CIDR TALOS_SERVICE_CIDR
 # Optional: TALOS_PATCH_DIR -- all.yaml, <role>.yaml and <node>.yaml in it are
-#           applied in that order, before the generated per-node patch, which
-#           is applied last so hostname, NIC and VIP cannot be overridden.
+#           applied in that order, then the generated per-node patch. After
+#           the merge, check-node-config.py (beside this script; needs python3
+#           with PyYAML) rejects a config whose cluster identity, trust,
+#           install inputs, CIDRs, role, hostname, interface or VIP differ
+#           from what was generated, or that gained a config document.
 #
 # State (TALOS_STATE_DIR, 0700; refused when it is, or might be, inside a git
 # checkout -- a .git in any ancestor, or git not positively saying "no"):
@@ -194,6 +197,9 @@ fi
 command -v talosctl >/dev/null 2>&1 || die "talosctl is not on PATH"
 have=$(talosctl version --client --short 2>/dev/null | awk '/Talos/ {print $2; exit}')
 [ "$have" = "$TALOS_VERSION" ] || die "talosctl is ${have:-unknown}, inputs pin $TALOS_VERSION"
+CHECK=$(dirname "$0")/check-node-config.py
+[ -r "$CHECK" ] || die "missing $CHECK (ship it beside this script)"
+python3 -c 'import yaml' 2>/dev/null || die "python3 with PyYAML is required to check merged configs"
 
 run() { log "+ $*"; "$@"; }
 
@@ -223,12 +229,6 @@ if [ ! -e "$SECRETS" ]; then
     shopt -u nullglob dotglob
     [ ${#leftovers[@]} -eq 0 ] \
         || die "$SECRETS is missing but $STATE holds earlier state (${leftovers[*]}); restore the bundle from backup, or start a new cluster in an empty directory"
-fi
-if [ -e "$SECRETS" ] && [ ! -e "$STATE/secrets.sha256" ]; then
-    die "$SECRETS has no recorded fingerprint; refusing to guess whether it belongs to this cluster"
-fi
-if [ -e "$SECRETS" ] && [ ! -e "$STATE/cluster.env" ]; then
-    die "$SECRETS exists without $STATE/cluster.env; refusing to guess which inputs it belongs to"
 fi
 if [ -e "$SECRETS" ] && [ ! -e "$STATE/secrets.sha256" ]; then
     die "$SECRETS has no recorded fingerprint; refusing to guess whether it belongs to this cluster"
@@ -300,6 +300,10 @@ for i in "${!NAMES[@]}"; do
     args+=(--patch "@$patch")
     run talosctl machineconfig patch "$STAGING/gen/$role.yaml" "${args[@]}" \
         --output "$STAGING/nodes/$name.yaml"
+    # what patches may not change: identity, role, install inputs, node identity
+    run python3 "$CHECK" "$STAGING/gen/$role.yaml" "$STAGING/nodes/$name.yaml" \
+        "$name" "$role" "${MACS[$i]}" "$TALOS_VIP" \
+        || die "$name: the merged config breaks a protected setting (see above); nothing was published"
     run talosctl validate --config "$STAGING/nodes/$name.yaml" --mode metal --strict
 done
 

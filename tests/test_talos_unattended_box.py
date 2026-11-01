@@ -274,47 +274,121 @@ def test_provisioning_job_leaves_the_box_out():
 # --------------------------------------------------------------------------- #
 # gen-config.sh with a fake talosctl                                          #
 # --------------------------------------------------------------------------- #
-#: Records every invocation, writes secret-looking lines that tests can look
-#: for, and fails the way talosctl does when asked to overwrite secrets. Its
-#: `gen config` output is a function of the secrets and the patch, so an
-#: unchanged rerun produces byte-identical configs; its talosconfig carries a
-#: fresh random key each time, as the real one does.
-FAKE_TALOSCTL = r"""#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >> "$FAKE_LOG"
-tc=""
-if [ "${1:-}" = --talosconfig ]; then tc=$2; shift 2; fi
-opt() {   # opt <flag> <args...>: value of the last <flag>
-    local want=$1 v=""; shift
-    while [ $# -gt 0 ]; do [ "$1" = "$want" ] && v=$2; shift; done
-    printf '%s' "$v"
-}
-case "$1 ${2:-}" in
-  "version --client")
-    printf 'Client:\n\tTalos %s\n' "$FAKE_TALOS_VERSION" ;;
-  "gen secrets")
-    out=$(opt -o "$@")
-    [ ! -e "$out" ] || { echo "file exists" >&2; exit 1; }
-    printf 'cluster:\n  secret: FAKESECRET-%s\n' "$(od -An -tx8 -N8 /dev/urandom | tr -d ' ')" > "$out" ;;
-  "gen config")
-    secrets=$(opt --with-secrets "$@"); dir=$(opt --output "$@")
-    patch=$(opt --config-patch "$@"); patch=${patch#@}
-    mkdir -p "$dir"
-    for role in controlplane worker; do
-      { echo "# role: $role"; cat "$secrets"; cat "$patch"; } > "$dir/$role.yaml"
-    done
-    printf 'client-key: FAKESECRET-%s\n' "$(od -An -tx8 -N8 /dev/urandom | tr -d ' ')" > "$dir/talosconfig" ;;
-  "machineconfig patch")
-    in=$3; shift 3
-    out=$(opt --output "$@")
-    { cat "$in"; while [ $# -gt 0 ]; do
-        [ "$1" = --patch ] && { echo "# patch $(basename "${2#@}")"; cat "${2#@}"; }; shift; done; } > "$out" ;;
-  "validate --config")
-    exit "${FAKE_VALIDATE_RC:-0}" ;;
-  "config endpoint"|"config node")
-    echo "$*" >> "$tc" ;;
-  *) echo "fake talosctl: unexpected $*" >&2; exit 64 ;;
-esac
+#: Records every invocation and stands in for talosctl with real YAML: secrets
+#: carry recognisable FAKESECRET values, `gen config` builds role configs from
+#: them (control planes get the CA keys, etcd and service-account material),
+#: and `machineconfig patch` merges like Talos' strategic merge closely enough
+#: for the identity checks -- maps merge, lists append, a patch document with
+#: a `kind` is added beside the main one. Its output is a function of its
+#: inputs, so an unchanged rerun is byte-identical; its talosconfig carries a
+#: fresh random key each time, as the real one does. Shebang filled in by the
+#: fixture: the test interpreter, which has PyYAML.
+FAKE_TALOSCTL = r"""#!@PYTHON@
+import os, secrets, sys
+import yaml
+
+argv = sys.argv[1:]
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write(" ".join(argv) + "\n")
+talosconfig = None
+if argv[:1] == ["--talosconfig"]:
+    talosconfig, argv = argv[1], argv[2:]
+
+
+def opts(flag):
+    return [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == flag]
+
+
+def opt(flag):
+    found = opts(flag)
+    return found[-1] if found else None
+
+
+def merge(dst, src):
+    for key, value in src.items():
+        if isinstance(value, dict) and isinstance(dst.get(key), dict):
+            merge(dst[key], value)
+        elif isinstance(value, list) and isinstance(dst.get(key), list):
+            dst[key] = dst[key] + value
+        else:
+            dst[key] = value
+
+
+def load(path):
+    with open(path) as fobj:
+        return [d for d in yaml.safe_load_all(fobj) if d is not None]
+
+
+def patched(docs, patch_files):
+    main = next(d for d in docs if d.get("version") == "v1alpha1")
+    for ref in patch_files:
+        for doc in load(ref.lstrip("@")):
+            if "kind" in doc:
+                docs.append(doc)
+            else:
+                merge(main, doc)
+    return docs
+
+
+def dump(docs, path):
+    with open(path, "w") as fobj:
+        yaml.safe_dump_all(docs, fobj, sort_keys=True)
+
+
+def fresh():
+    return "FAKESECRET-" + secrets.token_hex(8)
+
+
+cmd = " ".join(argv[:2])
+if cmd == "version --client":
+    print("Client:\n\tTalos " + os.environ["FAKE_TALOS_VERSION"])
+elif cmd == "gen secrets":
+    out = opt("-o")
+    if os.path.exists(out):
+        sys.exit("file exists")
+    with open(out, "w") as fobj:
+        yaml.safe_dump({
+            "cluster": {"id": fresh(), "secret": fresh()},
+            "secrets": {"bootstraptoken": fresh(), "secretboxencryptionsecret": fresh()},
+            "trustdinfo": {"token": fresh()},
+            "certs": {name: {"crt": fresh(), "key": fresh()}
+                      for name in ("os", "k8s", "k8saggregator", "etcd")},
+            "serviceaccount": {"key": fresh()},
+        }, fobj)
+elif cmd == "gen config":
+    name, endpoint = argv[2], argv[3]
+    with open(opt("--with-secrets")) as fobj:
+        sec = yaml.safe_load(fobj)
+    certs = sec["certs"]
+    out = opt("--output")
+    os.makedirs(out)
+    for role in ("controlplane", "worker"):
+        machine = {"type": role, "token": sec["trustdinfo"]["token"],
+                   "ca": {"crt": certs["os"]["crt"]},
+                   "install": {"disk": opt("--install-disk"), "image": opt("--install-image")}}
+        cluster = {"id": sec["cluster"]["id"], "secret": sec["cluster"]["secret"],
+                   "clusterName": name, "controlPlane": {"endpoint": endpoint},
+                   "token": sec["secrets"]["bootstraptoken"], "ca": {"crt": certs["k8s"]["crt"]}}
+        if role == "controlplane":
+            machine["ca"]["key"] = certs["os"]["key"]
+            cluster["ca"]["key"] = certs["k8s"]["key"]
+            cluster.update(aggregatorCA=certs["k8saggregator"],
+                           serviceAccount={"key": sec["serviceaccount"]["key"]},
+                           secretboxEncryptionSecret=sec["secrets"]["secretboxencryptionsecret"],
+                           etcd={"ca": certs["etcd"]})
+        docs = [{"version": "v1alpha1", "machine": machine, "cluster": cluster}]
+        dump(patched(docs, opts("--config-patch")), os.path.join(out, role + ".yaml"))
+    with open(os.path.join(out, "talosconfig"), "w") as fobj:
+        fobj.write("client-key: " + fresh() + "\n")
+elif cmd == "machineconfig patch":
+    dump(patched(load(argv[2]), opts("--patch")), opt("--output"))
+elif cmd == "validate --config":
+    sys.exit(int(os.environ.get("FAKE_VALIDATE_RC", "0")))
+elif argv[0] == "config" and argv[1] in ("endpoint", "node"):
+    with open(talosconfig, "a") as fobj:
+        fobj.write(" ".join(argv) + "\n")
+else:
+    sys.exit("fake talosctl: unexpected " + " ".join(argv))
 """
 
 
@@ -333,8 +407,12 @@ def lab(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake = bin_dir / "talosctl"
-    fake.write_text(FAKE_TALOSCTL)
+    fake.write_text(FAKE_TALOSCTL.replace("@PYTHON@", sys.executable))
     fake.chmod(0o755)
+    # gen-config.sh runs check-node-config.py with `python3`; this one has PyYAML
+    python3 = bin_dir / "python3"
+    python3.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    python3.chmod(0o755)
     log = tmp_path / "talosctl.log"
     env = {
         "PATH": f"{bin_dir}:/usr/bin:/bin",
@@ -418,14 +496,17 @@ def test_first_run_generates_with_explicit_pins(lab):
     assert proc.stdout.splitlines() == [f"{n}: created" for n in CP + WORKERS]
 
 
+def _config(path) -> dict:
+    return next(d for d in yaml.safe_load_all(path.read_text()) if d.get("version") == "v1alpha1")
+
+
 def test_node_configs_carry_role_identity_ntp_and_vip(lab):
     _ok(lab.run())
     for name in CP + WORKERS:
-        cfg = (lab.state / "nodes" / f"{name}.yaml").read_text()
+        cfg = _config(lab.state / "nodes" / f"{name}.yaml")
         role = "controlplane" if name.startswith("cp-") else "worker"
-        assert f"# role: {role}" in cfg
-        patch = yaml.safe_load((lab.state / "patches" / f"{name}.yaml").read_text())
-        net = patch["machine"]["network"]
+        assert cfg["machine"]["type"] == role
+        net = cfg["machine"]["network"]
         assert net["hostname"] == name
         (nic,) = net["interfaces"]
         assert nic["deviceSelector"]["hardwareAddr"].startswith("52:54:00:53:00:")
@@ -433,8 +514,11 @@ def test_node_configs_carry_role_identity_ntp_and_vip(lab):
         assert ("vip" in nic) == (role == "controlplane")
         if role == "controlplane":
             assert nic["vip"] == {"ip": "192.168.53.5"}
-        assert '"ntp1.example"' in cfg and '"ntp2.example"' in cfg
-        assert '"10.244.0.0/16"' in cfg and '"10.96.0.0/12"' in cfg
+        assert cfg["machine"]["time"]["servers"] == ["ntp1.example", "ntp2.example"]
+        assert cfg["cluster"]["network"] == {"podSubnets": ["10.244.0.0/16"],
+                                             "serviceSubnets": ["10.96.0.0/12"]}
+        assert cfg["machine"]["install"] == {
+            "disk": "/dev/vda", "image": f"registry.example/installer/abc:{TALOS_VERSION}"}
 
 
 def test_state_is_private(lab):
@@ -557,6 +641,7 @@ def test_an_empty_dot_git_directory_is_not_a_checkout(lab, tmp_path):
     _ok(lab.run(TALOS_STATE_DIR=str(tmp_path / "plain" / "state")))
 
 
+# ---- B2: partial state never becomes a fresh identity ---------------------- #
 def test_lost_secrets_stop_the_run_instead_of_a_new_identity(lab):
     _ok(lab.run())
     (lab.state / "secrets.yaml").unlink()
@@ -594,6 +679,83 @@ def test_a_state_dir_with_only_run_leftovers_is_fresh(lab):
     (lab.state / ".staging.abc123").mkdir()
     _ok(lab.run())
     assert (lab.state / "secrets.yaml").exists()
+
+
+# ---- B3: patches cannot replace identity, role or node identity ----------- #
+OTHER_CLUSTER = "FOREIGN-VALUE"
+
+
+@pytest.mark.parametrize("patch_file,body,violation", [
+    ("worker-01.yaml", "machine:\n  type: controlplane\n", "machine.type"),
+    ("all.yaml", "machine:\n  token: FOREIGN-VALUE\n", "machine.token"),
+    ("controlplane.yaml", "machine:\n  ca:\n    crt: FOREIGN-VALUE\n    key: FOREIGN-VALUE\n",
+     "machine.ca"),
+    ("all.yaml", "machine:\n  acceptedCAs:\n    - crt: FOREIGN-VALUE\n", "machine.acceptedCAs"),
+    ("all.yaml", "machine:\n  install:\n    image: registry.example/other:v1.99.0\n",
+     "machine.install.image"),
+    ("all.yaml", "machine:\n  install:\n    disk: /dev/vdb\n", "machine.install.disk"),
+    ("cp-01.yaml", "cluster:\n  id: FOREIGN-VALUE\n", "cluster.id"),
+    ("all.yaml", "cluster:\n  secret: FOREIGN-VALUE\n", "cluster.secret"),
+    ("all.yaml", "cluster:\n  clusterName: other\n", "cluster.clusterName"),
+    ("all.yaml", "cluster:\n  controlPlane:\n    endpoint: https://203.0.113.9:6443\n",
+     "cluster.controlPlane.endpoint"),
+    ("all.yaml", "cluster:\n  ca:\n    crt: FOREIGN-VALUE\n", "cluster.ca"),
+    ("controlplane.yaml", "cluster:\n  etcd:\n    ca:\n      crt: FOREIGN-VALUE\n",
+     "cluster.etcd.ca"),
+    ("all.yaml", "cluster:\n  network:\n    podSubnets: [10.1.0.0/16]\n",
+     "cluster.network.podSubnets"),
+    ("worker.yaml",
+     "machine:\n  network:\n    interfaces:\n      - interface: eth0\n        dhcp: true\n"
+     "        vip:\n          ip: 192.168.53.5\n",
+     "exactly the node's one interface"),
+    ("all.yaml", "apiVersion: v1alpha1\nkind: HostnameConfig\nhostname: other\n",
+     "added a HostnameConfig document"),
+])
+def test_a_patch_that_breaks_a_protected_setting_publishes_nothing(
+        lab, tmp_path, patch_file, body, violation):
+    patches = tmp_path / "patches"
+    patches.mkdir()
+    (patches / patch_file).write_text(body)
+    proc = lab.run(TALOS_PATCH_DIR=str(patches))
+    assert proc.returncode != 0
+    assert violation in proc.stderr, proc.stderr
+    assert "breaks a protected setting" in proc.stderr
+    assert not (lab.state / "nodes").exists()
+    assert not list(lab.state.glob(".staging.*"))
+    # the checker names settings, never their values
+    assert SECRET_MARK not in proc.stderr and OTHER_CLUSTER not in proc.stderr
+
+
+def test_a_protected_change_on_rerun_keeps_the_published_configs(lab, tmp_path):
+    _ok(lab.run())
+    before = {p.name: _sha(p) for p in (lab.state / "nodes").glob("*.yaml")}
+    patches = tmp_path / "patches"
+    patches.mkdir()
+    (patches / "cp-02.yaml").write_text("machine:\n  type: worker\n")
+    proc = lab.run(TALOS_PATCH_DIR=str(patches))
+    assert proc.returncode != 0 and "cp-02: machine.type" in proc.stderr
+    assert {p.name: _sha(p) for p in (lab.state / "nodes").glob("*.yaml")} == before
+
+
+def test_the_checker_rejects_a_worker_vip_and_a_wrong_mac(tmp_path):
+    check = os.path.join(BOX, "scripts", "check-node-config.py")
+    base = {"version": "v1alpha1", "machine": {"type": "worker", "token": "t"},
+            "cluster": {"id": "i"}}
+    final = {"version": "v1alpha1", "machine": {
+        "type": "worker", "token": "t",
+        "network": {"hostname": "worker-01", "interfaces": [{
+            "deviceSelector": {"hardwareAddr": "52:54:00:53:00:99"}, "dhcp": True,
+            "vip": {"ip": "192.168.53.5"}}]}},
+        "cluster": {"id": "i"}}
+    (tmp_path / "base.yaml").write_text(yaml.safe_dump(base))
+    (tmp_path / "final.yaml").write_text(yaml.safe_dump(final))
+    proc = subprocess.run([sys.executable, check, str(tmp_path / "base.yaml"),
+                           str(tmp_path / "final.yaml"), "worker-01", "worker",
+                           "52:54:00:53:00:21", "192.168.53.5"],
+                          capture_output=True, text=True)
+    assert proc.returncode == 1
+    assert "not selected by the node's mac" in proc.stderr
+    assert "vip does not match the node's role" in proc.stderr
 
 
 def test_tampered_secrets_are_refused(lab):

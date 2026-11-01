@@ -115,6 +115,7 @@ templates:
         - openssh-server
         - curl
         - util-linux
+        - python3-yaml      # gen-config.sh checks merged configs with it
 
       write_files:
         # One fail-fast script owns both the tool install and the readiness

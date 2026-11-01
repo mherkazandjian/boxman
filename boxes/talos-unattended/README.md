@@ -77,7 +77,8 @@ scripts/gen-config.sh --inputs inputs.env --nodes nodes.txt
 `gen-config.sh` validates every input and the node table (3+3, or the 1+1
 smoke profile) before it does anything, then:
 
-1. checks that `talosctl` is exactly `TALOS_VERSION`;
+1. checks that `talosctl` is exactly `TALOS_VERSION`, and that `python3`
+   with PyYAML (part of the control template) is there to check configs;
 2. refuses a `TALOS_STATE_DIR` that is, or might be, inside a git checkout,
    before creating anything. Every parent directory must be searchable and
    must not hold a checkout's `.git` (a worktree or submodule's `.git` file,
@@ -93,14 +94,23 @@ smoke profile) before it does anything, then:
    configs or patches): it never mints a second cluster identity;
 4. runs `talosctl gen config` with explicit Talos and Kubernetes versions,
    install disk, installer image, NTP servers and pod/service CIDRs;
-5. patches each node with its hostname, its MAC-selected DHCP interface and,
-   on control planes, the shared VIP. Optional patches from `TALOS_PATCH_DIR`
-   (`all.yaml`, `<role>.yaml`, `<node>.yaml`) go first, and the generated
-   identity patch goes last so it cannot be overridden. It then validates
-   every config (`--mode metal --strict`);
+5. patches each node: first the optional patches from `TALOS_PATCH_DIR`
+   (`all.yaml`, `<role>.yaml`, `<node>.yaml`), then the generated patch with
+   its hostname, its MAC-selected DHCP interface and, on control planes, the
+   shared VIP. `scripts/check-node-config.py` then compares the merged config
+   with the generated one. It rejects any change to the cluster's identity
+   and trust (cluster id, secret, name, endpoint, tokens, CAs, service
+   account, encryption secret, accepted CAs), the install disk and image,
+   the pod/service CIDRs and the machine type. It also rejects a hostname
+   other than the node's name, anything but exactly the node's one
+   MAC-selected DHCP interface, a VIP on a worker or a missing one on a
+   control plane, and any config document a patch added. Every config is then
+   validated (`--mode metal --strict`). A rejected or invalid config stops
+   the run with nothing published, and the error names only the setting,
+   never its value;
 6. writes a `talosconfig` whose endpoints are the control-plane addresses,
    never the VIP, once only. It publishes configs only after all of them
-   validate and reports each node as `created`, `changed` or `unchanged`.
+   pass and reports each node as `created`, `changed` or `unchanged`.
 
 Only commands and file paths are logged; no secret is printed. Back up
 `TALOS_STATE_DIR` off the control VM: losing the secrets bundle means losing
@@ -108,9 +118,13 @@ the ability to manage the cluster.
 
 ## Known limitations
 
-- The patch forms (`machine.network.hostname`, `interfaces[].vip`) and
-  determinism of `talosctl gen config` across reruns are checked against the
-  pinned release in the smoke run, not yet here.
+- The patch forms (`machine.network.hostname`, `interfaces[].vip`), the
+  field paths the config check protects, and determinism of `talosctl gen
+  config` across reruns are checked against the pinned release in the smoke
+  run, not yet here. The tests use a stand-in `talosctl` whose merge only
+  approximates Talos' strategic merge.
+- Patches may only change the main (v1alpha1) document; adding a separate
+  config document (for example an extension service) is rejected for now.
 - A single hypervisor is a single failure domain. Three control-plane VMs do
   not make the lab highly available.
 - Delivery is through the Talos maintenance API, which is unauthenticated
