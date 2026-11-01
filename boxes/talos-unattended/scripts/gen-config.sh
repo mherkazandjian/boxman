@@ -94,24 +94,37 @@ esac
 [[ $TALOS_SERVICE_CIDR =~ $CIDR4 ]] || die "TALOS_SERVICE_CIDR must be an IPv4 CIDR"
 [ "$TALOS_POD_CIDR" != "$TALOS_SERVICE_CIDR" ] || die "pod and service CIDRs must differ"
 case "$TALOS_STATE_DIR" in /*) ;; *) die "TALOS_STATE_DIR must be an absolute path" ;; esac
+# no . or .. components: below a directory that does not exist yet they are
+# resolved only by mkdir, after the checks below
+case "$TALOS_STATE_DIR/" in */./*|*/../*) die "TALOS_STATE_DIR must not contain . or .. components" ;; esac
+TALOS_STATE_DIR=$(printf '%s' "$TALOS_STATE_DIR" | tr -s /)
+[ "$TALOS_STATE_DIR" = / ] || TALOS_STATE_DIR=${TALOS_STATE_DIR%/}
 if [ -n "${TALOS_PATCH_DIR:-}" ]; then
     [ -d "$TALOS_PATCH_DIR" ] || die "TALOS_PATCH_DIR $TALOS_PATCH_DIR is not a directory"
 fi
 
 # Secrets must never land in a repository checkout, and an uncertain answer
 # counts as "yes". Two independent checks, both fail closed:
-#  1. every ancestor of the state directory is searchable, and none holds a
-#     checkout's .git: the file or link a worktree or submodule uses, or a
-#     directory with a HEAD (git's own test). A .git directory that cannot be
-#     read is a refusal; a readable one without HEAD is not a repository.
-#     This needs no git at all;
+#  1. the nearest existing ancestor is resolved to its physical path (a
+#     symlink into a checkout must not hide the checkout), and every parent of
+#     that path is searchable and holds no checkout's .git: the file or link a
+#     worktree or submodule uses, or a directory with a HEAD (git's own test).
+#     A .git directory that cannot be read is a refusal; a readable one
+#     without HEAD is not a repository. This needs no git at all;
 #  2. when git is installed, it must positively say "not a git repository";
 #     any other failure (dubious ownership, a broken repo) is a refusal.
+# The state directory is then used by that physical path only, and checked to
+# resolve to it once created.
 in_repo() { die "TALOS_STATE_DIR $TALOS_STATE_DIR is $1; keep cluster secrets out of repositories"; }
 probe=$TALOS_STATE_DIR
 while [ ! -e "$probe" ]; do probe=$(dirname "$probe"); done
 [ -d "$probe" ] || die "TALOS_STATE_DIR $TALOS_STATE_DIR: $probe is not a directory"
-dir=$probe
+physical=$(cd -P -- "$probe" 2>/dev/null && pwd -P) && [ -n "$physical" ] \
+    || die "cannot resolve $probe to a physical path (cannot inspect it); refusing to place secrets below it"
+rest=${TALOS_STATE_DIR:${#probe}}
+rest=${rest#/}
+if [ -n "$rest" ]; then STATE_PHYSICAL=${physical%/}/$rest; else STATE_PHYSICAL=$physical; fi
+dir=$physical
 while :; do
     [ -x "$dir" ] || die "cannot inspect $dir for a git checkout (not searchable); refusing to place secrets below it"
     git_dir=$dir/.git
@@ -126,12 +139,12 @@ while :; do
     dir=$(dirname "$dir")
 done
 if command -v git >/dev/null 2>&1; then
-    if answer=$(LC_ALL=C git -C "$probe" rev-parse --is-inside-work-tree 2>&1); then
+    if answer=$(LC_ALL=C git -C "$physical" rev-parse --is-inside-work-tree 2>&1); then
         in_repo "inside a git repository (git rev-parse: $answer)"
     fi
     case "$answer" in
         *"not a git repository"*) ;;
-        *) die "cannot tell whether $probe is in a git repository (git rev-parse: ${answer:-no output}); refusing to place secrets there" ;;
+        *) die "cannot tell whether $physical is in a git repository (git rev-parse: ${answer:-no output}); refusing to place secrets there" ;;
     esac
 fi
 
@@ -204,6 +217,14 @@ python3 -c 'import yaml' 2>/dev/null || die "python3 with PyYAML is required to 
 run() { log "+ $*"; "$@"; }
 
 mkdir -p "$STATE"
+# a path component swapped for a symlink since the checks must not redirect
+# the secrets: from here on only the checked physical path is used
+actual=$(cd -P -- "$STATE" 2>/dev/null && pwd -P) \
+    || die "cannot resolve $STATE after creating it"
+[ "$actual" = "$STATE_PHYSICAL" ] \
+    || die "$STATE resolves to $actual, not the checked $STATE_PHYSICAL; refusing to write secrets there"
+STATE=$STATE_PHYSICAL
+SECRETS=$STATE/secrets.yaml
 chmod 0700 "$STATE"
 exec 9>"$STATE/.lock"
 flock -n 9 || die "another gen-config run holds $STATE/.lock"

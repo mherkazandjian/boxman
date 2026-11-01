@@ -631,8 +631,78 @@ def test_an_uninspectable_ancestor_is_a_refusal(lab, tmp_path):
     finally:
         locked.chmod(0o700)
     assert proc.returncode != 0
-    assert "cannot inspect" in proc.stderr or "not searchable" in proc.stderr, proc.stderr
+    assert "cannot inspect" in proc.stderr, proc.stderr
     assert lab.calls() == []
+
+
+def _nested_checkout(tmp_path):
+    """A checkout with a nested directory, and a link to it from outside."""
+    repo = tmp_path / "checkout"
+    (repo / "sub" / "dir").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "link").symlink_to(repo / "sub" / "dir")
+    return repo, outside / "link"
+
+
+@pytest.mark.parametrize("with_git", [False, True], ids=["no-git", "git"])
+def test_a_symlink_into_a_nested_checkout_directory_is_refused(lab, tmp_path, with_git):
+    # review B4b: the parent walk followed the path as written, so with no
+    # git OUT/link -> REPO/sub/dir let OUT/link/state land inside REPO
+    repo, link = _nested_checkout(tmp_path)
+    path = None if with_git else _without_git(lab, tmp_path)
+    proc = lab.run(TALOS_STATE_DIR=str(link / "state"), **({"PATH": path} if path else {}))
+    assert proc.returncode != 0
+    assert "inside a git" in proc.stderr, proc.stderr
+    assert not (repo / "sub" / "dir" / "state").exists()
+    assert lab.calls() == []
+
+
+def test_a_dot_dot_below_a_missing_directory_is_refused(lab, tmp_path):
+    # OUT/new does not exist, so OUT/new/../link resolves only when mkdir
+    # creates it -- after any check of the path as it stood
+    repo, link = _nested_checkout(tmp_path)
+    state = link.parent / "new" / ".." / "link" / "state"
+    proc = lab.run(TALOS_STATE_DIR=str(state), PATH=_without_git(lab, tmp_path))
+    assert proc.returncode != 0 and ". or .. components" in proc.stderr, proc.stderr
+    assert not (repo / "sub" / "dir" / "state").exists()
+    assert not (link.parent / "new").exists()
+    assert lab.calls() == []
+
+
+def test_a_component_swapped_for_a_symlink_after_the_checks_is_caught(lab, tmp_path):
+    # the checks pass on a real directory; it is replaced by a symlink into a
+    # checkout just before mkdir -- the physical re-check must stop the run
+    repo, link = _nested_checkout(tmp_path)
+    real = link.parent / "real"
+    real.mkdir()
+    swap = tmp_path / "swap-bin"
+    swap.mkdir()
+    (swap / "mkdir").write_text(
+        "#!/bin/sh\n"
+        f"if [ ! -e '{tmp_path}/swapped' ]; then\n"
+        f"  touch '{tmp_path}/swapped'; rmdir '{real}'; ln -s '{repo}/sub/dir' '{real}'\n"
+        "fi\n"
+        'exec /bin/mkdir "$@"\n')
+    (swap / "mkdir").chmod(0o755)
+    proc = lab.run(TALOS_STATE_DIR=str(real / "state"),
+                   PATH=f"{swap}:{_without_git(lab, tmp_path)}")
+    assert (tmp_path / "swapped").exists()
+    assert proc.returncode != 0
+    assert "not the checked" in proc.stderr, proc.stderr
+    assert not (repo / "sub" / "dir" / "state" / "secrets.yaml").exists()
+    assert not any(c.startswith("gen ") for c in lab.calls())
+
+
+def test_a_symlinked_state_path_is_used_by_its_physical_location(lab, tmp_path):
+    target = tmp_path / "private"
+    target.mkdir()
+    (tmp_path / "via").symlink_to(target)
+    proc = _ok(lab.run(TALOS_STATE_DIR=str(tmp_path / "via" / "state")))
+    assert (target / "state" / "secrets.yaml").exists()
+    assert f"--with-secrets {os.path.realpath(target)}/state/secrets.yaml" in "\n".join(lab.calls())
+    assert SECRET_MARK not in proc.stdout + proc.stderr
 
 
 def test_an_empty_dot_git_directory_is_not_a_checkout(lab, tmp_path):

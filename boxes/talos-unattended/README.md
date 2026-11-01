@@ -80,12 +80,16 @@ smoke profile) before it does anything, then:
 1. checks that `talosctl` is exactly `TALOS_VERSION`, and that `python3`
    with PyYAML (part of the control template) is there to check configs;
 2. refuses a `TALOS_STATE_DIR` that is, or might be, inside a git checkout,
-   before creating anything. Every parent directory must be searchable and
-   must not hold a checkout's `.git` (a worktree or submodule's `.git` file,
-   or a `.git` directory with a `HEAD`). When git is installed, it must also
-   positively answer "not a git repository". Anything uncertain (an
-   unreadable `.git` or parent directory, or a git error such as dubious
-   ownership) is a refusal. It then locks the directory (0700);
+   before creating anything. The path may not contain `.` or `..`, and its
+   nearest existing directory is resolved through any symlinks first. Every
+   parent of that physical path must be searchable and must not hold a
+   checkout's `.git` (a worktree or submodule's `.git` file, or a `.git`
+   directory with a `HEAD`). When git is installed, it must also positively
+   answer "not a git repository". Anything uncertain (an unresolvable path,
+   an unreadable `.git` or parent directory, or a git error such as dubious
+   ownership) is a refusal. Once created, the directory must still resolve
+   to the checked physical path, the only one used from then on. It is then
+   locked (0700);
 3. creates the secrets bundle **once** (`talosctl gen secrets`), and only in
    an empty state directory. It records the bundle's fingerprint and identity
    inputs, and every rerun reuses it. A missing, altered or mismatched
