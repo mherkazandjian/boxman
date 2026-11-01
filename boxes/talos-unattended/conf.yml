@@ -1,0 +1,222 @@
+{#
+  talos-unattended
+  ================
+
+  Seven VMs for an unattended Talos Linux install, in two configuration
+  groups of one project:
+
+    management   control -- Ubuntu, cloned from templates.control-base; runs
+                 talosctl/kubectl/flux and keeps the cluster's private state.
+                 It owns the `fabric` NAT network and its DHCP reservations.
+    talos        cp-01..cp-03 and worker-01..worker-03 -- empty disks that
+                 fall through to the shared Talos metal ISO and wait in
+                 maintenance mode on management::fabric.
+
+  `boxman up` only creates and starts the VMs. Talos configuration is
+  generated on the control VM (scripts/gen-config.sh) and delivered through
+  the Talos API by the install driver; see README.md.
+
+  Addressing is deterministic: every Talos node pins a MAC that the fabric
+  network reserves, so a node's role never depends on discovery order. The
+  same table feeds scripts/nodes-from-conf.py, which writes the node list
+  gen-config.sh reads.
+
+  Everything site-specific comes from the environment (see
+  inputs.env.example). The defaults below are synthetic placeholders that
+  only let the file render; the scripts refuse the placeholder pins.
+#}
+{% set lab = env("TALOS_LAB_DIR", default="~/workspaces/talos-unattended") %}
+{% set net = env("TALOS_LAB_PREFIX", default="192.168.53") %}
+{% set operator_key = env("TALOS_OPERATOR_KEY", default="~/.ssh/id_ed25519_talos_lab") %}
+{% set operator_pubkey = env("TALOS_OPERATOR_PUBKEY", default="ssh-ed25519 AAAAPLACEHOLDER operator@example") %}
+{#- role, sizing and identity of every Talos node; the VIP (.5) and the
+    control VM sit outside these, the dynamic range is .100-.199 #}
+{% set nodes = [
+     {'name': 'cp-01',     'role': 'controlplane', 'mac': '52:54:00:53:00:11', 'host': 11},
+     {'name': 'cp-02',     'role': 'controlplane', 'mac': '52:54:00:53:00:12', 'host': 12},
+     {'name': 'cp-03',     'role': 'controlplane', 'mac': '52:54:00:53:00:13', 'host': 13},
+     {'name': 'worker-01', 'role': 'worker',       'mac': '52:54:00:53:00:21', 'host': 21},
+     {'name': 'worker-02', 'role': 'worker',       'mac': '52:54:00:53:00:22', 'host': 22},
+     {'name': 'worker-03', 'role': 'worker',       'mac': '52:54:00:53:00:23', 'host': 23},
+   ] %}
+{% set size = {
+     'controlplane': {'vcpus': 2, 'memory': 4096, 'disk_size': '50G'},
+     'worker':       {'vcpus': 4, 'memory': 6144, 'disk_size': '150G'},
+   } %}
+version: '1.0'
+project: talos_unattended
+
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: true
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+
+workspace:
+  path: {{ lab }}
+
+# The shared Talos metal boot ISO. Build it from an Image Factory schematic
+# that includes the qemu-guest-agent extension, and pin the same schematic's
+# installer image as TALOS_INSTALLER_IMAGE so the extension survives the
+# install. The all-zero checksum and "placeholder" in the uri mark an
+# unsupplied pin: make check-box-images skips it, and no download can match
+# it.
+isos:
+  talos-install:
+    uri: {{ env("TALOS_ISO_URI", default="https://factory.talos.dev/image/placeholder/metal-amd64.iso") }}
+    checksum: {{ env("TALOS_ISO_CHECKSUM", default="sha256:" ~ "0" * 64) }}
+
+templates:
+  control-base:
+    name: talos-unattended-control-base
+    image:
+      uri: http://cloud-images-archive.ubuntu.com/releases/noble/release-20240423/ubuntu-24.04-server-cloudimg-amd64.img
+      checksum: sha256:32a9d30d18803da72f5936cf2b7b9efcb4d0bb63c67933f17e3bdfd1751de3f3
+    disk_size: 40G
+    os_variant: ubuntu24.04
+    memory: 2048
+    vcpus: 2
+    cloudinit_done_marker: /var/lib/talos-unattended/template-ready
+    cloudinit_done_timeout: 900   # package install plus three tool downloads
+    # Non-secret recipe only: the operator's public key, the guest agent and
+    # pinned talosctl/kubectl/flux, each verified against its sha256. No
+    # Talos secrets, machine configs or Git credentials belong here -- the
+    # template is reusable and its user-data is logged by boxman.
+    cloudinit: |
+      #cloud-config
+      hostname: control
+      manage_etc_hosts: true
+
+      network:
+        version: 2
+        ethernets:
+          default:
+            match:
+              name: "en*"
+            dhcp4: true
+            dhcp6: false
+
+      users:
+        - name: admin
+          homedir: /admin
+          groups: [sudo]
+          sudo: "ALL=(ALL) NOPASSWD:ALL"
+          shell: /bin/bash
+          lock_passwd: true
+          ssh_authorized_keys:
+            - {{ operator_pubkey }}
+
+      ssh_pwauth: false
+      package_update: true
+      packages:
+        - qemu-guest-agent
+        - openssh-server
+        - curl
+        - util-linux
+
+      write_files:
+        # One fail-fast script owns both the tool install and the readiness
+        # marker boxman waits for. cloud-init runs runcmd under /bin/sh
+        # without errexit, so a marker written by a later runcmd entry would
+        # publish a template whose tools failed to install.
+        - path: /usr/local/sbin/prepare-control-template
+          permissions: "0755"
+          content: |
+            #!/bin/bash
+            # install the pinned tools, verified, then mark the template ready;
+            # any failure exits non-zero and leaves no marker
+            set -euo pipefail
+            bin=${TOOLS_BIN_DIR:-/usr/local/bin}
+            marker=${READY_MARKER:-/var/lib/talos-unattended/template-ready}
+            rm -f "$marker"
+            tmp=$(mktemp -d)
+            trap 'rm -rf "$tmp"' EXIT
+            fetch() {   # fetch <name> <url> <sha256>
+                local name=$1 url=$2 sum=$3
+                case "$sum" in
+                    ""|*PLACEHOLDER*) echo "no sha256 pinned for $name" >&2; exit 1 ;;
+                esac
+                curl -fsSL --retry 3 -o "$tmp/$name.download" "$url"
+                echo "$sum  $tmp/$name.download" | sha256sum -c --quiet -
+                case "$url" in
+                    *.tar.gz) tar -xzf "$tmp/$name.download" -C "$tmp" "$name"
+                              install -m 0755 "$tmp/$name" "$bin/$name" ;;
+                    *) install -m 0755 "$tmp/$name.download" "$bin/$name" ;;
+                esac
+                "$bin/$name" --help >/dev/null
+            }
+            fetch talosctl "https://github.com/siderolabs/talos/releases/download/{{ env('TALOS_VERSION', default='vPLACEHOLDER') }}/talosctl-linux-amd64" "{{ env('TALOSCTL_SHA256', default='PLACEHOLDER') }}"
+            fetch kubectl "https://dl.k8s.io/release/{{ env('KUBECTL_VERSION', default='vPLACEHOLDER') }}/bin/linux/amd64/kubectl" "{{ env('KUBECTL_SHA256', default='PLACEHOLDER') }}"
+            fetch flux "https://github.com/fluxcd/flux2/releases/download/{{ env('FLUX_VERSION', default='vPLACEHOLDER') }}/flux_{{ env('FLUX_VERSION', default='vPLACEHOLDER') | replace('v', '', 1) }}_linux_amd64.tar.gz" "{{ env('FLUX_SHA256', default='PLACEHOLDER') }}"
+            install -d -m 0755 "$(dirname "$marker")"
+            date -Is > "$marker"
+
+      runcmd:
+        - systemctl enable --now qemu-guest-agent
+        # the only entry that can write the marker; see write_files above
+        - /usr/local/sbin/prepare-control-template
+
+clusters:
+  management:
+    base_image: talos-unattended-control-base
+    workdir: {{ lab }}/management
+    admin_user: admin
+    # The template authorizes the operator key; there is deliberately no
+    # admin_pass, so boxman injects no generated key and no password exists.
+    admin_key_name: {{ operator_key }}
+    ssh_config: ssh_config
+
+    networks:
+      fabric:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:53:00:01'
+        ip:
+          address: '{{ net }}.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '{{ net }}.100'
+              end: '{{ net }}.199'
+            hosts:
+{% for n in nodes %}
+              - mac: '{{ n.mac }}'
+                ip: '{{ net }}.{{ n.host }}'
+                name: {{ n.name }}
+{% endfor %}
+        enable: True
+        autostart: True
+
+    vms:
+      control:
+        hostname: control
+        cpus: { sockets: 1, cores: 2, threads: 1 }
+        memory: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'fabric'
+
+  # API-only guests: no admin_user, admin_pass or ssh_config. Nothing may
+  # target this group over ssh or Ansible; the driver talks to it only
+  # through talosctl on the control VM.
+  talos:
+    workdir: {{ lab }}/talos
+    vms:
+{% for n in nodes %}
+      {{ n.name }}:
+        hostname: {{ n.name }}
+        vcpus: {{ size[n.role].vcpus }}
+        memory: {{ size[n.role].memory }}
+        disk_size: {{ size[n.role].disk_size }}
+        boot_order: [cdrom, hd]   # selects ISO boot; firmware order is hd,cdrom
+        cdroms:
+          - name: talos-install
+        networks:
+          - name: management::fabric
+            mac: '{{ n.mac }}'
+{% endfor %}

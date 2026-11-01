@@ -103,10 +103,15 @@ def discover_boxes():
     hosts joined by a VXLAN and boots a locally built Proxmox auto-install ISO,
     none of which exists on a single CI host. Its config shape is pinned by
     tests/test_proxmox_nested_box.py instead.
+
+    ``talos-unattended`` is excluded by name: ``boxman up`` alone only starts
+    its VMs, the Talos guests have no ssh by design, and it needs private
+    pins (ISO, tools) that CI does not have. Its shape and its
+    config-generation script are pinned by tests/test_talos_unattended_box.py.
     """
     pattern = os.path.join(BOXES_DIR, "*/conf.yml")
     excluded_suffixes = ("-docker-runtime", "-iso-boot")
-    excluded_names = ("proxmox-nested-ceph-cluster",)
+    excluded_names = ("proxmox-nested-ceph-cluster", "talos-unattended")
     return sorted(
         os.path.dirname(p) for p in glob.glob(pattern)
         if not os.path.basename(os.path.dirname(p)).endswith(excluded_suffixes)
