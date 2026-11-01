@@ -80,10 +80,12 @@ smoke profile) before it does anything, then:
 1. checks that `talosctl` is exactly `TALOS_VERSION`;
 2. locks `TALOS_STATE_DIR` (0700), and refuses to use a directory inside a
    git work tree, so secrets cannot land in a checkout;
-3. creates the secrets bundle **once** (`talosctl gen secrets`) and records
-   its fingerprint and identity inputs. Every rerun reuses it. A missing,
-   altered or mismatched bundle, or changed cluster name, endpoint or
-   versions, stops the run rather than minting a second cluster identity;
+3. creates the secrets bundle **once** (`talosctl gen secrets`), and only in
+   an empty state directory. It records the bundle's fingerprint and identity
+   inputs, and every rerun reuses it. A missing, altered or mismatched
+   bundle, or a changed cluster name, endpoint or version, stops the run.
+   So does a missing bundle beside any earlier state (identity, talosconfig,
+   configs or patches): it never mints a second cluster identity;
 4. runs `talosctl gen config` with explicit Talos and Kubernetes versions,
    install disk, installer image, NTP servers and pod/service CIDRs;
 5. patches each node with its hostname, its MAC-selected DHCP interface and,

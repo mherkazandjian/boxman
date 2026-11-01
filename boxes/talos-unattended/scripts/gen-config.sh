@@ -20,8 +20,9 @@
 #           is applied last so hostname, NIC and VIP cannot be overridden.
 #
 # State (TALOS_STATE_DIR, 0700, never inside a git work tree):
-#   secrets.yaml + secrets.sha256   cluster identity: created once, reused on
-#                                   every rerun, never regenerated
+#   secrets.yaml + secrets.sha256   cluster identity: created once, only in an
+#                                   empty state directory, reused on every
+#                                   rerun, never regenerated
 #   cluster.env                     the identity inputs the secrets belong to
 #   talosconfig                     admin client config, created once
 #   patches/<node>.yaml             generated per-node patches
@@ -180,6 +181,25 @@ if [ -e "$STATE/cluster.env" ]; then
 fi
 if [ -e "$STATE/secrets.sha256" ] && [ ! -e "$SECRETS" ]; then
     die "$SECRETS is missing but was created before; restore it from backup -- a new bundle would be a different cluster"
+fi
+# A new bundle only for an empty state directory: anything a previous run
+# left (identity, talosconfig, configs, patches) means this cluster exists
+# and its bundle is lost, however much of the rest survived.
+if [ ! -e "$SECRETS" ]; then
+    leftovers=()
+    shopt -s nullglob dotglob
+    for entry in "$STATE"/*; do
+        case "${entry##*/}" in .lock|.staging.*) ;; *) leftovers+=("${entry##*/}") ;; esac
+    done
+    shopt -u nullglob dotglob
+    [ ${#leftovers[@]} -eq 0 ] \
+        || die "$SECRETS is missing but $STATE holds earlier state (${leftovers[*]}); restore the bundle from backup, or start a new cluster in an empty directory"
+fi
+if [ -e "$SECRETS" ] && [ ! -e "$STATE/secrets.sha256" ]; then
+    die "$SECRETS has no recorded fingerprint; refusing to guess whether it belongs to this cluster"
+fi
+if [ -e "$SECRETS" ] && [ ! -e "$STATE/cluster.env" ]; then
+    die "$SECRETS exists without $STATE/cluster.env; refusing to guess which inputs it belongs to"
 fi
 if [ -e "$SECRETS" ] && [ ! -e "$STATE/secrets.sha256" ]; then
     die "$SECRETS has no recorded fingerprint; refusing to guess whether it belongs to this cluster"

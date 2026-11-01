@@ -506,6 +506,35 @@ def test_lost_secrets_stop_the_run_instead_of_a_new_identity(lab):
     assert not (lab.state / "secrets.yaml").exists()
 
 
+@pytest.mark.parametrize("survivor", ["cluster.env", "talosconfig", "nodes", "patches"])
+def test_bundle_and_fingerprint_lost_with_other_state_left(lab, survivor):
+    _ok(lab.run())
+    before = {p.name: _sha(p) for p in (lab.state / "nodes").glob("*.yaml")}
+    (lab.state / "secrets.yaml").unlink()
+    (lab.state / "secrets.sha256").unlink()
+    for entry in ("cluster.env", "talosconfig", "nodes", "patches"):
+        if entry != survivor:
+            path = lab.state / entry
+            subprocess.run(["rm", "-rf", str(path)], check=True)
+    n = len(lab.calls())
+    proc = lab.run()
+    assert proc.returncode != 0
+    assert "holds earlier state" in proc.stderr and survivor in proc.stderr, proc.stderr
+    assert not any(c.startswith("gen ") for c in lab.calls()[n:])
+    assert not (lab.state / "secrets.yaml").exists()
+    if survivor == "nodes":
+        assert {p.name: _sha(p) for p in (lab.state / "nodes").glob("*.yaml")} == before
+
+
+def test_a_state_dir_with_only_run_leftovers_is_fresh(lab):
+    # the lock file and an interrupted run's staging dir are not cluster state
+    lab.state.mkdir(mode=0o700)
+    (lab.state / ".lock").touch()
+    (lab.state / ".staging.abc123").mkdir()
+    _ok(lab.run())
+    assert (lab.state / "secrets.yaml").exists()
+
+
 def test_tampered_secrets_are_refused(lab):
     _ok(lab.run())
     with open(lab.state / "secrets.yaml", "a") as fobj:
