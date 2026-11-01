@@ -1,18 +1,24 @@
 """
 Deterministic checks for boxes/talos-unattended.
 
-Neither half touching libvirt or the network:
+Two halves, neither touching libvirt or the network:
 
 - conf.yml's shape: the seven-VM topology, sizing, the shared ISO, pinned MACs
   that the fabric network reserves, and no ssh credentials on the API-only
   Talos group.
-- the control template's tool install, run for real against a fake curl.
+- scripts/gen-config.sh, executed for real with a fake ``talosctl`` on PATH
+  that records its argv and writes recognisable secret material. The tests
+  assert the commands it ran, that a rerun changes nothing and mints no new
+  identity, that the guards stop before side effects, and that no secret
+  reaches its output or a git work tree.
 """
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
+import stat
 import subprocess
 import sys
 
@@ -26,9 +32,11 @@ pytestmark = pytest.mark.unit
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOX = os.path.join(REPO, "boxes", "talos-unattended")
+GEN_CONFIG = os.path.join(BOX, "scripts", "gen-config.sh")
 NODES_FROM_CONF = os.path.join(BOX, "scripts", "nodes-from-conf.py")
 
 TALOS_VERSION = "v1.99.0"   # synthetic: these tests pin no real release
+SECRET_MARK = "FAKESECRET"
 
 CP = [f"cp-0{i}" for i in (1, 2, 3)]
 WORKERS = [f"worker-0{i}" for i in (1, 2, 3)]
@@ -263,5 +271,322 @@ def test_provisioning_job_leaves_the_box_out():
     assert BOX not in discover_boxes()
 
 
+# --------------------------------------------------------------------------- #
+# gen-config.sh with a fake talosctl                                          #
+# --------------------------------------------------------------------------- #
+#: Records every invocation, writes secret-looking lines that tests can look
+#: for, and fails the way talosctl does when asked to overwrite secrets. Its
+#: `gen config` output is a function of the secrets and the patch, so an
+#: unchanged rerun produces byte-identical configs; its talosconfig carries a
+#: fresh random key each time, as the real one does.
+FAKE_TALOSCTL = r"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$FAKE_LOG"
+tc=""
+if [ "${1:-}" = --talosconfig ]; then tc=$2; shift 2; fi
+opt() {   # opt <flag> <args...>: value of the last <flag>
+    local want=$1 v=""; shift
+    while [ $# -gt 0 ]; do [ "$1" = "$want" ] && v=$2; shift; done
+    printf '%s' "$v"
+}
+case "$1 ${2:-}" in
+  "version --client")
+    printf 'Client:\n\tTalos %s\n' "$FAKE_TALOS_VERSION" ;;
+  "gen secrets")
+    out=$(opt -o "$@")
+    [ ! -e "$out" ] || { echo "file exists" >&2; exit 1; }
+    printf 'cluster:\n  secret: FAKESECRET-%s\n' "$(od -An -tx8 -N8 /dev/urandom | tr -d ' ')" > "$out" ;;
+  "gen config")
+    secrets=$(opt --with-secrets "$@"); dir=$(opt --output "$@")
+    patch=$(opt --config-patch "$@"); patch=${patch#@}
+    mkdir -p "$dir"
+    for role in controlplane worker; do
+      { echo "# role: $role"; cat "$secrets"; cat "$patch"; } > "$dir/$role.yaml"
+    done
+    printf 'client-key: FAKESECRET-%s\n' "$(od -An -tx8 -N8 /dev/urandom | tr -d ' ')" > "$dir/talosconfig" ;;
+  "machineconfig patch")
+    in=$3; shift 3
+    out=$(opt --output "$@")
+    { cat "$in"; while [ $# -gt 0 ]; do
+        [ "$1" = --patch ] && { echo "# patch $(basename "${2#@}")"; cat "${2#@}"; }; shift; done; } > "$out" ;;
+  "validate --config")
+    exit "${FAKE_VALIDATE_RC:-0}" ;;
+  "config endpoint"|"config node")
+    echo "$*" >> "$tc" ;;
+  *) echo "fake talosctl: unexpected $*" >&2; exit 64 ;;
+esac
+"""
+
+
+def _node_table(path, cps=CP, workers=WORKERS):
+    lines = [f"{n} controlplane 192.168.53.1{i + 1} 52:54:00:53:00:1{i + 1}"
+             for i, n in enumerate(cps)]
+    lines += [f"{n} worker 192.168.53.2{i + 1} 52:54:00:53:00:2{i + 1}"
+              for i, n in enumerate(workers)]
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+@pytest.fixture
+def lab(tmp_path):
+    """A fake talosctl on PATH, a node table and complete inputs."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "talosctl"
+    fake.write_text(FAKE_TALOSCTL)
+    fake.chmod(0o755)
+    log = tmp_path / "talosctl.log"
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        # tmp_path is outside any git work tree on a normal runner; the
+        # repo-guard test below proves the check itself
+        "GIT_CEILING_DIRECTORIES": str(tmp_path.parent),
+        "FAKE_LOG": str(log),
+        "FAKE_TALOS_VERSION": TALOS_VERSION,
+        "TALOS_STATE_DIR": str(tmp_path / "state"),
+        "TALOS_CLUSTER_NAME": "lab",
+        "TALOS_VERSION": TALOS_VERSION,
+        "KUBERNETES_VERSION": "1.99.0",
+        "TALOS_INSTALLER_IMAGE": f"registry.example/installer/abc:{TALOS_VERSION}",
+        "TALOS_INSTALL_DISK": "/dev/vda",
+        "TALOS_VIP": "192.168.53.5",
+        "TALOS_NTP_SERVERS": "ntp1.example ntp2.example",
+        "TALOS_POD_CIDR": "10.244.0.0/16",
+        "TALOS_SERVICE_CIDR": "10.96.0.0/12",
+    }
+
+    class Lab:
+        root = tmp_path
+        state = tmp_path / "state"
+        nodes = _node_table(tmp_path / "nodes.txt")
+
+        def run(self, *args, **overrides):
+            e = dict(env, **overrides)
+            for key in [k for k, v in overrides.items() if v is None]:
+                del e[key]
+            return subprocess.run(["bash", GEN_CONFIG, "--nodes", str(self.nodes), *args],
+                                  capture_output=True, text=True, env=e, timeout=60)
+
+        def calls(self):
+            return log.read_text().splitlines() if log.exists() else []
+
+    return Lab()
+
+
+def _ok(proc):
+    assert proc.returncode == 0, proc.stderr
+    return proc
+
+
 def _sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _mode(path):
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_dry_run_plans_without_state_or_talosctl(lab):
+    out = _ok(lab.run("--dry-run")).stdout
+    assert "talosctl gen secrets --talos-version v1.99.0" in out
+    assert "--install-disk /dev/vda" in out and "https://192.168.53.5:6443" in out
+    assert sum(line.startswith("plan: cp-") for line in out.splitlines()) == 3
+    assert not lab.state.exists()
+    assert lab.calls() == []
+
+
+def test_first_run_generates_with_explicit_pins(lab):
+    proc = _ok(lab.run())
+    calls = lab.calls()
+    assert calls[0] == "version --client --short"
+    assert calls[1].startswith(f"gen secrets --talos-version {TALOS_VERSION} -o ")
+    gen = calls[2]
+    assert gen.startswith("gen config lab https://192.168.53.5:6443 --with-secrets ")
+    for flag in (f"--talos-version {TALOS_VERSION}", "--kubernetes-version 1.99.0",
+                 "--install-disk /dev/vda",
+                 f"--install-image registry.example/installer/abc:{TALOS_VERSION}",
+                 "--output-types controlplane,worker,talosconfig"):
+        assert flag in gen, flag
+    assert f"--with-secrets {lab.state}/secrets.yaml" in gen
+    patches = [c for c in calls if c.startswith("machineconfig patch")]
+    assert len(patches) == 6
+    assert sum(c.startswith("validate --config") and "--mode metal --strict" in c
+               for c in calls) == 6
+    # talosctl talks to the control planes directly, never through the VIP
+    assert calls[-2].startswith("--talosconfig ")
+    assert calls[-2].endswith("config endpoint 192.168.53.11 192.168.53.12 192.168.53.13")
+    assert calls[-1].endswith("config node 192.168.53.11")
+    assert proc.stdout.splitlines() == [f"{n}: created" for n in CP + WORKERS]
+
+
+def test_node_configs_carry_role_identity_ntp_and_vip(lab):
+    _ok(lab.run())
+    for name in CP + WORKERS:
+        cfg = (lab.state / "nodes" / f"{name}.yaml").read_text()
+        role = "controlplane" if name.startswith("cp-") else "worker"
+        assert f"# role: {role}" in cfg
+        patch = yaml.safe_load((lab.state / "patches" / f"{name}.yaml").read_text())
+        net = patch["machine"]["network"]
+        assert net["hostname"] == name
+        (nic,) = net["interfaces"]
+        assert nic["deviceSelector"]["hardwareAddr"].startswith("52:54:00:53:00:")
+        assert nic["dhcp"] is True
+        assert ("vip" in nic) == (role == "controlplane")
+        if role == "controlplane":
+            assert nic["vip"] == {"ip": "192.168.53.5"}
+        assert '"ntp1.example"' in cfg and '"ntp2.example"' in cfg
+        assert '"10.244.0.0/16"' in cfg and '"10.96.0.0/12"' in cfg
+
+
+def test_state_is_private(lab):
+    _ok(lab.run())
+    assert _mode(lab.state) == 0o700
+    for path in [lab.state / "secrets.yaml", lab.state / "talosconfig",
+                 *(lab.state / "nodes").glob("*.yaml")]:
+        assert _mode(path) == 0o600, path
+    assert not list(lab.state.glob(".staging.*"))
+
+
+def test_rerun_reuses_identity_and_changes_nothing(lab):
+    _ok(lab.run())
+    before = {p.name: _sha(p) for p in [lab.state / "secrets.yaml", lab.state / "talosconfig",
+                                         *(lab.state / "nodes").glob("*.yaml")]}
+    first_calls = len(lab.calls())
+    proc = _ok(lab.run())
+    rerun = lab.calls()[first_calls:]
+    assert not any(c.startswith("gen secrets") for c in rerun)
+    assert not any("config endpoint" in c for c in rerun)   # talosconfig kept
+    assert proc.stdout.splitlines() == [f"{n}: unchanged" for n in CP + WORKERS]
+    after = {p.name: _sha(p) for p in [lab.state / "secrets.yaml", lab.state / "talosconfig",
+                                        *(lab.state / "nodes").glob("*.yaml")]}
+    assert after == before
+
+
+def test_a_patch_change_is_reported_and_published(lab, tmp_path):
+    _ok(lab.run())
+    patches = tmp_path / "patches"
+    patches.mkdir()
+    (patches / "worker.yaml").write_text("machine:\n  kubelet: {}\n")
+    proc = _ok(lab.run(TALOS_PATCH_DIR=str(patches)))
+    status = dict(line.split(": ") for line in proc.stdout.splitlines())
+    assert {status[n] for n in CP} == {"unchanged"}
+    assert {status[n] for n in WORKERS} == {"changed"}
+    worker_patch = next(c for c in lab.calls()[::-1] if "worker-01.yaml" in c
+                        and c.startswith("machineconfig patch"))
+    # user patches first, the generated identity patch last
+    assert worker_patch.index(f"@{patches}/worker.yaml") < worker_patch.index("patches/worker-01.yaml")
+
+
+def test_no_secret_reaches_the_output(lab):
+    first = _ok(lab.run())
+    second = _ok(lab.run())
+    assert SECRET_MARK in (lab.state / "secrets.yaml").read_text()
+    for proc in (first, second):
+        assert SECRET_MARK not in proc.stdout + proc.stderr
+
+
+def test_state_inside_a_git_work_tree_is_refused(lab, tmp_path):
+    repo = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    proc = lab.run(TALOS_STATE_DIR=str(repo / "state"), GIT_CEILING_DIRECTORIES=None)
+    assert proc.returncode != 0
+    assert "inside a git work tree" in proc.stderr
+    assert not (repo / "state").exists()
+    assert lab.calls() == []
+
+
+def test_lost_secrets_stop_the_run_instead_of_a_new_identity(lab):
+    _ok(lab.run())
+    (lab.state / "secrets.yaml").unlink()
+    n = len(lab.calls())
+    proc = lab.run()
+    assert proc.returncode != 0 and "restore it from backup" in proc.stderr
+    assert not any(c.startswith("gen ") for c in lab.calls()[n:])
+    assert not (lab.state / "secrets.yaml").exists()
+
+
+def test_tampered_secrets_are_refused(lab):
+    _ok(lab.run())
+    with open(lab.state / "secrets.yaml", "a") as fobj:
+        fobj.write("# edited\n")
+    proc = lab.run()
+    assert proc.returncode != 0 and "fingerprint" in proc.stderr
+
+
+@pytest.mark.parametrize("var,value", [
+    ("TALOS_CLUSTER_NAME", "other"),
+    ("TALOS_VIP", "192.168.53.6"),
+    ("KUBERNETES_VERSION", "1.99.1"),
+])
+def test_identity_drift_is_refused(lab, var, value):
+    _ok(lab.run())
+    proc = lab.run(**{var: value})
+    assert proc.returncode != 0 and "cluster.env" in proc.stderr
+
+
+def test_talosctl_version_mismatch_stops_before_state(lab):
+    proc = lab.run(FAKE_TALOS_VERSION="v1.98.0")
+    assert proc.returncode != 0 and "inputs pin v1.99.0" in proc.stderr
+    assert not lab.state.exists()
+
+
+def test_a_concurrent_run_is_refused(lab):
+    lab.state.mkdir(mode=0o700)
+    with open(lab.state / ".lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        proc = lab.run()
+    assert proc.returncode != 0 and ".lock" in proc.stderr
+    assert not any(c.startswith("gen ") for c in lab.calls())
+
+
+def test_a_failed_validation_publishes_nothing(lab):
+    proc = lab.run(FAKE_VALIDATE_RC="1")
+    assert proc.returncode != 0
+    assert not (lab.state / "nodes").exists()
+    assert not list(lab.state.glob(".staging.*"))
+
+
+@pytest.mark.parametrize("override,message", [
+    ({"TALOS_VERSION": None}, "TALOS_VERSION is not set"),
+    ({"TALOS_NTP_SERVERS": "PLACEHOLDER-ntp-server"}, "placeholder"),
+    ({"TALOS_VERSION": "v1.99"}, "exact release"),
+    ({"TALOS_INSTALLER_IMAGE": "registry.example/installer/abc:v1.98.0"}, "must be tagged"),
+    ({"TALOS_STATE_DIR": "relative/state"}, "absolute path"),
+    ({"TALOS_POD_CIDR": "10.96.0.0/12"}, "must differ"),
+    ({"TALOS_VIP": "192.168.53.11"}, "uses the VIP"),
+])
+def test_bad_inputs_fail_before_any_talosctl_call(lab, override, message):
+    proc = lab.run(**override)
+    assert proc.returncode != 0 and message in proc.stderr, proc.stderr
+    assert lab.calls() == []
+
+
+@pytest.mark.parametrize("table,message", [
+    ("cp-01 controlplane 192.168.53.11 52:54:00:53:00:11\n"
+     "worker-01 worker 192.168.53.21 52:54:00:53:00:21\n"
+     "worker-02 worker 192.168.53.22 52:54:00:53:00:22\n", "got 1+2"),
+    ("cp-01 controlplane 192.168.53.11 52:54:00:53:00:11\n"
+     "worker-01 worker 192.168.53.21 52:54:00:53:00:11\n", "duplicate mac"),
+    ("cp-01 etcd 192.168.53.11 52:54:00:53:00:11\n", "unknown role"),
+    ("cp-01 controlplane 192.168.53.11\n", "expected"),
+])
+def test_bad_node_tables_fail_before_any_talosctl_call(lab, table, message):
+    lab.nodes.write_text(table)
+    proc = lab.run()
+    assert proc.returncode != 0 and message in proc.stderr, proc.stderr
+    assert lab.calls() == []
+
+
+def test_one_plus_one_smoke_profile_is_accepted(lab):
+    _node_table(lab.nodes, cps=["cp-01"], workers=["worker-01"])
+    proc = _ok(lab.run())
+    assert proc.stdout.splitlines() == ["cp-01: created", "worker-01: created"]
+
+
+def test_shipped_inputs_example_is_refused_as_is(lab):
+    env = {k: None for k in ("TALOS_STATE_DIR", "TALOS_VERSION", "TALOS_NTP_SERVERS",
+                             "TALOS_INSTALLER_IMAGE", "KUBERNETES_VERSION")}
+    proc = lab.run("--inputs", os.path.join(BOX, "inputs.env.example"), **env)
+    assert proc.returncode != 0 and "placeholder" in proc.stderr
+    assert lab.calls() == []
