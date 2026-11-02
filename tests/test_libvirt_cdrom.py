@@ -738,6 +738,20 @@ class TestTheImageACdromReads:
         [command] = calls
         assert "--backing-chain" in command and " -U " in command
 
+    def test_the_persistent_definition_takes_the_chain_the_live_one_records(
+            self, cd: CDROMManager):
+        """A revert's overlay is root and 0600, which qemu-img without sudo
+        cannot read; libvirt records its chain in the live definition."""
+        same = _OVERLAY_SDA_PERSISTENT.replace("1793626528", "1793626526")
+
+        def execute(*args, **_kw):
+            return _result(stdout=_domain(
+                same if "--inactive" in args else _OVERLAY_SDA))
+        with patch.object(cd.virsh, "execute", side_effect=execute), \
+             patch.object(LibVirtCommandBase, "execute_shell",
+                          side_effect=AssertionError("no qemu-img needed")):
+            assert cd.media_read(inactive=True) == {"sda": "/isos/tools.iso"}
+
     def test_one_that_cannot_be_read_is_left_out(self, cd: CDROMManager):
         with patch.object(cd.virsh, "execute", return_value=_result(
                 stdout=_domain(_OVERLAY_SDA_PERSISTENT))), \

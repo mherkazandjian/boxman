@@ -465,11 +465,26 @@ class CDROMManager:
         snapshot revert leaves a drive on a qcow2 overlay of its ISO (#273).
 
         Drives on an image built on nothing are left out, and so are empty
-        ones and any whose chain cannot be told (:meth:`media_layers`).
+        ones and any whose chain cannot be told (:meth:`media_layers`). The
+        persistent definition records no chain: one the live definition
+        records for the same image is taken before ``qemu-img`` is asked,
+        which without ``sudo`` cannot read a revert's ``root`` ``0600``
+        overlay.
         """
+        elements = self.cdrom_elements(inactive=inactive) or {}
+        live: dict[str, list] = {}
+        if inactive and any(disk.find("source") is not None
+                            and recorded_layers(disk) is None
+                            for disk in elements.values()):
+            for disk in (self.cdrom_elements() or {}).values():
+                layers = recorded_layers(disk)
+                if layers:
+                    live[layers[0][0]] = layers
         read = {}
-        for target, disk in (self.cdrom_elements(inactive=inactive) or {}).items():
-            layers = self.media_layers(disk)
+        for target, disk in elements.items():
+            source = disk.find("source")
+            layers = (live.get(source.get("file")) if source is not None
+                      else None) or self.media_layers(disk)
             if layers and len(layers) > 1:
                 read[target] = layers[-1][0]
         return read
