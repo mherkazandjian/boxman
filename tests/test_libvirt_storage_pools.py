@@ -5,15 +5,20 @@ removes a VM's files itself, the pools that listed them are refreshed.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from boxman.providers.libvirt.storage_pools import (
+    POOL_NAME_MAX_BYTES,
     ensure_pool_on,
     refresh_pools_holding,
+    set_autostart,
+    workdir_pool_name,
 )
+from fake_libvirt_pools import FakePools
 
 pytestmark = pytest.mark.unit
 
@@ -282,3 +287,76 @@ class TestEnsurePoolOn:
         virsh = self._virsh({}, define_ok=False)
 
         assert ensure_pool_on(virsh, str(tmp_path), "bprj_ov") is None
+
+
+class TestWorkdirPoolName:
+    """The pool boxman defines on a cluster's workdir is named after the
+    project and the cluster, not the workdir's basename, which every
+    project's ``cluster_1`` shares (#277)."""
+
+    def test_it_is_named_after_the_project_and_the_cluster(self):
+        assert (workdir_pool_name("demo", "cluster_1")
+                == "bprj__demo__bprj_cluster_1_workdir")
+
+    def test_two_projects_with_a_cluster_1_get_two_names(self):
+        assert (workdir_pool_name("demo", "cluster_1")
+                != workdir_pool_name("other", "cluster_1"))
+
+    @pytest.mark.parametrize("project, cluster", [
+        ("team/demo", "cluster_1"),        # libvirt refuses a "/"
+        ("demo", "cluster\n1"),            # ... and a newline
+        ("demo", "cluster\x001"),          # no NUL passes to virsh
+        ("d" * POOL_NAME_MAX_BYTES, "c"),  # /etc/libvirt/storage/<name>.xml
+        ("é" * 100, "c"),                  # bytes, not characters
+    ])
+    def test_a_name_libvirt_could_not_hold_falls_back_to_a_digest(
+            self, project, cluster):
+        digest = hashlib.sha256(
+            f"{project}/{cluster}".encode()).hexdigest()[:16]
+
+        name = workdir_pool_name(project, cluster)
+
+        assert name == f"bprj__{digest}_workdir"
+        assert len(name.encode()) <= POOL_NAME_MAX_BYTES
+
+    def test_the_longest_name_that_fits_is_kept(self):
+        project = "d" * (POOL_NAME_MAX_BYTES - len("bprj____bprj_c_workdir"))
+
+        assert (workdir_pool_name(project, "c")
+                == f"bprj__{project}__bprj_c_workdir")
+
+    def test_the_fallback_is_the_same_every_run_and_differs_per_cluster(self):
+        assert (workdir_pool_name("team/demo", "a")
+                == workdir_pool_name("team/demo", "a"))
+        assert (workdir_pool_name("team/demo", "a")
+                != workdir_pool_name("team/demo", "b"))
+
+
+class TestSetAutostart:
+
+    def test_one_already_set_is_left_as_it_is(self, tmp_path):
+        virsh = FakePools()
+        virsh.define("p", str(tmp_path), autostart=True)
+
+        assert set_autostart(virsh, "p", str(tmp_path))
+        assert virsh.verbs("pool-autostart") == []
+
+    def test_one_not_set_is_set(self, tmp_path):
+        virsh = FakePools()
+        virsh.define("p", str(tmp_path), active=False)
+
+        assert set_autostart(virsh, "p", str(tmp_path))
+        assert virsh.verbs("pool-autostart") == [("pool-autostart", "p")]
+        assert virsh.pools["p"].autostart
+
+    def test_one_that_cannot_be_set_is_a_warning(self, tmp_path, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(
+            "boxman.providers.libvirt.storage_pools.log.warning",
+            warnings.append)
+        virsh = FakePools()
+        virsh.define("p", str(tmp_path), persistent=False)
+
+        assert not set_autostart(virsh, "p", str(tmp_path))
+        assert any("p on" in w and "start with the host" in w
+                   for w in warnings)

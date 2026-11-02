@@ -1767,7 +1767,8 @@ class TestManagerDispatch:
         with pytest.raises(ConfigError, match=r"both map to docker compose project"):
             manager.provision_compose_clusters()
 
-    def test_storage_pool_uses_cluster_libvirt_session_not_dc_default(self, monkeypatch):
+    def test_storage_pool_uses_cluster_libvirt_session_not_dc_default(
+            self, monkeypatch, tmp_path):
         """Finding 2: in a compose-primary mixed project, self.provider is the
         dc session; _ensure_libvirt_storage_pool must build VirshCommand from
         the libvirt cluster's own session config (its URI), not the dc default."""
@@ -1780,7 +1781,7 @@ class TestManagerDispatch:
             "clusters": {
                 "svc": {"provider": "docker-compose", "workdir": "/tmp/dc",
                         "boxes": {"w": {"image": "x"}}},
-                "vms": {"provider": "libvirt", "workdir": "/tmp/vm", "vms": {"n": {}}},
+                "vms": {"provider": "libvirt", "workdir": str(tmp_path / "vm"), "vms": {"n": {}}},
             },
         }
         # dc session registered first → becomes the legacy default self.provider
@@ -1798,7 +1799,7 @@ class TestManagerDispatch:
                 return SimpleNamespace(ok=True, stdout="", stderr="")
 
         monkeypatch.setattr(vms_mod, "VirshCommand", _FakeVirsh)
-        m._ensure_libvirt_storage_pool("/tmp/vm", "vms")
+        m._ensure_libvirt_storage_pool(str(tmp_path / "vm"), "vms")
         assert captured["cfg"] == {"uri": "qemu+ssh://remote/system"}
 
     def test_dc_only_project_partitions_all_clusters_as_compose(self):

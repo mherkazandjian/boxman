@@ -195,8 +195,10 @@ verb.
 ## `boxman storage pools`
 
 libvirt keeps a storage pool on each directory a VM's disks are created
-in: virt-install and virt-clone define one when there is none. `destroy`
-retires the pools on the directories it removes. A pool left on a
+in: virt-install and virt-clone define one when there is none. boxman
+sees to the one on each cluster workdir itself, before cloning (see
+[the pool on a cluster's workdir](#the-pool-on-a-clusters-workdir)).
+`destroy` retires the pools on the directories it removes. A pool left on a
 directory that is gone some other way (by an older boxman, by a
 `destroy` that could not read which domains use it, or by a directory
 removed by hand) shows up here.
@@ -235,6 +237,41 @@ No conf.yml is needed: without one, the command uses boxman.yml's libvirt
 provider on the local runtime. Under the docker runtime, run it beside
 the project's conf.yml, because libvirt there is that project's
 container.
+
+### The pool on a cluster's workdir
+
+Before it clones VMs into a cluster's workdir (`provision`, `up`,
+`update`), boxman sees to a pool on it. Otherwise the clones, started
+together, would race to define one. The pool is found by its target,
+never by its name:
+
+- A pool already on the workdir is used under its own name and started
+  if it is down. It may be an older boxman's, named after the workdir's
+  basename (`cluster_1`), or virt-install's (`cluster_1-3`). A pool counts
+  as on the workdir when its target is spelled the same way once
+  normalized, and is the same directory.
+- A pool of a matching name on another directory, such as another
+  project's `cluster_1`, is never taken for the workdir.
+- With no pool on it, boxman defines
+  `bprj__<project>__bprj_<cluster>_workdir`, starts it and sets it to
+  start with the host.
+  - If that name is taken by a pool on another directory (the workdir
+    moved, say), boxman uses the first free `<name>_<n>` and leaves the
+    other pool as it is.
+  - If the project or cluster name holds a `/` or a control character,
+    or the name would be longer than 200 bytes, the pool is named
+    `bprj__<digest>_workdir`. The digest is the first 16 hex digits of
+    the SHA-256 of `<project>/<cluster>`.
+- Clusters that share a workdir share its pool. The first cluster to get
+  there names it.
+- A `bprj__` pool on the workdir that does not start with the host is set
+  to, for example after its `pool-start` failed when it was defined. A
+  pool with any other name keeps its setting.
+- boxman makes the workdir itself, as the user it runs as. It does not
+  run `pool-build`.
+- If the pools cannot be listed, or the pool cannot be defined or
+  started, boxman warns and the clones go on. virt-install and virt-clone
+  then define a pool themselves, as they did before.
 
 ---
 

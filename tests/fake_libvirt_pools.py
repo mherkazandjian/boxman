@@ -8,6 +8,12 @@ answers it.
   ``--name`` or ``--uuid``; under ``--all`` a name is padded with blanks.
 - ``pool-dumpxml``, ``pool-destroy`` and ``pool-undefine`` take a name or a
   UUID; destroying a transient pool makes it go.
+- ``pool-define-as <name> dir --target <dir>`` defines an inactive pool,
+  refused for a name taken or a directory pool already on that target as
+  libvirt spells it (a trailing ``/`` dropped); ``pool-start`` starts one
+  whose directory exists; ``pool-autostart`` sets a persistent one to start
+  with the host; ``pool-info`` describes one by name. ``pool-build`` is not
+  known: boxman makes the directory itself.
 - ``list --all --uuid --name``, ``list --uuid`` and ``dumpxml [--inactive]``
   describe the domains, each with the pools its volume disks name.
 
@@ -18,6 +24,7 @@ Every call is recorded, in order, in :attr:`FakePools.calls`, and in
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from unittest.mock import MagicMock
 
@@ -117,6 +124,10 @@ class FakePools:
             "pool-dumpxml": self._pool_dumpxml,
             "pool-destroy": self._pool_destroy,
             "pool-undefine": self._pool_undefine,
+            "pool-define-as": self._pool_define_as,
+            "pool-start": self._pool_start,
+            "pool-autostart": self._pool_autostart,
+            "pool-info": self._pool_info,
             "list": self._list,
             "dumpxml": self._dumpxml,
         }.get(verb)
@@ -174,6 +185,67 @@ class FakePools:
         self._gone[pool.uuid] = name
         del self.pools[name]
         return _result(stdout=f"Pool {name} has been undefined\n\n")
+
+    def _pool_define_as(self, args):
+        name, kind = args[0], args[1]
+        target = args[args.index("--target") + 1]
+        failed = f"error: Failed to define pool {name}\nerror: operation failed: "
+        if name in self.pools:
+            return _result(ok=False, stderr=(
+                f"{failed}pool '{name}' already exists with uuid "
+                f"{self.pools[name].uuid}"))
+        spelled = target.rstrip("/") or "/"
+        for other, pool in self.pools.items():
+            if (pool.type == kind == "dir" and pool.target is not None
+                    and (pool.target.rstrip("/") or "/") == spelled):
+                return _result(ok=False, stderr=(
+                    f"{failed}Storage source conflict with pool: '{other}'"))
+        self.define(name, spelled, type=kind, active=False)
+        return _result(stdout=f"Pool {name} defined\n\n")
+
+    def _pool_start(self, args):
+        found = self._pool(args[0])
+        if found is None:
+            return _result(ok=False, stderr="error: no such pool")
+        name, pool = found
+        if pool.active:
+            return _result(ok=False, stderr=(
+                f"error: Failed to start pool {name}\nerror: Requested "
+                f"operation is not valid: storage pool '{name}' is already "
+                f"active"))
+        if pool.type == "dir" and not os.path.isdir(pool.target or ""):
+            return _result(ok=False, stderr=(
+                f"error: Failed to start pool {name}\nerror: cannot open "
+                f"directory '{pool.target}': No such file or directory"))
+        pool.active = True
+        return _result(stdout=f"Pool {name} started\n\n")
+
+    def _pool_autostart(self, args):
+        found = self._pool(args[0])
+        if found is None:
+            return _result(ok=False, stderr="error: no such pool")
+        name, pool = found
+        if not pool.persistent:
+            return _result(ok=False, stderr=(
+                "error: failed to mark pool as autostarted\nerror: Requested "
+                "operation is not valid: cannot set autostart for transient "
+                "pool"))
+        pool.autostart = True
+        return _result(stdout=f"Pool {name} marked as autostarted\n\n")
+
+    def _pool_info(self, args):
+        found = self._pool(args[0])
+        if found is None:
+            return _result(ok=False, stderr=(
+                f"error: failed to get pool '{args[0]}'\nerror: Storage pool "
+                f"not found: no storage pool with matching name '{args[0]}'"))
+        name, pool = found
+        yes = {True: "yes", False: "no"}
+        return _result(stdout=(
+            f"Name:           {name}\nUUID:           {pool.uuid}\n"
+            f"State:          {'running' if pool.active else 'inactive'}\n"
+            f"Persistent:     {yes[pool.persistent]}\n"
+            f"Autostart:      {yes[pool.autostart]}\n\n"))
 
     def _list(self, args):
         if "--name" in args:

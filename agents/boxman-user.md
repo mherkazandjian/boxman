@@ -341,6 +341,7 @@ template time:
 | `boxman snapshot {list\|log\|restore\|delete\|collapse}` | List / git-log-style graph / restore / delete / merge-newer-into-head. |
 | `boxman restore` | Shortcut: restore all VMs to their latest snapshot. |
 | `boxman storage {df\|trim\|compact\|optimize\|compress-snapshots}` | qcow2 space reclaim and snapshot-memory compression. |
+| `boxman storage pools [--stale \| --prune [POOL ...] [--dry-run] [-y]]` | List libvirt's storage pools; `--prune` removes the ones left on directories that are gone. |
 | `boxman pxe-boot --vm <name> [--expected-ip IP] [--wait-timeout 600] [--restore-after]` | Network-boot a VM; optionally poll SSH then restore boot order to `[hd]`. |
 | `boxman netlab {deploy\|destroy\|inspect\|ssh <node> [--user U]}` | Containerlab subcommands (only when `containerlab:` is enabled). `netlab ssh` *prints* the ssh command — use `$(boxman netlab ssh sw1)`. |
 | `boxman control finish-install [--vms a,b] [--cluster c] [--dry-run]` | Declare an ISO-boot VM's install done: eject its `install_only` media now, whatever its guest agent says or its state (live + config when running, config when shut off). Refuses a named VM without install-only media; no-op, with a message, when nothing is left. After it, `up`/`update` no longer treat the VM as installing. |
@@ -374,7 +375,19 @@ coexist without colliding:
 |---|---|---|
 | VM domain name | `bprj__<project>__bprj_<cluster>_<vm>` | `bprj__myproj__bprj_cluster1_node01` |
 | Network name | `bprj__<project>__bprj__clstr__<cluster>__clstr__<network>` | `bprj__myproj__bprj__clstr__cluster1__clstr__nat` |
+| Storage pool on a cluster workdir | `bprj__<project>__bprj_<cluster>_workdir`, unless one is already on it | `bprj__myproj__bprj_cluster1_workdir` |
 | `ssh_config` Host alias | `<cluster>_<hostname>`, plus a padded `node<N>` | `cluster1_node01` and `node0` |
+
+The workdir's storage pool is found by its **target**, not its name. Any pool
+already on the workdir is used under its own name: an older boxman's
+`<basename>` (`cluster1`), or virt-install's `<basename>-<n>`. One of that name
+on another directory, such as another project's `cluster1`, is never taken. A
+new pool is defined only when none is on the workdir; it is set to start with
+the host. The name gets `_<n>` when it is taken on another directory. It becomes
+`bprj__<16 hex digits>_workdir` when the project or cluster name holds a `/` or
+a newline, or the name would be over 200 bytes. Clusters sharing a workdir share
+its pool. `destroy` retires the pools on the directories it removes, and
+`boxman storage pools` lists the rest.
 
 ⚠ **The SSH alias is `<cluster>_<hostname>`, not the bare hostname.** A VM
 `node01` in cluster `cluster1` is `ssh cluster1_node01` (or `ssh node0`). It is
@@ -1437,7 +1450,7 @@ Upgrade boxman so `passlib` is present, and recreate the template.
 | `<workspace.path>/ssh_config` | OpenSSH config with `<cluster>_<hostname>` Host blocks. |
 | `<workspace.path>/inventory/` | Ansible inventory (auto-generated unless overridden). |
 | `<workspace.path>/<cluster>/` | Default cluster workdir when `cluster.workdir` is unset. |
-| `<cluster.workdir>/` | VM qcow2 disks, libvirt storage pool. |
+| `<cluster.workdir>/` | VM qcow2 disks. A libvirt storage pool is on it: `bprj__<project>__bprj_<cluster>_workdir`, or the one already there. |
 | `<cluster.workdir>/docker-compose.yml` | Generated compose file for a container cluster. Do not hand-edit. |
 | `<cluster.workdir>/snapshots.json` | Snapshot ledger for a container cluster. |
 | `~/boxman-templates/` | Default per-template workdir. |
