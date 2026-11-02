@@ -1216,9 +1216,10 @@ class FlowsMixin:
             if pools is None:
                 self.logger.warning(
                     f"could not read libvirt's storage pools, so none on "
-                    f"{', '.join(trees)} is removed along with it; a pool "
-                    f"left on a directory that "
-                    f"is gone can be removed by hand with "
+                    f"{', '.join(trees)} is removed along with it; find the "
+                    f"ones left on a directory that is gone with `boxman "
+                    f"storage pools --stale`, and remove them with `boxman "
+                    f"storage pools --prune POOL`, or by hand with "
                     f"`{session.virsh_invocation('pool-destroy', 'POOL')}` "
                     f"(if it is active), then "
                     f"`{session.virsh_invocation('pool-undefine', 'POOL')}`")
@@ -1275,7 +1276,8 @@ class FlowsMixin:
                 self.logger.warning(
                     f"left storage pool {pool.name} in place, although its "
                     f"directory {pool.target} is gone: {why}. Once nothing "
-                    f"needs it, remove it with "
+                    f"needs it, remove it with `boxman storage pools "
+                    f"--prune {pool.name}`, or by hand with "
                     f"`{session.virsh_invocation('pool-destroy', pool.name)}`"
                     f" (if it is active), then "
                     f"`{session.virsh_invocation('pool-undefine', pool.name)}`")

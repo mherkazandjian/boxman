@@ -4,8 +4,8 @@ the storage pools and domains of one libvirt host, for #277: what retiring
 the pool on a removed directory reads and runs, answered as libvirt 10
 answers it.
 
-- ``pool-list`` takes ``--all``, ``--transient`` and ``--name`` or
-  ``--uuid``; under ``--all`` a name is padded with blanks.
+- ``pool-list`` takes ``--all``, ``--transient``, ``--autostart`` and
+  ``--name`` or ``--uuid``; under ``--all`` a name is padded with blanks.
 - ``pool-dumpxml``, ``pool-destroy`` and ``pool-undefine`` take a name or a
   UUID; destroying a transient pool makes it go.
 - ``list --all --uuid --name``, ``list --uuid`` and ``dumpxml [--inactive]``
@@ -36,6 +36,7 @@ class FakePool:
     type: str = "dir"
     active: bool = True
     persistent: bool = True
+    autostart: bool = False
 
 
 @dataclass
@@ -130,6 +131,8 @@ class FakePools:
             if not (every or pool.active):
                 continue
             if "--transient" in args and pool.persistent:
+                continue
+            if "--autostart" in args and not pool.autostart:
                 continue
             if "--uuid" in args:
                 rows.append(pool.uuid)

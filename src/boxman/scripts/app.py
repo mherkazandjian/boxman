@@ -37,7 +37,8 @@ _CLI_HANDLERS = frozenset({
     'destroy_runtime', 'destroy', 'deprovision', 'snapshot_take',
     'snapshot_list', 'snapshot_log', 'snapshot_restore', 'snapshot_delete',
     'snapshot_collapse', 'storage_df', 'storage_trim', 'storage_compact',
-    'storage_optimize', 'storage_compress_snapshots', 'suspend_vm',
+    'storage_optimize', 'storage_compress_snapshots', 'storage_pools',
+    'suspend_vm',
     'resume_vm', 'save_vm', 'start_vm', 'finish_install', 'run_task', 'ps',
     'show_conf',
     'ssh_session', 'exec_container', 'pxe_boot', 'netlab_deploy',
@@ -303,6 +304,33 @@ def _main():
                 if 'project' in manager.config:
                     manager.runtime_instance.project_name = manager.config['project']
             getattr(manager, args.handler)(args)
+        sys.exit(0)
+
+    # 'storage pools' — libvirt's storage pools, with or without a project
+    # (#277). Without a conf.yml it asks boxman.yml's libvirt provider on the
+    # local runtime; under the docker runtime libvirt is a project's
+    # container, so it needs that project's conf.yml.
+    if args.handler == 'storage_pools':
+        conf = args.conf if os.path.isfile(args.conf) else None
+        manager = BoxmanManager(config=conf)
+        boxman_config = load_boxman_config(os.path.expanduser(args.boxman_conf))
+        manager.load_app_config(boxman_config)
+        if conf is None:
+            if args.runtime not in (None, 'local'):
+                log.error(
+                    f"no project config found ({args.conf}): under the "
+                    f"'{args.runtime}' runtime libvirt runs in a project's "
+                    f"container, so run this beside that project's conf.yml")
+                sys.exit(2)
+            manager.runtime = 'local'
+        else:
+            manager.runtime = args.runtime or boxman_config.get('runtime', 'local')
+            if manager.runtime_instance.name == 'docker-compose':
+                manager.runtime_instance.project_dir = os.path.abspath(
+                    os.path.dirname(args.conf))
+                if 'project' in manager.config:
+                    manager.runtime_instance.project_name = manager.config['project']
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # 'snapshot log' is a viewer command — suppress INFO logging across the

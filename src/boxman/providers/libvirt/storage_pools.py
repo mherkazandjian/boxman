@@ -265,6 +265,13 @@ def retire_pool(virsh, pool: Pool) -> str | None:
     return None
 
 
+def autostarted_pools(virsh) -> set[str] | None:
+    """The names of the pools set to start with the host (``pool-list
+    --all --autostart --name``), or ``None`` when they cannot be listed."""
+    listed = _listed(virsh, "--all", "--autostart", "--name")
+    return None if listed is None else set(listed)
+
+
 def refresh_pools_holding(virsh, paths: Iterable[str]) -> list[str]:
     """
     Refresh every active pool whose target directory held one of *paths*.
