@@ -22,8 +22,13 @@
 #           applied in that order, then the generated per-node patch. After
 #           the merge, check-node-config.py (beside this script; needs python3
 #           with PyYAML) rejects a config whose cluster identity, trust,
-#           install inputs, CIDRs, role, hostname, interface or VIP differ
-#           from what was generated, or that gained a config document.
+#           install inputs, CIDRs, role, hostname, link or VIP differ from
+#           what was generated, or that gained or lost a config document.
+#
+# The configs are Talos v1.12+ multi-document machine configs: NTP is a
+# TimeSyncConfig, the CIDRs a KubeNetworkConfig, and each node's hostname,
+# MAC-selected link, DHCP and VIP are HostnameConfig, LinkAliasConfig,
+# DHCPv4Config and Layer2VIPConfig documents.
 #
 # State (TALOS_STATE_DIR, 0700; refused when it is, or might be, inside a git
 # checkout -- a .git in any ancestor, or git not positively saying "no"):
@@ -115,7 +120,26 @@ esac
 [[ $TALOS_VIP =~ $IPV4 ]] || die "TALOS_VIP must be an IPv4 address"
 [[ $TALOS_POD_CIDR =~ $CIDR4 ]] || die "TALOS_POD_CIDR must be an IPv4 CIDR"
 [[ $TALOS_SERVICE_CIDR =~ $CIDR4 ]] || die "TALOS_SERVICE_CIDR must be an IPv4 CIDR"
-[ "$TALOS_POD_CIDR" != "$TALOS_SERVICE_CIDR" ] || die "pod and service CIDRs must differ"
+ip_int() { local a b c d; IFS=. read -r a b c d <<< "$1"; echo $(( (a << 24) | (b << 16) | (c << 8) | d )); }
+prefix_mask() { echo $(( $1 == 0 ? 0 : (0xFFFFFFFF << (32 - $1)) & 0xFFFFFFFF )); }
+# in_cidr ADDR CIDR: ADDR lies inside CIDR
+in_cidr() {
+    local mask; mask=$(prefix_mask "${2#*/}")
+    [ $(( $(ip_int "$1") & mask )) -eq $(( $(ip_int "${2%/*}") & mask )) ]
+}
+for var in TALOS_POD_CIDR TALOS_SERVICE_CIDR; do
+    # Talos rejects a CIDR with host bits set, at validation time
+    cidr=${!var}
+    [ $(( $(ip_int "${cidr%/*}") & ~$(prefix_mask "${cidr#*/}") & 0xFFFFFFFF )) -eq 0 ] \
+        || die "$var $cidr has host bits set; use its network address"
+done
+# two canonical CIDRs overlap exactly when one holds the other's address
+if in_cidr "${TALOS_POD_CIDR%/*}" "$TALOS_SERVICE_CIDR" || in_cidr "${TALOS_SERVICE_CIDR%/*}" "$TALOS_POD_CIDR"; then
+    die "pod and service CIDRs must not overlap"
+fi
+for cidr in "$TALOS_POD_CIDR" "$TALOS_SERVICE_CIDR"; do
+    ! in_cidr "$TALOS_VIP" "$cidr" || die "TALOS_VIP $TALOS_VIP lies inside $cidr"
+done
 case "$TALOS_STATE_DIR" in /*) ;; *) die "TALOS_STATE_DIR must be an absolute path" ;; esac
 # no . or .. components: below a directory that does not exist yet they are
 # resolved only by mkdir, after the checks below
@@ -187,6 +211,9 @@ while read -r name role ip mac extra; do
         *) die "node table: $name has unknown role $role" ;;
     esac
     [ "$ip" != "$TALOS_VIP" ] || die "node table: $name uses the VIP $TALOS_VIP as its address"
+    for cidr in "$TALOS_POD_CIDR" "$TALOS_SERVICE_CIDR"; do
+        ! in_cidr "$ip" "$cidr" || die "node table: $name's address $ip lies inside $cidr"
+    done
     for i in "${!NAMES[@]}"; do
         [ "${NAMES[$i]}" != "$name" ] || die "node table: duplicate name $name"
         [ "${IPS[$i]}" != "$ip" ]     || die "node table: duplicate address $ip"
@@ -204,6 +231,7 @@ for i in "${!NAMES[@]}"; do
 done
 
 ENDPOINT="https://$TALOS_VIP:6443"
+LINK=fabric   # the alias every node's one NIC gets, after the network it is on
 STATE=$TALOS_STATE_DIR
 SECRETS=$STATE/secrets.yaml
 IDENTITY="TALOS_CLUSTER_NAME=$TALOS_CLUSTER_NAME
@@ -237,7 +265,8 @@ CHECK=$(dirname "$0")/check-node-config.py
 [ -r "$CHECK" ] || die "missing $CHECK (ship it beside this script)"
 python3 -c 'import yaml' 2>/dev/null || die "python3 with PyYAML is required to check merged configs"
 
-run() { log "+ $*"; "$@"; }
+# stdout is the per-node report alone: tool output goes to stderr
+run() { log "+ $*"; "$@" >&2; }
 
 mkdir -p "$STATE"
 # a path component swapped for a symlink since the checks must not redirect
@@ -297,16 +326,18 @@ else
     log "created $SECRETS"
 fi
 
-# settings shared by every node
+# settings shared by every node, as v1.12+ config documents
 {
-    echo "machine:"
-    echo "  time:"
-    echo "    servers:"
-    for s in $TALOS_NTP_SERVERS; do echo "      - \"$s\""; done
-    echo "cluster:"
-    echo "  network:"
-    echo "    podSubnets: [\"$TALOS_POD_CIDR\"]"
-    echo "    serviceSubnets: [\"$TALOS_SERVICE_CIDR\"]"
+    echo "apiVersion: v1alpha1"
+    echo "kind: TimeSyncConfig"
+    echo "ntp:"
+    echo "  servers:"
+    for s in $TALOS_NTP_SERVERS; do echo "    - \"$s\""; done
+    echo "---"
+    echo "apiVersion: v1alpha1"
+    echo "kind: KubeNetworkConfig"
+    echo "podSubnets: [\"$TALOS_POD_CIDR\"]"
+    echo "serviceSubnets: [\"$TALOS_SERVICE_CIDR\"]"
 } > "$STAGING/cluster-patch.yaml"
 
 run talosctl gen config "$TALOS_CLUSTER_NAME" "$ENDPOINT" \
@@ -323,17 +354,29 @@ mkdir -p "$STAGING/patches" "$STAGING/nodes"
 for i in "${!NAMES[@]}"; do
     name=${NAMES[$i]} role=${ROLES[$i]}
     patch=$STAGING/patches/$name.yaml
+    # the node's identity: a static hostname, its one NIC named by its
+    # reserved MAC, DHCP on it and, on control planes, the shared VIP
     {
-        echo "machine:"
-        echo "  network:"
-        echo "    hostname: $name"
-        echo "    interfaces:"
-        echo "      - deviceSelector:"
-        echo "          hardwareAddr: \"${MACS[$i]}\""
-        echo "        dhcp: true"
+        echo "apiVersion: v1alpha1"
+        echo "kind: HostnameConfig"
+        echo "auto: \"off\""
+        echo "hostname: $name"
+        echo "---"
+        echo "apiVersion: v1alpha1"
+        echo "kind: LinkAliasConfig"
+        echo "name: $LINK"
+        echo "selector:"
+        echo "  match: 'mac(link.permanent_addr) == \"${MACS[$i]}\"'"
+        echo "---"
+        echo "apiVersion: v1alpha1"
+        echo "kind: DHCPv4Config"
+        echo "name: $LINK"
         if [ "$role" = controlplane ]; then
-            echo "        vip:"
-            echo "          ip: $TALOS_VIP"
+            echo "---"
+            echo "apiVersion: v1alpha1"
+            echo "kind: Layer2VIPConfig"
+            echo "name: \"$TALOS_VIP\""
+            echo "link: $LINK"
         fi
     } > "$patch"
     args=()
@@ -345,7 +388,7 @@ for i in "${!NAMES[@]}"; do
     run talosctl machineconfig patch "$STAGING/gen/$role.yaml" "${args[@]}" \
         --output "$STAGING/nodes/$name.yaml"
     # what patches may not change: identity, role, install inputs, node identity
-    run python3 "$CHECK" "$STAGING/gen/$role.yaml" "$STAGING/nodes/$name.yaml" \
+    run python3 "$CHECK" "$STAGING/gen/$role.yaml" "$patch" "$STAGING/nodes/$name.yaml" \
         "$name" "$role" "${MACS[$i]}" "$TALOS_VIP" \
         || die "$name: the merged config breaks a protected setting (see above); nothing was published"
     run talosctl validate --config "$STAGING/nodes/$name.yaml" --mode metal --strict

@@ -11,6 +11,9 @@ Two halves, neither touching libvirt or the network:
   assert the commands it ran, that a rerun changes nothing and mints no new
   identity, that the guards stop before side effects, and that no secret
   reaches its output or a git work tree.
+
+With TALOS_UNATTENDED_TALOSCTL pointing at a talosctl of the pinned release,
+the generation tests also run against it (no cluster or network needed).
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import hashlib
 import logging
 import os
 import re
+import runpy
 import stat
 import subprocess
 import sys
@@ -348,17 +352,20 @@ def test_provisioning_job_leaves_the_box_out():
 # --------------------------------------------------------------------------- #
 # gen-config.sh with a fake talosctl                                          #
 # --------------------------------------------------------------------------- #
-#: Records every invocation and stands in for talosctl with real YAML: secrets
-#: carry recognisable FAKESECRET values, `gen config` builds role configs from
-#: them (control planes get the CA keys, etcd and service-account material),
-#: and `machineconfig patch` merges like Talos' strategic merge closely enough
-#: for the identity checks -- maps merge, lists append, a patch document with
-#: a `kind` is added beside the main one. Its output is a function of its
-#: inputs, so an unchanged rerun is byte-identical; its talosconfig carries a
-#: fresh random key each time, as the real one does. Shebang filled in by the
-#: fixture: the test interpreter, which has PyYAML.
+#: Records every invocation and stands in for talosctl v1.14 with real YAML.
+#: Secrets carry recognisable FAKESECRET values. `gen config` writes the
+#: multi-document layout talosctl v1.14.5 writes (same documents, keys and
+#: roles; test_the_fake_matches_the_real_layout compares them when a real
+#: talosctl is supplied). `machineconfig patch` merges the way talosctl does:
+#: a patch document without a kind merges into the v1alpha1 one, one with a
+#: kind into the document of that kind and name, or is appended; maps merge,
+#: lists append (KubeNetworkConfig's subnets are replaced) and `$patch: delete`
+#: removes a document. `validate` applies the checks the real one was seen to
+#: make on these configs. Output is a function of the inputs, so an unchanged
+#: rerun is byte-identical; the talosconfig carries a fresh key each time, as
+#: the real one does. Shebang filled in by the fixture: the test interpreter.
 FAKE_TALOSCTL = r"""#!@PYTHON@
-import os, secrets, sys
+import ipaddress, os, secrets, sys
 import yaml
 
 argv = sys.argv[1:]
@@ -378,14 +385,22 @@ def opt(flag):
     return found[-1] if found else None
 
 
-def merge(dst, src):
+REPLACED = {("KubeNetworkConfig", "podSubnets"), ("KubeNetworkConfig", "serviceSubnets")}
+
+
+def merge(dst, src, kind=None):
     for key, value in src.items():
         if isinstance(value, dict) and isinstance(dst.get(key), dict):
             merge(dst[key], value)
-        elif isinstance(value, list) and isinstance(dst.get(key), list):
+        elif (isinstance(value, list) and isinstance(dst.get(key), list)
+              and (kind, key) not in REPLACED):
             dst[key] = dst[key] + value
         else:
             dst[key] = value
+
+
+def key(doc):
+    return (doc["kind"], doc.get("name")) if "kind" in doc else ("v1alpha1", None)
 
 
 def load(path):
@@ -394,28 +409,134 @@ def load(path):
 
 
 def patched(docs, patch_files):
-    main = next(d for d in docs if d.get("version") == "v1alpha1")
     for ref in patch_files:
         for doc in load(ref.lstrip("@")):
-            if "kind" in doc:
-                docs.append(doc)
+            match = [d for d in docs if key(d) == key(doc)]
+            if doc.get("$patch") == "delete":
+                docs = [d for d in docs if key(d) != key(doc)]
+            elif match:
+                merge(match[0], doc, doc.get("kind"))
             else:
-                merge(main, doc)
+                docs.append(doc)
     return docs
 
 
 def dump(docs, path):
     with open(path, "w") as fobj:
-        yaml.safe_dump_all(docs, fobj, sort_keys=True)
+        yaml.safe_dump_all(docs, fobj, sort_keys=False)
 
 
 def fresh():
     return "FAKESECRET-" + secrets.token_hex(8)
 
 
+def doc(kind, **fields):
+    return {"apiVersion": "v1alpha1", "kind": kind, **fields}
+
+
+def role_config(role, name, endpoint, sec, k8s):
+    certs, cp = sec["certs"], role == "controlplane"
+    main = {"version": "v1alpha1", "debug": False, "persist": True,
+            "machine": {"type": role, "token": sec["trustdinfo"]["token"],
+                        "ca": {"crt": certs["os"]["crt"], "key": certs["os"]["key"] if cp else ""},
+                        "certSANs": [], "features": {"diskQuotaSupport": True}},
+            "cluster": {"token": sec["secrets"]["bootstraptoken"]}}
+    if cp:
+        main["cluster"]["etcd"] = {"ca": certs["etcd"]}
+    node = {"nodeIP": {}}
+    if cp:
+        node["labels"] = {"node-role.kubernetes.io/control-plane": "",
+                          "node.kubernetes.io/exclude-from-external-load-balancers": ""}
+        node["taints"] = {"node-role.kubernetes.io/control-plane": "NoSchedule"}
+    docs = [
+        main,
+        doc("DiscoveryServiceConfig", name="default", endpoint="https://discovery.talos.dev/"),
+        doc("DiscoveryIdentityConfig", clusterID=sec["cluster"]["id"],
+            clusterSecret=sec["cluster"]["secret"]),
+        doc("UnattendedInstallConfig", installer={"image": opt("--install-image")},
+            provisioning={"diskSelector": {
+                "match": 'disk.dev_path == "%s"' % opt("--install-disk")}, "wipe": False}),
+        doc("ResolverConfig", hostDNS={"enabled": True, "forwardKubeDNSToHost": True}),
+        doc("VolumeConfig", name="EPHEMERAL", mount={"secure": True}),
+        doc("FilesystemTrimConfig", interval="168h0m0s"),
+        doc("SecurityProfileConfig", workloadIsolation=True),
+        doc("HostnameConfig", auto="stable"),
+        doc("KubeClusterConfig", clusterName=name, endpoint=endpoint),
+        doc("KubeNodeConfig", **node),
+        doc("KubeletConfig", image="ghcr.io/siderolabs/kubelet:v" + k8s, config={},
+            defaultRuntimeSeccompProfileEnabled=True),
+        doc("KubeNetworkConfig", dnsDomain="cluster.local", podSubnets=["10.244.0.0/16"],
+            serviceSubnets=["10.96.0.0/12"]),
+        doc("KubeAPIServerCAConfig", **({"issuingCA": {"cert": certs["k8s"]["crt"],
+                                                       "key": certs["k8s"]["key"]}}
+                                        if cp else {"acceptedCAs": [certs["k8s"]["crt"]]})),
+        doc("KubePrismConfig", port=7445),
+    ]
+    if cp:
+        image = "registry.k8s.io/kube-%s:v" + k8s
+        docs += [
+            doc("KubeAggregatorCAConfig", issuingCA={"cert": certs["k8saggregator"]["crt"],
+                                                     "key": certs["k8saggregator"]["key"]}),
+            doc("KubeAdmissionControlConfig", name="PodSecurity", configuration={
+                "apiVersion": "pod-security.admission.config.k8s.io/v1alpha1",
+                "defaults": {"audit": "restricted", "audit-version": "latest",
+                             "enforce": "baseline", "enforce-version": "latest",
+                             "warn": "restricted", "warn-version": "latest"},
+                "exemptions": {"namespaces": ["kube-system"], "runtimeClasses": [],
+                               "usernames": []},
+                "kind": "PodSecurityConfiguration"}),
+            doc("KubeAuditPolicyConfig", configuration={
+                "apiVersion": "audit.k8s.io/v1", "kind": "Policy",
+                "rules": [{"level": "Metadata"}]}),
+            doc("KubeAuthenticationConfig", configuration={
+                "anonymous": {"conditions": [{"path": "/livez"}, {"path": "/readyz"},
+                                             {"path": "/healthz"}], "enabled": True},
+                "jwt": []}),
+            doc("KubeAuthorizerConfig", name="node", type="Node"),
+            doc("KubeAuthorizerConfig", name="rbac", type="RBAC"),
+            doc("KubeEtcdEncryptionConfig", config={"resources": [{
+                "providers": [{"secretbox": {"keys": [{
+                    "name": "key2", "secret": sec["secrets"]["secretboxencryptionsecret"]}]}}],
+                "resources": ["secrets"]}]}),
+            doc("KubeServiceAccountConfig", issuer={"privateKey": sec["serviceaccount"]["key"],
+                                                    "issuerURL": endpoint}),
+            doc("KubeAPIServerConfig", image=image % "apiserver"),
+            doc("KubeControllerManagerConfig", image=image % "controller-manager"),
+            doc("KubeSchedulerConfig", image=image % "scheduler", config={}),
+            doc("KubeProxyConfig", image=image % "proxy", config={}),
+            doc("KubeFlannelCNIConfig", backendType="vxlan", backendPort=4789),
+            doc("KubeCoreDNSConfig", enabled=True),
+        ]
+    return docs
+
+
+def validate(path):
+    docs = load(path)
+    main = next(d for d in docs if "kind" not in d)
+    kinds = {key(d): d for d in docs}
+    errors = []
+    host = kinds.get(("HostnameConfig", None))
+    if host is not None:
+        if host.get("hostname") and host.get("auto") not in ("off", False):
+            errors.append("'auto' and 'hostname' cannot be set at the same time")
+        if (main.get("machine") or {}).get("network", {}).get("hostname"):
+            errors.append("static hostname is already set in v1alpha1 config")
+    if (main.get("cluster") or {}).get("network"):
+        errors.append("cluster network config is already set in the v1alpha1 config")
+    net = kinds.get(("KubeNetworkConfig", None)) or {}
+    for cidr in net.get("podSubnets", []) + net.get("serviceSubnets", []):
+        try:
+            ipaddress.ip_network(cidr)
+        except ValueError:
+            errors.append("invalid subnet: %s is not a valid CIDR" % cidr)
+    if errors or os.environ.get("FAKE_VALIDATE_RC", "0") != "0":
+        sys.exit("%d errors occurred:\n" % len(errors) + "\n".join("\t* " + e for e in errors))
+    print(path + " is valid for metal mode")
+
+
 cmd = " ".join(argv[:2])
 if cmd == "version --client":
-    print("Client:\n\tTalos " + os.environ["FAKE_TALOS_VERSION"])
+    print("Client:\nTalos " + os.environ["FAKE_TALOS_VERSION"])
 elif cmd == "gen secrets":
     out = opt("-o")
     if os.path.exists(out):
@@ -433,31 +554,17 @@ elif cmd == "gen config":
     name, endpoint = argv[2], argv[3]
     with open(opt("--with-secrets")) as fobj:
         sec = yaml.safe_load(fobj)
-    certs = sec["certs"]
     out = opt("--output")
     os.makedirs(out)
     for role in ("controlplane", "worker"):
-        machine = {"type": role, "token": sec["trustdinfo"]["token"],
-                   "ca": {"crt": certs["os"]["crt"]},
-                   "install": {"disk": opt("--install-disk"), "image": opt("--install-image")}}
-        cluster = {"id": sec["cluster"]["id"], "secret": sec["cluster"]["secret"],
-                   "clusterName": name, "controlPlane": {"endpoint": endpoint},
-                   "token": sec["secrets"]["bootstraptoken"], "ca": {"crt": certs["k8s"]["crt"]}}
-        if role == "controlplane":
-            machine["ca"]["key"] = certs["os"]["key"]
-            cluster["ca"]["key"] = certs["k8s"]["key"]
-            cluster.update(aggregatorCA=certs["k8saggregator"],
-                           serviceAccount={"key": sec["serviceaccount"]["key"]},
-                           secretboxEncryptionSecret=sec["secrets"]["secretboxencryptionsecret"],
-                           etcd={"ca": certs["etcd"]})
-        docs = [{"version": "v1alpha1", "machine": machine, "cluster": cluster}]
+        docs = role_config(role, name, endpoint, sec, opt("--kubernetes-version"))
         dump(patched(docs, opts("--config-patch")), os.path.join(out, role + ".yaml"))
     with open(os.path.join(out, "talosconfig"), "w") as fobj:
         fobj.write("client-key: " + fresh() + "\n")
 elif cmd == "machineconfig patch":
     dump(patched(load(argv[2]), opts("--patch")), opt("--output"))
 elif cmd == "validate --config":
-    sys.exit(int(os.environ.get("FAKE_VALIDATE_RC", "0")))
+    validate(argv[2])
 elif argv[0] == "config" and argv[1] in ("endpoint", "node"):
     with open(talosconfig, "a") as fobj:
         fobj.write(" ".join(argv) + "\n")
@@ -575,29 +682,49 @@ def test_first_run_generates_with_explicit_pins(lab):
     assert proc.stdout.splitlines() == [f"{n}: created" for n in CP + WORKERS]
 
 
-def _config(path) -> dict:
-    return next(d for d in yaml.safe_load_all(path.read_text()) if d.get("version") == "v1alpha1")
+def _docs(path) -> dict:
+    """{(kind, name): document} of a multi-document machine config."""
+    docs = {}
+    for doc in yaml.safe_load_all(path.read_text()):
+        if doc:
+            docs[(doc["kind"], doc.get("name")) if "kind" in doc else ("v1alpha1", None)] = doc
+    return docs
+
+
+def _assert_node_configs(nodes_dir, names, image, ntp):
+    """The patch forms gen-config writes, as they land in each final config."""
+    for name in names:
+        docs = _docs(nodes_dir / f"{name}.yaml")
+        role = "controlplane" if name.startswith("cp-") else "worker"
+        mac = f"52:54:00:53:00:{1 if role == 'controlplane' else 2}{name[-1]}"
+        assert docs[("v1alpha1", None)]["machine"]["type"] == role
+        assert docs[("HostnameConfig", None)] == {
+            "apiVersion": "v1alpha1", "kind": "HostnameConfig", "auto": "off", "hostname": name}
+        assert docs[("LinkAliasConfig", "fabric")]["selector"] == {
+            "match": f'mac(link.permanent_addr) == "{mac}"'}
+        assert ("DHCPv4Config", "fabric") in docs
+        vips = [k for k in docs if k[0] == "Layer2VIPConfig"]
+        if role == "controlplane":
+            assert vips == [("Layer2VIPConfig", "192.168.53.5")]
+            assert docs[vips[0]]["link"] == "fabric"
+        else:
+            assert vips == []
+        assert docs[("TimeSyncConfig", None)]["ntp"] == {"servers": ntp}
+        net = docs[("KubeNetworkConfig", None)]
+        assert (net["podSubnets"], net["serviceSubnets"]) == (["10.244.0.0/16"], ["10.96.0.0/12"])
+        install = docs[("UnattendedInstallConfig", None)]
+        assert install["installer"] == {"image": image}
+        assert install["provisioning"]["diskSelector"] == {"match": 'disk.dev_path == "/dev/vda"'}
+        # no pre-v1.12 forms that would conflict with the documents
+        assert "network" not in docs[("v1alpha1", None)]["machine"]
+        assert "network" not in docs[("v1alpha1", None)]["cluster"]
 
 
 def test_node_configs_carry_role_identity_ntp_and_vip(lab):
     _ok(lab.run())
-    for name in CP + WORKERS:
-        cfg = _config(lab.state / "nodes" / f"{name}.yaml")
-        role = "controlplane" if name.startswith("cp-") else "worker"
-        assert cfg["machine"]["type"] == role
-        net = cfg["machine"]["network"]
-        assert net["hostname"] == name
-        (nic,) = net["interfaces"]
-        assert nic["deviceSelector"]["hardwareAddr"].startswith("52:54:00:53:00:")
-        assert nic["dhcp"] is True
-        assert ("vip" in nic) == (role == "controlplane")
-        if role == "controlplane":
-            assert nic["vip"] == {"ip": "192.168.53.5"}
-        assert cfg["machine"]["time"]["servers"] == ["ntp1.example", "ntp2.example"]
-        assert cfg["cluster"]["network"] == {"podSubnets": ["10.244.0.0/16"],
-                                             "serviceSubnets": ["10.96.0.0/12"]}
-        assert cfg["machine"]["install"] == {
-            "disk": "/dev/vda", "image": f"registry.example/installer/abc:{TALOS_VERSION}"}
+    _assert_node_configs(lab.state / "nodes", CP + WORKERS,
+                         f"registry.example/installer/abc:{TALOS_VERSION}",
+                         ["ntp1.example", "ntp2.example"])
 
 
 def test_state_is_private(lab):
@@ -832,34 +959,85 @@ def test_a_state_dir_with_only_run_leftovers_is_fresh(lab):
 
 # ---- B3: patches cannot replace identity, role or node identity ----------- #
 OTHER_CLUSTER = "FOREIGN-VALUE"
+#: the same as certificate material: talosctl decodes v1alpha1 CA fields as
+#: base64 while patching, before any check could see them
+OTHER_CA = "Rk9SRUlHTi1WQUxVRQ=="
 
 
-@pytest.mark.parametrize("patch_file,body,violation", [
+def _kind(kind, body=""):
+    return f"apiVersion: v1alpha1\nkind: {kind}\n{body}"
+
+
+#: (patch file, patch, the violation the checker must name)
+PROTECTED_PATCHES = [
+    # the v1alpha1 document's own identity, and legacy fields that would
+    # duplicate (and might override) the v1.12+ documents
     ("worker-01.yaml", "machine:\n  type: controlplane\n", "machine.type"),
     ("all.yaml", "machine:\n  token: FOREIGN-VALUE\n", "machine.token"),
-    ("controlplane.yaml", "machine:\n  ca:\n    crt: FOREIGN-VALUE\n    key: FOREIGN-VALUE\n",
+    ("controlplane.yaml", f"machine:\n  ca:\n    crt: {OTHER_CA}\n    key: {OTHER_CA}\n",
      "machine.ca"),
-    ("all.yaml", "machine:\n  acceptedCAs:\n    - crt: FOREIGN-VALUE\n", "machine.acceptedCAs"),
+    ("all.yaml", f"machine:\n  acceptedCAs:\n    - crt: {OTHER_CA}\n", "machine.acceptedCAs"),
+    ("all.yaml", "cluster:\n  token: FOREIGN-VALUE\n", "cluster.token"),
+    ("controlplane.yaml", f"cluster:\n  etcd:\n    ca:\n      crt: {OTHER_CA}\n",
+     "cluster.etcd.ca"),
     ("all.yaml", "machine:\n  install:\n    image: registry.example/other:v1.99.0\n",
-     "machine.install.image"),
-    ("all.yaml", "machine:\n  install:\n    disk: /dev/vdb\n", "machine.install.disk"),
+     "machine.install"),
     ("cp-01.yaml", "cluster:\n  id: FOREIGN-VALUE\n", "cluster.id"),
-    ("all.yaml", "cluster:\n  secret: FOREIGN-VALUE\n", "cluster.secret"),
     ("all.yaml", "cluster:\n  clusterName: other\n", "cluster.clusterName"),
     ("all.yaml", "cluster:\n  controlPlane:\n    endpoint: https://203.0.113.9:6443\n",
-     "cluster.controlPlane.endpoint"),
-    ("all.yaml", "cluster:\n  ca:\n    crt: FOREIGN-VALUE\n", "cluster.ca"),
-    ("controlplane.yaml", "cluster:\n  etcd:\n    ca:\n      crt: FOREIGN-VALUE\n",
-     "cluster.etcd.ca"),
-    ("all.yaml", "cluster:\n  network:\n    podSubnets: [10.1.0.0/16]\n",
-     "cluster.network.podSubnets"),
-    ("worker.yaml",
-     "machine:\n  network:\n    interfaces:\n      - interface: eth0\n        dhcp: true\n"
-     "        vip:\n          ip: 192.168.53.5\n",
-     "exactly the node's one interface"),
-    ("all.yaml", "apiVersion: v1alpha1\nkind: HostnameConfig\nhostname: other\n",
-     "added a HostnameConfig document"),
-])
+     "cluster.controlPlane"),
+    ("all.yaml", "cluster:\n  network:\n    podSubnets: [10.1.0.0/16]\n", "cluster.network"),
+    ("worker.yaml", "machine:\n  network:\n    interfaces:\n      - interface: eth0\n"
+     "        dhcp: true\n        vip:\n          ip: 192.168.53.5\n", "machine.network"),
+    # cluster identity, trust and install inputs, now in their own documents
+    ("all.yaml", _kind("KubeClusterConfig", "clusterName: other\n"),
+     "the KubeClusterConfig document was changed"),
+    ("all.yaml", _kind("KubeClusterConfig", "endpoint: https://203.0.113.9:6443\n"),
+     "the KubeClusterConfig document was changed"),
+    ("all.yaml", _kind("DiscoveryIdentityConfig", "clusterID: FOREIGN-VALUE\n"),
+     "the DiscoveryIdentityConfig document was changed"),
+    ("controlplane.yaml", _kind("KubeAPIServerCAConfig", "issuingCA:\n  cert: FOREIGN-VALUE\n"),
+     "the KubeAPIServerCAConfig document was changed"),
+    ("worker.yaml", _kind("KubeAPIServerCAConfig", "acceptedCAs:\n  - FOREIGN-VALUE\n"),
+     "the KubeAPIServerCAConfig document was changed"),
+    ("controlplane.yaml", _kind("KubeAggregatorCAConfig", "issuingCA:\n  key: FOREIGN-VALUE\n"),
+     "the KubeAggregatorCAConfig document was changed"),
+    ("controlplane.yaml",
+     _kind("KubeServiceAccountConfig", "issuer:\n  privateKey: FOREIGN-VALUE\n"),
+     "the KubeServiceAccountConfig document was changed"),
+    ("controlplane.yaml", _kind("KubeEtcdEncryptionConfig",
+                                "config:\n  resources:\n    - providers: [{identity: {}}]\n"
+                                "      resources: [secrets]\n"),
+     "the KubeEtcdEncryptionConfig document was changed"),
+    ("controlplane.yaml", _kind("KubeAuthenticationConfig",
+                                "configuration:\n  jwt:\n    - issuer: {url: https://other}\n"),
+     "the KubeAuthenticationConfig document was changed"),
+    ("controlplane.yaml", _kind("KubeAuthorizerConfig", "name: rbac\ntype: AlwaysAllow\n"),
+     "the KubeAuthorizerConfig document (rbac) was changed"),
+    ("controlplane.yaml", _kind("KubeAuthorizerConfig", "name: rbac\n$patch: delete\n"),
+     "a patch deleted the KubeAuthorizerConfig document (rbac)"),
+    ("all.yaml", _kind("KubeNetworkConfig", "podSubnets: [10.1.0.0/16]\n"),
+     "the KubeNetworkConfig document was changed"),
+    ("all.yaml", _kind("UnattendedInstallConfig", "installer:\n  image: registry.example/other\n"),
+     "the UnattendedInstallConfig document was changed"),
+    ("all.yaml", _kind("UnattendedInstallConfig",
+                       "provisioning:\n  diskSelector:\n    match: 'disk.dev_path == \"/dev/vdb\"'\n"),
+     "the UnattendedInstallConfig document was changed"),
+    ("all.yaml", _kind("TrustedRootsConfig", "name: other\ncertificates: FOREIGN-VALUE\n"),
+     "a patch added the TrustedRootsConfig document (other)"),
+    # the node's identity: one MAC-selected link on DHCP, the VIP by role
+    ("cp-01.yaml", _kind("DHCPv4Config", "name: fabric\nignoreRoutes: true\n"),
+     "the DHCPv4Config document (fabric) differs from the generated node patch"),
+    ("worker.yaml", _kind("Layer2VIPConfig", "name: 192.168.53.5\nlink: fabric\n"),
+     "the vip does not match the node's role"),
+    ("all.yaml", _kind("LinkAliasConfig", "name: other\nselector:\n  match: 'true'\n"),
+     "a patch added the LinkAliasConfig document (other)"),
+    ("all.yaml", _kind("LinkConfig", "name: fabric\naddresses:\n  - address: 192.168.53.99/24\n"),
+     "a patch added the LinkConfig document (fabric)"),
+]
+
+
+@pytest.mark.parametrize("patch_file,body,violation", PROTECTED_PATCHES)
 def test_a_patch_that_breaks_a_protected_setting_publishes_nothing(
         lab, tmp_path, patch_file, body, violation):
     patches = tmp_path / "patches"
@@ -872,7 +1050,8 @@ def test_a_patch_that_breaks_a_protected_setting_publishes_nothing(
     assert not (lab.state / "nodes").exists()
     assert not list(lab.state.glob(".staging.*"))
     # the checker names settings, never their values
-    assert SECRET_MARK not in proc.stderr and OTHER_CLUSTER not in proc.stderr
+    assert SECRET_MARK not in proc.stderr
+    assert OTHER_CLUSTER not in proc.stderr and OTHER_CA not in proc.stderr
 
 
 def test_a_protected_change_on_rerun_keeps_the_published_configs(lab, tmp_path):
@@ -886,25 +1065,50 @@ def test_a_protected_change_on_rerun_keeps_the_published_configs(lab, tmp_path):
     assert {p.name: _sha(p) for p in (lab.state / "nodes").glob("*.yaml")} == before
 
 
-def test_the_checker_rejects_a_worker_vip_and_a_wrong_mac(tmp_path):
-    check = os.path.join(BOX, "scripts", "check-node-config.py")
-    base = {"version": "v1alpha1", "machine": {"type": "worker", "token": "t"},
-            "cluster": {"id": "i"}}
-    final = {"version": "v1alpha1", "machine": {
-        "type": "worker", "token": "t",
-        "network": {"hostname": "worker-01", "interfaces": [{
-            "deviceSelector": {"hardwareAddr": "52:54:00:53:00:99"}, "dhcp": True,
-            "vip": {"ip": "192.168.53.5"}}]}},
-        "cluster": {"id": "i"}}
-    (tmp_path / "base.yaml").write_text(yaml.safe_dump(base))
-    (tmp_path / "final.yaml").write_text(yaml.safe_dump(final))
-    proc = subprocess.run([sys.executable, check, str(tmp_path / "base.yaml"),
-                           str(tmp_path / "final.yaml"), "worker-01", "worker",
-                           "52:54:00:53:00:21", "192.168.53.5"],
+CHECK = os.path.join(BOX, "scripts", "check-node-config.py")
+
+
+def _check(tmp_path, base, patch, final, *args):
+    for name, docs in (("base", base), ("patch", patch), ("final", final)):
+        (tmp_path / f"{name}.yaml").write_text(yaml.safe_dump_all(docs))
+    return subprocess.run([sys.executable, CHECK, *(str(tmp_path / f"{n}.yaml")
+                                                    for n in ("base", "patch", "final")), *args],
                           capture_output=True, text=True)
+
+
+def test_the_checker_checks_the_node_identity_independently_of_the_patch(tmp_path):
+    # even a generated patch that went wrong (another node's MAC, a VIP on a
+    # worker, YAML's "off" read as false) is judged against the arguments
+    main = {"version": "v1alpha1", "machine": {"type": "worker", "token": "t"}}
+    patch = [{"apiVersion": "v1alpha1", "kind": "HostnameConfig", "auto": False,
+              "hostname": "worker-01"},
+             {"apiVersion": "v1alpha1", "kind": "LinkAliasConfig", "name": "fabric",
+              "selector": {"match": 'mac(link.permanent_addr) == "52:54:00:53:00:99"'}},
+             {"apiVersion": "v1alpha1", "kind": "DHCPv4Config", "name": "fabric"},
+             {"apiVersion": "v1alpha1", "kind": "Layer2VIPConfig", "name": "192.168.53.5",
+              "link": "fabric"}]
+    proc = _check(tmp_path, [main], patch, [main, *patch],
+                  "worker-01", "worker", "52:54:00:53:00:21", "192.168.53.5")
     assert proc.returncode == 1
-    assert "not selected by the node's mac" in proc.stderr
+    assert "HostnameConfig" not in proc.stderr          # auto: off parsed as false is fine
+    assert "not selected by exactly its mac" in proc.stderr
+    assert "dhcp is not configured on exactly the node's link" in proc.stderr
     assert "vip does not match the node's role" in proc.stderr
+
+
+def test_the_checker_accepts_exactly_the_generated_node_identity(tmp_path):
+    main = {"version": "v1alpha1", "machine": {"type": "controlplane", "token": "t"}}
+    host = {"apiVersion": "v1alpha1", "kind": "HostnameConfig", "auto": "stable"}
+    patch = [{"apiVersion": "v1alpha1", "kind": "HostnameConfig", "auto": "off",
+              "hostname": "cp-01"},
+             {"apiVersion": "v1alpha1", "kind": "LinkAliasConfig", "name": "fabric",
+              "selector": {"match": 'mac(link.permanent_addr) == "52:54:00:53:00:11"'}},
+             {"apiVersion": "v1alpha1", "kind": "DHCPv4Config", "name": "fabric"},
+             {"apiVersion": "v1alpha1", "kind": "Layer2VIPConfig", "name": "192.168.53.5",
+              "link": "fabric"}]
+    proc = _check(tmp_path, [main, host], patch, [main, *patch],
+                  "cp-01", "controlplane", "52:54:00:53:00:11", "192.168.53.5")
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_tampered_secrets_are_refused(lab):
@@ -954,7 +1158,10 @@ def test_a_failed_validation_publishes_nothing(lab):
     ({"TALOS_VERSION": "v1.99"}, "exact release"),
     ({"TALOS_INSTALLER_IMAGE": "registry.example/installer/abc:v1.98.0"}, "must be tagged"),
     ({"TALOS_STATE_DIR": "relative/state"}, "absolute path"),
-    ({"TALOS_POD_CIDR": "10.96.0.0/12"}, "must differ"),
+    ({"TALOS_POD_CIDR": "10.96.0.0/12"}, "must not overlap"),
+    ({"TALOS_POD_CIDR": "10.0.0.0/8"}, "must not overlap"),
+    ({"TALOS_SERVICE_CIDR": "10.100.0.0/12"}, "has host bits set"),
+    ({"TALOS_POD_CIDR": "192.168.0.0/16"}, "lies inside 192.168.0.0/16"),
     ({"TALOS_VIP": "192.168.53.11"}, "uses the VIP"),
 ])
 def test_bad_inputs_fail_before_any_talosctl_call(lab, override, message):
@@ -1029,3 +1236,116 @@ def test_a_malformed_or_missing_version_set_stops_the_run(lab, tmp_path, body, m
     assert proc.returncode != 0 and message in proc.stderr, proc.stderr
     assert not (tmp_path / "pwned").exists()
     assert lab.calls() == []
+
+
+# --------------------------------------------------------------------------- #
+# the same, against a real talosctl at the pinned version (opt-in)            #
+# --------------------------------------------------------------------------- #
+#: Path to a talosctl binary at versions.env's TALOS_VERSION. These tests run
+#: only when it is set: they check what the fake can only approximate -- that
+#: the patch forms validate (`--strict`), that every protected change is
+#: caught after Talos' own merge, that `gen config` is deterministic and that
+#: the fake writes the same layout. No cluster or network is needed.
+REAL_TALOSCTL = os.environ.get("TALOS_UNATTENDED_TALOSCTL")
+real = pytest.mark.skipif(
+    not REAL_TALOSCTL, reason="set TALOS_UNATTENDED_TALOSCTL to a talosctl at the pinned version")
+
+
+@pytest.fixture
+def real_lab(lab, tmp_path):
+    """lab, with the real talosctl and the shipped version set."""
+    have = subprocess.run([REAL_TALOSCTL, "version", "--client", "--short"],
+                          capture_output=True, text=True).stdout
+    pinned = _pins()["TALOS_VERSION"]
+    assert f"Talos {pinned}" in have, f"TALOS_UNATTENDED_TALOSCTL is not {pinned}: {have}"
+    real_bin = tmp_path / "real-bin"
+    real_bin.mkdir()
+    (real_bin / "talosctl").symlink_to(os.path.abspath(REAL_TALOSCTL))
+    (real_bin / "python3").symlink_to(lab.bin / "python3")
+    base_run = lab.run
+
+    def run(*args, **overrides):
+        env = dict({"PATH": f"{real_bin}:/usr/bin:/bin"}, **PINNED_VARS, **overrides)
+        return base_run(*args, versions=None, **env)
+
+    lab.run = run
+    lab.talosctl = str(real_bin / "talosctl")
+    return lab
+
+
+@real
+def test_real_talosctl_validates_the_configs_and_a_rerun_changes_nothing(real_lab):
+    proc = _ok(real_lab.run())
+    assert proc.stdout.splitlines() == [f"{n}: created" for n in CP + WORKERS]
+    assert proc.stderr.count("is valid for metal mode") == 6      # validate --strict
+    files = [real_lab.state / "talosconfig", *(real_lab.state / "nodes").glob("*.yaml")]
+    before = {p.name: _sha(p) for p in files}
+    proc = _ok(real_lab.run())
+    assert proc.stdout.splitlines() == [f"{n}: unchanged" for n in CP + WORKERS]
+    assert {p.name: _sha(p) for p in files} == before
+
+
+@real
+def test_real_talosctl_writes_the_expected_patch_forms(real_lab):
+    _ok(real_lab.run())
+    _assert_node_configs(real_lab.state / "nodes", CP + WORKERS,
+                         _pins()["TALOS_INSTALLER_IMAGE"], ["ntp1.example", "ntp2.example"])
+
+
+@real
+@pytest.mark.parametrize("patch_file,body,violation", PROTECTED_PATCHES)
+def test_real_talosctl_merges_cannot_slip_past_the_checker(
+        real_lab, tmp_path, patch_file, body, violation):
+    _node_table(real_lab.nodes, cps=["cp-01"], workers=["worker-01"])
+    patches = tmp_path / "patches"
+    patches.mkdir()
+    (patches / patch_file).write_text(body)
+    proc = real_lab.run(TALOS_PATCH_DIR=str(patches))
+    assert proc.returncode != 0
+    assert violation in proc.stderr, proc.stderr
+    assert not (real_lab.state / "nodes").exists()
+    assert OTHER_CLUSTER not in proc.stderr and OTHER_CA not in proc.stderr
+
+
+def _layout(path) -> dict:
+    """{(kind, name): sorted key paths} -- the structure, without values."""
+    def paths(node, prefix):
+        if isinstance(node, dict):
+            if not node:
+                yield prefix + "{}"
+            for key, value in node.items():
+                yield from paths(value, f"{prefix}.{key}")
+        elif isinstance(node, list):
+            if not node:
+                yield prefix + "[]"
+            for value in node:
+                yield from paths(value, prefix + "[]")
+        else:
+            yield prefix
+    return {k: sorted(set(paths(d, ""))) for k, d in _docs(path).items()}
+
+
+@real
+def test_the_fake_matches_the_real_layout(real_lab, tmp_path):
+    fake = real_lab.bin / "talosctl"
+    patch = tmp_path / "cluster.yaml"
+    patch.write_text(_kind("TimeSyncConfig", "ntp:\n  servers: [ntp1.example]\n"))
+    layouts = {}
+    for label, talosctl in (("real", real_lab.talosctl), ("fake", str(fake))):
+        out = tmp_path / label
+        out.mkdir()
+        env = dict(os.environ, FAKE_LOG=str(tmp_path / "fake.log"))
+        for cmd in (["gen", "secrets", "-o", str(out / "secrets.yaml")],
+                    ["gen", "config", "lab", "https://192.168.53.5:6443",
+                     "--with-secrets", str(out / "secrets.yaml"),
+                     "--kubernetes-version", "1.37.1", "--install-disk", "/dev/vda",
+                     "--install-image", _pins()["TALOS_INSTALLER_IMAGE"],
+                     "--config-patch", f"@{patch}", "--output", str(out / "gen")]):
+            subprocess.run([talosctl, *cmd], check=True, capture_output=True, env=env)
+        layouts[label] = {role: _layout(out / "gen" / f"{role}.yaml")
+                          for role in ("controlplane", "worker")}
+    assert layouts["fake"] == layouts["real"]
+    # every document the checker protects exists in the real output
+    checker = runpy.run_path(CHECK)
+    kinds = {k for k, _ in layouts["real"]["controlplane"]}
+    assert set(checker["PROTECTED_KINDS"]) <= kinds

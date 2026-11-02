@@ -99,7 +99,9 @@ The pins come from `versions.env` beside `scripts/` unless `--versions FILE`
 names another file.
 
 `gen-config.sh` validates every input and the node table (3+3, or the 1+1
-smoke profile) before it does anything, then:
+smoke profile) before it does anything. That includes CIDRs Talos would
+reject later (host bits set) and ones that overlap each other, the VIP or a
+node address. Then it:
 
 1. checks that `talosctl` is exactly `TALOS_VERSION`, and that `python3`
    with PyYAML (part of the control template) is there to check configs;
@@ -121,21 +123,34 @@ smoke profile) before it does anything, then:
    So does a missing bundle beside any earlier state (identity, talosconfig,
    configs or patches): it never mints a second cluster identity;
 4. runs `talosctl gen config` with explicit Talos and Kubernetes versions,
-   install disk, installer image, NTP servers and pod/service CIDRs;
+   install disk and installer image. A cluster patch sets the NTP servers
+   (a `TimeSyncConfig` document) and the pod/service CIDRs (the
+   `KubeNetworkConfig` document);
 5. patches each node: first the optional patches from `TALOS_PATCH_DIR`
-   (`all.yaml`, `<role>.yaml`, `<node>.yaml`), then the generated patch with
-   its hostname, its MAC-selected DHCP interface and, on control planes, the
-   shared VIP. `scripts/check-node-config.py` then compares the merged config
-   with the generated one. It rejects any change to the cluster's identity
-   and trust (cluster id, secret, name, endpoint, tokens, CAs, service
-   account, encryption secret, accepted CAs), the install disk and image,
-   the pod/service CIDRs and the machine type. It also rejects a hostname
-   other than the node's name, anything but exactly the node's one
-   MAC-selected DHCP interface, a VIP on a worker or a missing one on a
-   control plane, and any config document a patch added. Every config is then
-   validated (`--mode metal --strict`). A rejected or invalid config stops
-   the run with nothing published, and the error names only the setting,
-   never its value;
+   (`all.yaml`, `<role>.yaml`, `<node>.yaml`), then the generated node patch.
+   That patch holds four Talos v1.12+ documents: a `HostnameConfig` with the
+   node's static name, a `LinkAliasConfig` that names the NIC with the
+   node's reserved MAC `fabric`, a `DHCPv4Config` on `fabric` and, on control
+   planes only, a `Layer2VIPConfig` for the shared VIP on `fabric`.
+   `scripts/check-node-config.py` then compares the merged config with the
+   generated one, document by document. A patch may change other documents,
+   but it may not add or delete one. It also may not change:
+   - cluster identity and trust: the `DiscoveryIdentityConfig`,
+     `KubeClusterConfig`, Kubernetes and aggregator CA, service account,
+     etcd encryption, authentication and authorizer documents, and the
+     main document's type, tokens and CAs;
+   - install inputs: the `UnattendedInstallConfig` (installer image and
+     disk);
+   - networking: the `KubeNetworkConfig` (the CIDRs) and the node patch's
+     documents;
+   - the legacy v1alpha1 fields (`machine.network`, `machine.install`,
+     `cluster.network`, ...) that would duplicate these documents.
+
+   The checker also confirms the node's name, MAC, DHCP and VIP-by-role
+   independently of the patch. Every config is then validated
+   (`--mode metal --strict`). A rejected or invalid config stops the run
+   with nothing published, and the error names only the setting, never its
+   value;
 6. writes a `talosconfig` whose endpoints are the control-plane addresses,
    never the VIP, once only. It publishes configs only after all of them
    pass and reports each node as `created`, `changed` or `unchanged`.
@@ -148,16 +163,33 @@ the ability to manage the cluster.
 
 `pytest tests/test_talos_unattended_box.py` needs no VMs and no network: it
 renders `conf.yml` and runs the scripts against a fake `talosctl` on `PATH`.
+The fake writes the v1.14 document layout and merges the way `talosctl`
+does: lists append, maps merge, and `$patch: delete` removes a document.
+
+Point `TALOS_UNATTENDED_TALOSCTL` at a `talosctl` of the pinned release to
+also run the same checks against the real binary. It needs no cluster and no
+network. With it, the tests check that:
+- every config passes `validate --strict`;
+- the patch forms land as expected;
+- every protected change is caught after Talos' own merge;
+- a rerun is byte-identical;
+- the fake writes exactly the real document layout.
+
+```sh
+curl -fsSLo talosctl https://github.com/siderolabs/talos/releases/download/v1.14.5/talosctl-linux-amd64
+echo "<TALOSCTL_SHA256 from versions.env>  talosctl" | sha256sum -c - && chmod +x talosctl
+TALOS_UNATTENDED_TALOSCTL=$PWD/talosctl pytest tests/test_talos_unattended_box.py
+```
 
 ## Known limitations
 
-- The patch forms (`machine.network.hostname`, `interfaces[].vip`), the
-  field paths the config check protects, and determinism of `talosctl gen
-  config` across reruns are checked against the pinned release in the smoke
-  run, not yet here. The tests use a stand-in `talosctl` whose merge only
-  approximates Talos' strategic merge.
-- Patches may only change the main (v1alpha1) document; adding a separate
-  config document (for example an extension service) is rejected for now.
+- The configs are checked against the pinned `talosctl` (see
+  [Testing](#testing)) but have not yet booted a node. In particular,
+  whether `link.permanent_addr` carries the libvirt MAC on the virtio NIC is
+  only proven by the smoke run.
+- Patches may change existing documents only. Adding a config document (for
+  example an extension service or a trusted root) or deleting one is
+  rejected for now.
 - A single hypervisor is a single failure domain. Three control-plane VMs do
   not make the lab highly available.
 - Delivery is through the Talos maintenance API, which is unauthenticated
