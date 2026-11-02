@@ -39,6 +39,16 @@ def _result(stdout: str = "", ok: bool = True, stderr: str = "", return_code: in
     return r
 
 
+def _created(execute: MagicMock) -> bool:
+    """Whether the ``virsh.execute`` double was asked to create a snapshot.
+
+    Not "was it called at all": a take asks the domain's state first, to
+    know what the snapshot can hold (#272).
+    """
+    return any(c.args and c.args[0] == "snapshot-create-as"
+               for c in execute.call_args_list)
+
+
 SNAP_XML_WITH_OVERLAY = """\
 <domainsnapshot>
   <name>snap1</name>
@@ -359,9 +369,12 @@ class TestListSnapshots:
 
         with patch.object(sm.virsh, "execute", side_effect=fake):
             out = sm.list_snapshots("vm01")
+        # no <state> recorded: neither is claimed to be disk-only
         assert out == [
-            {"name": "snap1", "description": "description of snap1"},
-            {"name": "snap2", "description": "description of snap2"},
+            {"name": "snap1", "description": "description of snap1",
+             "disk_only": False},
+            {"name": "snap2", "description": "description of snap2",
+             "disk_only": False},
         ]
 
     def test_empty_list_on_failure(self, sm: SnapshotManager):
@@ -2188,6 +2201,7 @@ class TestListSnapshotsDetailed:
             "creation_time": None,
             "parent": None,
             "depth": 0,
+            "disk_only": False,
         }]
 
 
@@ -3722,7 +3736,7 @@ class TestTakeWritesOverNoFile:
         ok, execute, errors = self._take(sm, tmp_path, force=force)
 
         assert ok is False
-        execute.assert_not_called()
+        assert not _created(execute)
         assert (tmp_path / name).read_bytes() == b"someone's RAM"
         assert f"{tmp_path / name} already exists" in errors
 
@@ -3739,7 +3753,7 @@ class TestTakeWritesOverNoFile:
             hidden.chmod(0o700)
 
         assert ok is False
-        execute.assert_not_called()
+        assert not _created(execute)
         assert "cannot tell whether" in errors
 
     def test_with_none_there_it_is_taken(self, sm: SnapshotManager,
@@ -3776,7 +3790,7 @@ class TestCreateSnapshotForce:
             assert sm.create_snapshot(
                 "vm01", str(tmp_path), "snapX", "d", force=True) is False
         # never reaches snapshot-create-as
-        execute.assert_not_called()
+        assert not _created(execute)
 
     def test_no_force_skips_clear(self, sm: SnapshotManager, tmp_path: Path):
         with patch.object(sm, "_force_clear_for_retake") as clear, \
