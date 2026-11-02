@@ -403,6 +403,13 @@ snapshot was taken). See
 [Disk Reclaim and Storage](doc/storage.md) for the full reclaim
 workflow and the `boxman storage` subcommand.
 
+A VM that is shut off gets a disk-only snapshot: there is no memory to
+save, `snapshot list` and `snapshot log` mark it `(disk only)`, and
+restoring it leaves the VM shut off for `boxman up` to start. A paused VM's
+snapshot saves its memory, and restoring it brings the VM back paused. A
+VM that `boxman down` saved is refused, since a snapshot would not hold
+its saved memory: run `boxman up` first.
+
 ### Output verbosity
 
 By default boxman prints terse, docker-compose-style progress lines (the

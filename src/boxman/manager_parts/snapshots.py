@@ -456,8 +456,13 @@ class SnapshotsMixin:
                     'depth': snap.get('depth', 0),
                     'vms': [],
                     'current_for': [],
+                    'disk_only_for': [],
                 })
                 entry['vms'].append(short_vm)
+                # a VM shut off when the snapshot was taken has no memory
+                # in it: restoring it leaves that VM shut off
+                if snap.get('disk_only'):
+                    entry['disk_only_for'].append(short_vm)
                 # Take the max depth seen across VMs (handles partial-take
                 # divergence where some VMs have a deeper chain).
                 entry['depth'] = max(entry['depth'], snap.get('depth', 0))
@@ -499,6 +504,7 @@ class SnapshotsMixin:
                     'depth': r['depth'],
                     'vms': sorted(r['vms']),
                     'current_for': sorted(r['current_for']),
+                    'disk_only_for': sorted(r['disk_only_for']),
                 }
                 for r in rows
             ]
@@ -528,6 +534,14 @@ class SnapshotsMixin:
                     cur_marker = '  ← current'
                 else:
                     cur_marker = f"  ← current ({len(current_for)}/{vms_total})"
+            disk_only_for = row['disk_only_for']
+            disk_marker = ''
+            if disk_only_for:
+                if len(disk_only_for) == vms_total:
+                    disk_marker = '  (disk only)'
+                else:
+                    disk_marker = (f"  (disk only: "
+                                   f"{','.join(sorted(disk_only_for))})")
             vm_list = ','.join(sorted(row['vms']))
             description = row.get('description') or ''
             ctime = row.get('creation_time') or '?'
@@ -535,7 +549,7 @@ class SnapshotsMixin:
                 f"{prefix}{row['name']:<{name_w}}  "
                 f"{ctime:<{time_w}}  "
                 f"\"{description}\"  "
-                f"[{vm_list}]{cur_marker}"
+                f"[{vm_list}]{disk_marker}{cur_marker}"
             )
 
     def _select_vm_targets(self, cli_args):
@@ -620,6 +634,9 @@ class SnapshotsMixin:
             for full_vm_name, cluster_name, _vm_name, _workdir
             in self._select_vm_targets(cli_args)
         ]
+        self._refuse_taking_managed_saves(
+            [full_vm_name for full_vm_name, *_rest in vm_targets],
+            cli_args.snapshot_name)
         # a memory_snapshot_dir is made on first use; a workdir exists by now
         made_for_memory: set[tuple[int, int]] = set()
         for memory_snapshot_dir in self._cluster_memory_snapshot_dirs():
@@ -712,6 +729,54 @@ class SnapshotsMixin:
 
         self.logger.info("all snapshots verified successfully")
         self._exit_if_dc_failed(dc_failed, 'take')
+
+    def _refuse_taking_managed_saves(self, vm_names, snapshot_name) -> None:
+        """
+        Refuse a take while one of *vm_names* holds managed saved state.
+
+        ``boxman down`` saves a VM that way. A snapshot of it can hold its
+        disks but not that memory, and libvirt takes one all the same; the
+        next start then restores the memory against the disks as they were
+        before the snapshot, so the guest writes into the snapshot's
+        backing files (measured on libvirt 10.10). The provider refuses
+        such a VM too; asking here first refuses before anything is
+        snapshotted, so one saved VM does not leave the others snapshotted
+        without it.
+
+        An unanswerable probe counts as saved, as in
+        :meth:`_refuse_managed_save_conflicts`.
+
+        Raises:
+            SnapshotError: naming every such VM and both ways out.
+        """
+        saved = []
+        for full_vm_name in vm_names:
+            session = self.session_for_vm(full_vm_name)
+            if not hasattr(session, 'has_managed_save'):
+                continue
+            answer = session.has_managed_save(full_vm_name)
+            if answer is None:
+                saved.append(
+                    f"{full_vm_name}: could not determine whether it holds "
+                    f"managed saved state")
+            elif answer:
+                saved.append(f"{full_vm_name}: holds managed saved state")
+
+        if not saved:
+            return
+
+        raise SnapshotError(
+            f"refusing to take snapshot '{snapshot_name}': a VM that holds "
+            f"managed saved state (`boxman down` saves it that way) would be "
+            f"snapshotted without that memory, and its next start would "
+            f"restore the memory against the disks as they were before the "
+            f"snapshot.\n  - "
+            + "\n  - ".join(saved)
+            + "\n\nRun `boxman up` first, then take the snapshot. Or discard "
+              "the saved memory with\n"
+              "    virsh managedsave-remove <domain>\n"
+              "and take a disk-only snapshot of the shut-off VM. Nothing was "
+              "snapshotted.")
 
     def snapshot_restore(self, cli_args):
         """

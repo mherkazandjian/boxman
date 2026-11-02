@@ -243,6 +243,41 @@ class SnapshotManager:
             args.extend(["--diskspec", spec])
         return args
 
+    def _take_state(self, vm_name: str) -> str | None:
+        """
+        What a snapshot of *vm_name* taken now can hold:
+
+        - ``'active'``: it is running, or paused, and its memory is saved
+          with its disks. A paused one stays paused, and a revert to the
+          snapshot brings it back paused (measured on libvirt 10.10).
+        - ``'inactive'``: it is shut off, and only its disks can be taken:
+          libvirt refuses a memory spec for it ("memory state cannot be
+          saved with offline or disk-only snapshot").
+        - ``'managedsave'``: it is shut off, but holds managed saved state
+          (``boxman down`` saves it that way); see :meth:`create_snapshot`.
+        - ``None``: that could not be told.
+
+        Asked by name, as :meth:`_pause_for_backup` asks: ``domstate``
+        prints a translated state name, and domain names are not
+        translated. A domain that does not exist reads as active, and the
+        take fails in libvirt as it always has.
+        """
+        inactive = self.virsh.execute("list", "--inactive", "--name",
+                                      warn=True)
+        if not inactive.ok:
+            return None
+        # exact names, one per line: libvirt refuses a newline in a domain
+        # name (see _pause_for_backup)
+        if vm_name not in inactive.stdout.split('\n'):
+            return 'active'
+        saved = self.virsh.execute("list", "--inactive", "--with-managed-save",
+                                   "--name", warn=True)
+        if not saved.ok:
+            return None
+        if vm_name in saved.stdout.split('\n'):
+            return 'managedsave'
+        return 'inactive'
+
     def create_snapshot(self,
                         vm_name: str,
                         vm_dir: str,
@@ -256,6 +291,16 @@ class SnapshotManager:
                         disk_dir: str | None = None) -> bool:
         """
         Create a snapshot of a VM.
+
+        What it holds follows the VM's state (:meth:`_take_state`). A
+        running or paused VM's snapshot saves its memory with its disks. A
+        shut-off VM's is disk-only: there is no memory to save, and
+        restoring it leaves the VM shut off. A VM holding managed saved
+        state is refused: libvirt takes a disk-only snapshot of it all the
+        same, but the next start restores the saved memory against the
+        disks as they were before the snapshot, so the guest writes into
+        the snapshot's backing files (measured on libvirt 10.10). So is one
+        whose state cannot be told.
 
         The memory image is written only where no file is: one already
         there — a leftover, or another VM's image under the same name (VM
@@ -277,7 +322,8 @@ class SnapshotManager:
                 after successful snapshot creation. The libvirt snapshot
                 metadata still references the original .raw path; the
                 ``snapshot_restore`` path detects the .raw.zst sibling and
-                decompresses transparently.
+                decompresses transparently. A disk-only snapshot has no
+                memory file, which is noted, not failed.
             compress_level: zstd compression level (default 3 — sweet spot
                 of ~71% reduction at sub-second/GB on commodity CPUs).
             force: If True, first clear anything that would make
@@ -296,6 +342,28 @@ class SnapshotManager:
             bool: True if successful, False otherwise
         """
         try:
+            # before --force removes anything: a take refused here must
+            # leave the snapshot it would have replaced in place
+            state = self._take_state(vm_name)
+            if state is None:
+                self.logger.error(
+                    f"cannot tell whether {vm_name} is running, so not "
+                    f"whether snapshot '{snapshot_name}' can save its "
+                    f"memory; refusing to take it")
+                return False
+            if state == 'managedsave':
+                self.logger.error(
+                    f"{vm_name} holds managed saved state (`boxman down` "
+                    f"saves it that way); refusing to take snapshot "
+                    f"'{snapshot_name}' of it: the snapshot would hold its "
+                    f"disks but not that memory, and the next start would "
+                    f"restore the memory against the disks as they were "
+                    f"before the snapshot. Run `boxman up` first, then take "
+                    f"it; or discard the saved memory with `virsh "
+                    f"managedsave-remove {vm_name}` and take a disk-only "
+                    f"snapshot of the shut-off VM")
+                return False
+            with_memory = state == 'active'
             if force and not self._force_clear_for_retake(
                     vm_name, vm_dir, snapshot_name,
                     paths_in_use=paths_in_use, recorded_in_use=recorded_in_use,
@@ -303,7 +371,9 @@ class SnapshotManager:
                 return False
             snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
             mem_path = os.path.join(vm_dir, snap_fname)
-            for path in (mem_path, f"{mem_path}.zst"):
+            # a disk-only snapshot writes no memory image, so a file at its
+            # name is not in its way
+            for path in ((mem_path, f"{mem_path}.zst") if with_memory else ()):
                 try:
                     os.lstat(path)
                 except FileNotFoundError:
@@ -325,11 +395,21 @@ class SnapshotManager:
                 vm_name, snapshot_name, disk_dir)
             if overlay_args is None:
                 return False
-            # Before saving memory state, ensure cdroms point directly at
-            # their raw ISO backing files (not qcow2 overlays of them).
-            # This prevents snapshot-revert from failing with
-            # "Image is not in qcow2 format" when QEMU validates the chain.
-            self._flatten_cdrom_overlays(vm_name)
+            if with_memory:
+                # Before saving memory state, ensure cdroms point directly
+                # at their raw ISO backing files (not qcow2 overlays of
+                # them). This prevents snapshot-revert from failing with
+                # "Image is not in qcow2 format" when QEMU validates the
+                # chain.
+                self._flatten_cdrom_overlays(vm_name)
+            # A shut-off VM is left as it is: there is no memory image to
+            # protect, and nothing it could see to flatten -- the
+            # definition of a shut-off domain names a CD-ROM overlay
+            # without the <backingStore> the running one shows. Nor is
+            # switching the media with --config alone a fix: it keeps
+            # <driver type='qcow2'/> on the raw ISO, and the VM then fails
+            # to start with "Image is not in qcow2 format" (measured on
+            # libvirt 10.10).
 
             # Exclude cdroms from the snapshot so no new qcow2 overlay is
             # created for them (they stay at the raw ISO after this call).
@@ -344,13 +424,24 @@ class SnapshotManager:
                 "--name", snapshot_name,
                 "--description", description,
                 "--atomic",
-                f"--memspec={mem_path}",
+                f"--memspec={mem_path}" if with_memory else "--disk-only",
                 *overlay_args,
                 *cdrom_args)
 
             if result.ok:
-                self.logger.info(f"snapshot '{snapshot_name}' created for vm {vm_name}")
-                if compress_memory:
+                if with_memory:
+                    self.logger.info(
+                        f"snapshot '{snapshot_name}' created for vm {vm_name}")
+                else:
+                    self.logger.info(
+                        f"snapshot '{snapshot_name}' created for vm {vm_name}: "
+                        f"disk-only, as the vm is shut off; restoring it "
+                        f"leaves the vm shut off")
+                if compress_memory and not with_memory:
+                    self.logger.info(
+                        f"snapshot '{snapshot_name}' of vm {vm_name} saved no "
+                        f"memory, so there is none to compress")
+                elif compress_memory:
                     if not self.compress_memory_file(mem_path, level=compress_level):
                         self.logger.warning(
                             f"snapshot '{snapshot_name}' for vm {vm_name}: memory "
@@ -447,11 +538,32 @@ class SnapshotManager:
         be inspected refuses the retake: the snapshot would be written over
         that file.
 
+        Leftovers already there are asked about before case 1 deletes the
+        snapshot, but for the files it records, which the delete deals with:
+        a refusal then leaves the snapshot in place, rather than costing the
+        one the retake was to replace. A restore puts back the overlays a
+        revert replaced, under the very names a retake writes (#272).
+
         Returns True when the name is clear to re-use.
         """
         info = self.virsh.execute(
             "snapshot-info", vm_name, snapshot_name, warn=True)
         if info.ok:
+            own = self._files_recorded_by(vm_name, snapshot_name)
+            if own is not None:
+                early = [path for path in self._retake_leftovers(
+                             vm_name, vm_dir, snapshot_name, disk_dir)
+                         if path not in own
+                         and os.path.realpath(path) not in own]
+                refusal = self._leftover_in_use(early, paths_in_use,
+                                                recorded_in_use)
+                if refusal:
+                    self.logger.error(
+                        f"--force: {refusal}; refusing to remove it, and so "
+                        f"to delete '{snapshot_name}' on {vm_name} and take "
+                        f"it again over it; '{snapshot_name}' is left as it "
+                        f"is")
+                    return False
             self.logger.info(
                 f"--force: removing existing snapshot '{snapshot_name}' on "
                 f"{vm_name} before re-taking")
@@ -472,16 +584,9 @@ class SnapshotManager:
                 f"remove any files")
             return False
 
-        active = {src for _t, src in self._data_disk_targets(vm_name)}
         removed = []
-        candidates = list(self._would_be_overlay_paths(
-            vm_name, snapshot_name, disk_dir=disk_dir))
-        snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
-        candidates.append(os.path.join(vm_dir, snap_fname))
-        candidates.append(os.path.join(vm_dir, f"{snap_fname}.zst"))
-        # in the live chain — never remove
-        leftovers = [path for path in candidates
-                     if path not in active and os.path.isfile(path)]
+        leftovers = self._retake_leftovers(vm_name, vm_dir, snapshot_name,
+                                           disk_dir)
         refusal = self._leftover_in_use(leftovers, paths_in_use,
                                         recorded_in_use)
         if refusal:
@@ -498,6 +603,42 @@ class SnapshotManager:
                 f"--force: removed {len(removed)} leftover snapshot file(s) "
                 f"for '{snapshot_name}' on {vm_name}")
         return True
+
+    def _retake_leftovers(self, vm_name: str, vm_dir: str,
+                          snapshot_name: str,
+                          disk_dir: str | None) -> list[str]:
+        """
+        The files at the names a take of *snapshot_name* writes — each
+        disk's overlay (:meth:`_would_be_overlay_paths`) and the memory
+        image, compressed or not — that are there now, but for those in the
+        live chain, which are never removed.
+        """
+        active = {src for _t, src in self._data_disk_targets(vm_name)}
+        candidates = list(self._would_be_overlay_paths(
+            vm_name, snapshot_name, disk_dir=disk_dir))
+        snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
+        candidates.append(os.path.join(vm_dir, snap_fname))
+        candidates.append(os.path.join(vm_dir, f"{snap_fname}.zst"))
+        return [path for path in candidates
+                if path not in active and os.path.isfile(path)]
+
+    def _files_recorded_by(self, vm_name: str,
+                           snapshot_name: str) -> set[str] | None:
+        """
+        The files snapshot *snapshot_name* of *vm_name* records — its
+        overlays, its memory image and that image's ``.zst`` — as recorded
+        and resolved; ``None`` when they cannot be read
+        (:meth:`recorded_files`).
+        """
+        recorded = self.recorded_files(vm_name)
+        if recorded is None:
+            return None
+        images, overlays, _unnamed = recorded
+        files = list(overlays.get(snapshot_name, []))
+        image = images.get(snapshot_name)
+        if image:
+            files += [image, f"{image}.zst"]
+        return set(files) | {os.path.realpath(path) for path in files}
 
     @staticmethod
     def _leftover_in_use(leftovers: list[str], paths_in_use,
@@ -837,6 +978,9 @@ class SnapshotManager:
         parent_elem = root.find("parent/name")
         if parent_elem is not None and parent_elem.text:
             out['parent'] = parent_elem.text
+        state_elem = root.find("state")
+        if state_elem is not None and state_elem.text:
+            out['state'] = state_elem.text.strip()
         ct_elem = root.find("creationTime")
         if ct_elem is not None and ct_elem.text:
             try:
@@ -846,6 +990,18 @@ class SnapshotManager:
             except (ValueError, OSError):
                 pass
         return out
+
+    @staticmethod
+    def _holds_no_memory(info: dict) -> bool:
+        """
+        Whether the snapshot that *info* (:meth:`_parse_snapshot_xml`)
+        describes saved no memory, so that restoring it leaves the VM shut
+        off: its domain was not running or paused -- 'shutoff' for one
+        taken of a shut-off VM, 'disk-snapshot' for a disk-only one of a
+        running VM. A state it does not record claims neither.
+        """
+        state = info.get('state')
+        return state is not None and state not in ('running', 'paused')
 
     def _snapshot_graph(self, vm_name: str) -> dict[str, dict]:
         """
@@ -881,10 +1037,11 @@ class SnapshotManager:
         Return per-snapshot dicts for *vm_name* in chain order
         (oldest first, head last) in a single pass.
 
-        Each dict: ``{name, description, creation_time, parent, depth}``.
-        Calls ``snapshot-list`` once, then ``snapshot-dumpxml`` once per
-        snapshot — everything else is parsed out of the XML via
-        :meth:`_parse_snapshot_xml`.
+        Each dict: ``{name, description, creation_time, parent, depth,
+        disk_only}`` — *disk_only* when it saved no memory
+        (:meth:`_holds_no_memory`). Calls ``snapshot-list`` once, then
+        ``snapshot-dumpxml`` once per snapshot — everything else is parsed
+        out of the XML via :meth:`_parse_snapshot_xml`.
         """
         parsed = self._snapshot_graph(vm_name)
         if not parsed:
@@ -916,6 +1073,7 @@ class SnapshotManager:
                 'creation_time': parsed[name].get('creation_time'),
                 'parent': parsed[name].get('parent'),
                 'depth': depth,
+                'disk_only': self._holds_no_memory(parsed[name]),
             }
             for depth, name in enumerate(ordered)
         ]
@@ -999,7 +1157,8 @@ class SnapshotManager:
             # fetch the available snapshots and their descriptions
             graph = self._snapshot_graph(vm_name)
             return [
-                {'name': name, 'description': info.get('description', '')}
+                {'name': name, 'description': info.get('description', ''),
+                 'disk_only': self._holds_no_memory(info)}
                 for name, info in graph.items()
                 if info['xml'] is not None
             ]

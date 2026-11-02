@@ -326,6 +326,8 @@ class TestTake:
             "boxes": {}}
         session = MagicMock()
         session.snapshot_take_cluster.return_value = True
+        # it is the VM's session too, and the VM is not saved
+        session.has_managed_save.return_value = False
         mgr.session_for_cluster = MagicMock(return_value=session)
         return session
 
