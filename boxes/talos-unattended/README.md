@@ -52,15 +52,36 @@ set -a; . ./inputs.env; set +a
 ```
 
 `inputs.env` is git-ignored. With nothing supplied, `conf.yml` still renders
-(for the repository's checks), but the ISO is a marked placeholder that
-cannot be downloaded, the template's tool install refuses its placeholder
-pins, and `gen-config.sh` refuses any value still containing `PLACEHOLDER`.
+(for the repository's checks), and `gen-config.sh` refuses any value still
+containing `PLACEHOLDER`.
 
-Pin a tested set: the Talos release (ISO, installer image and `talosctl`
-all at `TALOS_VERSION`), a Kubernetes version that release supports, and the
-`kubectl` and `flux` binaries. Build the ISO and the installer image from the
-same Image Factory schematic with the `qemu-guest-agent` extension. The
-extension in the boot ISO alone does not survive installation.
+## Version set
+
+`versions.env` pins the tested set; its comments record where each value
+and hash came from. `conf.yml` and `gen-config.sh` both read it, so nothing
+version-related goes in `inputs.env`.
+
+| pin | value | source |
+| --- | --- | --- |
+| Talos | v1.14.5 | latest stable release |
+| `talosctl` | sha256 `ff432b68…` | the release's `sha256sum.txt` |
+| Image Factory schematic | `ce4c9805…` | `siderolabs/qemu-guest-agent` only |
+| boot ISO | `metal-amd64.iso`, sha256 `36723c65…` | hashed at download (the factory publishes none) |
+| installer image | `factory.talos.dev/metal-installer/<schematic>:v1.14.5@sha256:8a510984…` | the factory registry's digest for the tag |
+| Kubernetes | 1.37.1 | Talos v1.14.5's default; 1.14 supports 1.33-1.37 |
+| `kubectl` | v1.37.1, sha256 `65691ff7…` | `dl.k8s.io` `.sha256` |
+| `flux` | v2.10.0, sha256 `208dd701…` | the release's checksums file; supports Kubernetes 1.35-1.37 |
+
+The ISO and the installer image come from the same schematic: the guest
+agent extension in the boot ISO alone does not survive installation.
+
+The file is plain `KEY=value` lines (no quotes or expansion). An
+environment variable of the same name overrides a pin, and `gen-config.sh`
+logs each override. To move to a new set, change every related pin together
+(the ISO and installer image embed the schematic id and Talos version, and
+`tests/test_talos_unattended_box.py` checks that they agree), record the
+sources in the comments, then repeat the real-`talosctl` checks described in
+[Testing](#testing).
 
 ## Generating machine configs
 
@@ -73,6 +94,9 @@ python3 scripts/nodes-from-conf.py > nodes.txt
 scripts/gen-config.sh --inputs inputs.env --nodes nodes.txt --dry-run   # the plan only
 scripts/gen-config.sh --inputs inputs.env --nodes nodes.txt
 ```
+
+The pins come from `versions.env` beside `scripts/` unless `--versions FILE`
+names another file.
 
 `gen-config.sh` validates every input and the node table (3+3, or the 1+1
 smoke profile) before it does anything, then:
@@ -119,6 +143,11 @@ smoke profile) before it does anything, then:
 Only commands and file paths are logged; no secret is printed. Back up
 `TALOS_STATE_DIR` off the control VM: losing the secrets bundle means losing
 the ability to manage the cluster.
+
+## Testing
+
+`pytest tests/test_talos_unattended_box.py` needs no VMs and no network: it
+renders `conf.yml` and runs the scripts against a fake `talosctl` on `PATH`.
 
 ## Known limitations
 

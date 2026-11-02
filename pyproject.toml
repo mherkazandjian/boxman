@@ -55,6 +55,7 @@ include = [
     # the documented example of a box's private inputs (placeholders only);
     # the filled-in copy it is copied to is git-ignored and matches no rule
     { path = "boxes/*/*.example", format = ["sdist", "wheel"] },
+    { path = "boxes/*/versions.env", format = ["sdist", "wheel"] },
     { path = "boxes/*/terraform/*.tf", format = ["sdist", "wheel"] },
     # They keep what the box generates out of git (its ssh keys, the answer
     # file with the root password hash, terraform state, the API token in

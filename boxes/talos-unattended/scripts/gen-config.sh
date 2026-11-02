@@ -4,11 +4,14 @@
 # Runs on the control VM (the install driver ships it there), or anywhere a
 # pinned talosctl is on PATH:
 #
-#   gen-config.sh [--dry-run] [--inputs FILE] --nodes FILE
+#   gen-config.sh [--dry-run] [--versions FILE] [--inputs FILE] --nodes FILE
 #
 #   --nodes FILE    the node table, one "<name> <role> <ipv4> <mac>" per line,
 #                   as scripts/nodes-from-conf.py prints it from conf.yml
-#   --inputs FILE   sourced first; holds the TALOS_* variables below
+#   --versions FILE the tested version set (default: versions.env beside
+#                   scripts/); its pins are defaults for any variable the
+#                   environment does not set, and every override is logged
+#   --inputs FILE   sourced after the pins; holds the TALOS_* variables below
 #   --dry-run       validate the inputs and print what would run; touches no
 #                   state and runs no talosctl
 #
@@ -40,6 +43,7 @@ umask 077
 DRY_RUN=0
 NODES_FILE=""
 INPUTS=""
+VERSIONS=""
 
 log() { printf 'gen-config: %s\n' "$*" >&2; }
 die() { printf 'gen-config: error: %s\n' "$*" >&2; exit 1; }
@@ -50,11 +54,26 @@ while [ $# -gt 0 ]; do
         --dry-run) DRY_RUN=1 ;;
         --nodes)   NODES_FILE=${2:?--nodes needs a file}; shift ;;
         --inputs)  INPUTS=${2:?--inputs needs a file}; shift ;;
+        --versions) VERSIONS=${2:?--versions needs a file}; shift ;;
         -h|--help) usage ;;
         *) die "unknown argument: $1" ;;
     esac
     shift
 done
+
+# the tested version set: KEY=value lines, read as data (never sourced), each
+# a default the environment and the inputs file may override
+[ -n "$VERSIONS" ] || VERSIONS=$(dirname "$0")/../versions.env
+[ -r "$VERSIONS" ] || die "cannot read the version set $VERSIONS"
+PINNED=()
+while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    [[ $line =~ ^([A-Z][A-Z0-9_]*)=([A-Za-z0-9._:/@+-]*)$ ]] \
+        || die "$VERSIONS: expected KEY=value, got: $line"
+    key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+    PINNED+=("$key=$value")
+    [ -n "${!key+set}" ] || export "$key=$value"
+done < "$VERSIONS"
 
 if [ -n "$INPUTS" ]; then
     [ -r "$INPUTS" ] || die "cannot read inputs file $INPUTS"
@@ -63,6 +82,10 @@ if [ -n "$INPUTS" ]; then
     . "$INPUTS"
     set +a
 fi
+for entry in "${PINNED[@]}"; do
+    key=${entry%%=*}
+    [ "${!key:-}" = "${entry#*=}" ] || log "$key=${!key:-} overrides the pinned ${entry#*=}"
+done
 
 # ---- validate every input before any side effect ---------------------------
 REQUIRED="TALOS_STATE_DIR TALOS_CLUSTER_NAME TALOS_VERSION KUBERNETES_VERSION

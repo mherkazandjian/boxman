@@ -21,10 +21,19 @@
   same table feeds scripts/nodes-from-conf.py, which writes the node list
   gen-config.sh reads.
 
-  Everything site-specific comes from the environment (see
-  inputs.env.example). The defaults below are synthetic placeholders that
-  only let the file render; the scripts refuse the placeholder pins.
+  Versions and checksums come from versions.env, the tested set; an
+  environment variable of the same name overrides a pin. Everything
+  site-specific comes from the environment (see inputs.env.example); its
+  defaults below are synthetic placeholders that only let the file render.
 #}
+{#- versions.env as `pin`: KEY=value lines, comments skipped, each value
+    overridable by an environment variable of the same name #}
+{% set versions_env %}{% include "versions.env" %}{% endset %}
+{% set pin = {} %}
+{% for line in versions_env.splitlines() if line.strip() and not line.startswith("#") %}
+{% set kv = line.split("=", 1) %}
+{% set _ = pin.update({kv[0]: env(kv[0], default=kv[1])}) %}
+{% endfor %}
 {% set lab = env("TALOS_LAB_DIR", default="~/workspaces/talos-unattended") %}
 {% set net = env("TALOS_LAB_PREFIX", default="192.168.53") %}
 {% set operator_key = env("TALOS_OPERATOR_KEY", default="~/.ssh/id_ed25519_talos_lab") %}
@@ -57,16 +66,13 @@ provider:
 workspace:
   path: {{ lab }}
 
-# The shared Talos metal boot ISO. Build it from an Image Factory schematic
-# that includes the qemu-guest-agent extension, and pin the same schematic's
-# installer image as TALOS_INSTALLER_IMAGE so the extension survives the
-# install. The all-zero checksum and "placeholder" in the uri mark an
-# unsupplied pin: make check-box-images skips it, and no download can match
-# it.
+# The shared Talos metal boot ISO, from the pinned Image Factory schematic
+# with the qemu-guest-agent extension; TALOS_INSTALLER_IMAGE comes from the
+# same schematic so the extension survives the install (versions.env).
 isos:
   talos-install:
-    uri: {{ env("TALOS_ISO_URI", default="https://factory.talos.dev/image/placeholder/metal-amd64.iso") }}
-    checksum: {{ env("TALOS_ISO_CHECKSUM", default="sha256:" ~ "0" * 64) }}
+    uri: {{ pin.TALOS_ISO_URI }}
+    checksum: {{ pin.TALOS_ISO_CHECKSUM }}
 
 templates:
   control-base:
@@ -81,7 +87,8 @@ templates:
     cloudinit_done_marker: /var/lib/talos-unattended/template-ready
     cloudinit_done_timeout: 900   # package install plus three tool downloads
     # Non-secret recipe only: the operator's public key, the guest agent and
-    # pinned talosctl/kubectl/flux, each verified against its sha256. No
+    # talosctl/kubectl/flux pinned in versions.env, each verified against its
+    # sha256. No
     # Talos secrets, machine configs or Git credentials belong here -- the
     # template is reusable and its user-data is logged by boxman.
     cloudinit: |
@@ -148,9 +155,9 @@ templates:
                 esac
                 "$bin/$name" --help >/dev/null
             }
-            fetch talosctl "https://github.com/siderolabs/talos/releases/download/{{ env('TALOS_VERSION', default='vPLACEHOLDER') }}/talosctl-linux-amd64" "{{ env('TALOSCTL_SHA256', default='PLACEHOLDER') }}"
-            fetch kubectl "https://dl.k8s.io/release/{{ env('KUBECTL_VERSION', default='vPLACEHOLDER') }}/bin/linux/amd64/kubectl" "{{ env('KUBECTL_SHA256', default='PLACEHOLDER') }}"
-            fetch flux "https://github.com/fluxcd/flux2/releases/download/{{ env('FLUX_VERSION', default='vPLACEHOLDER') }}/flux_{{ env('FLUX_VERSION', default='vPLACEHOLDER') | replace('v', '', 1) }}_linux_amd64.tar.gz" "{{ env('FLUX_SHA256', default='PLACEHOLDER') }}"
+            fetch talosctl "https://github.com/siderolabs/talos/releases/download/{{ pin.TALOS_VERSION }}/talosctl-linux-amd64" "{{ pin.TALOSCTL_SHA256 }}"
+            fetch kubectl "https://dl.k8s.io/release/{{ pin.KUBECTL_VERSION }}/bin/linux/amd64/kubectl" "{{ pin.KUBECTL_SHA256 }}"
+            fetch flux "https://github.com/fluxcd/flux2/releases/download/{{ pin.FLUX_VERSION }}/flux_{{ pin.FLUX_VERSION | replace('v', '', 1) }}_linux_amd64.tar.gz" "{{ pin.FLUX_SHA256 }}"
             install -d -m 0755 "$(dirname "$marker")"
             date -Is > "$marker"
 

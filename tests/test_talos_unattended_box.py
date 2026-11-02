@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import logging
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -34,6 +36,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOX = os.path.join(REPO, "boxes", "talos-unattended")
 GEN_CONFIG = os.path.join(BOX, "scripts", "gen-config.sh")
 NODES_FROM_CONF = os.path.join(BOX, "scripts", "nodes-from-conf.py")
+VERSIONS_ENV = os.path.join(BOX, "versions.env")
 
 TALOS_VERSION = "v1.99.0"   # synthetic: these tests pin no real release
 SECRET_MARK = "FAKESECRET"
@@ -45,10 +48,20 @@ WORKERS = [f"worker-0{i}" for i in (1, 2, 3)]
 # --------------------------------------------------------------------------- #
 # conf.yml                                                                    #
 # --------------------------------------------------------------------------- #
-def _render(monkeypatch) -> dict:
-    for var in ("TALOS_LAB_DIR", "TALOS_LAB_PREFIX", "TALOS_ISO_URI",
-                "TALOS_ISO_CHECKSUM", "TALOS_OPERATOR_KEY", "TALOS_OPERATOR_PUBKEY"):
+def _pins() -> dict:
+    """versions.env as a dict, comments and blank lines skipped."""
+    with open(VERSIONS_ENV) as fobj:
+        lines = [line.rstrip("\n") for line in fobj]
+    return dict(line.split("=", 1) for line in lines if line and not line.startswith("#"))
+
+
+def _render(monkeypatch, **env) -> dict:
+    """conf.yml rendered with the shipped pins and *env* only."""
+    for var in ("TALOS_LAB_DIR", "TALOS_LAB_PREFIX", "TALOS_OPERATOR_KEY",
+                "TALOS_OPERATOR_PUBKEY", *_pins()):
         monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
     monkeypatch.setenv("BOXMAN_CONF_DIR", BOX)
     return yaml.safe_load(create_jinja_env(BOX).get_template("conf.yml").render())
 
@@ -105,15 +118,80 @@ def test_config_passes_boot_validation(monkeypatch):
     mgr.validate_base_images()   # ISO declared, MACs well formed and unique
 
 
-def test_unsupplied_iso_pin_is_the_marked_placeholder(monkeypatch):
-    # make check-box-images skips exactly this marker instead of probing it
-    iso = _render(monkeypatch)["isos"]["talos-install"]
-    assert "placeholder" in iso["uri"]
-    assert iso["checksum"] == "sha256:" + "0" * 64
+# ---- the pinned version set ------------------------------------------------ #
+def test_versions_env_is_plain_key_value_data():
+    # read by Jinja (conf.yml) and by gen-config.sh as data, never sourced:
+    # nothing in it may need quoting or expansion to mean the same to both
+    with open(VERSIONS_ENV) as fobj:
+        for line in fobj.read().splitlines():
+            if line and not line.startswith("#"):
+                assert re.fullmatch(r"[A-Z][A-Z0-9_]*=[A-Za-z0-9._:/@+-]+", line), line
 
 
-def _template_userdata(monkeypatch) -> dict:
-    return yaml.safe_load(_render(monkeypatch)["templates"]["control-base"]["cloudinit"])
+def test_the_pins_form_one_consistent_tested_set():
+    pins = _pins()
+    talos, schematic = pins["TALOS_VERSION"], pins["TALOS_SCHEMATIC_ID"]
+    assert re.fullmatch(r"v\d+\.\d+\.\d+", talos)
+    assert re.fullmatch(r"[0-9a-f]{64}", schematic)
+    # boot ISO and installer image from the same schematic and release
+    assert pins["TALOS_ISO_URI"] == (
+        f"https://factory.talos.dev/image/{schematic}/{talos}/metal-amd64.iso")
+    image, digest = pins["TALOS_INSTALLER_IMAGE"].split("@")
+    assert image == f"factory.talos.dev/metal-installer/{schematic}:{talos}"
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", pins["TALOS_ISO_CHECKSUM"])
+    assert pins["TALOS_ISO_CHECKSUM"] != "sha256:" + "0" * 64
+    # kubectl at the cluster's Kubernetes version
+    assert re.fullmatch(r"\d+\.\d+\.\d+", pins["KUBERNETES_VERSION"])
+    assert pins["KUBECTL_VERSION"] == "v" + pins["KUBERNETES_VERSION"]
+    assert re.fullmatch(r"v\d+\.\d+\.\d+", pins["FLUX_VERSION"])
+    for tool in ("TALOSCTL", "KUBECTL", "FLUX"):
+        assert re.fullmatch(r"[0-9a-f]{64}", pins[f"{tool}_SHA256"]), tool
+
+
+def test_conf_uses_the_pinned_iso_and_tools(monkeypatch):
+    pins = _pins()
+    cfg = _render(monkeypatch)
+    assert cfg["isos"]["talos-install"] == {
+        "uri": pins["TALOS_ISO_URI"], "checksum": pins["TALOS_ISO_CHECKSUM"]}
+    script = _prepare_script(yaml.safe_load(cfg["templates"]["control-base"]["cloudinit"]))
+    flux = pins["FLUX_VERSION"]
+    for url, sha in (
+            (f"/talos/releases/download/{pins['TALOS_VERSION']}/talosctl-linux-amd64",
+             pins["TALOSCTL_SHA256"]),
+            (f"dl.k8s.io/release/{pins['KUBECTL_VERSION']}/bin/linux/amd64/kubectl",
+             pins["KUBECTL_SHA256"]),
+            (f"/flux2/releases/download/{flux}/flux_{flux[1:]}_linux_amd64.tar.gz",
+             pins["FLUX_SHA256"])):
+        line = next(x for x in script.splitlines() if url in x)
+        assert line.endswith(f'"{sha}"'), line
+
+
+def test_an_environment_variable_overrides_a_pin(monkeypatch):
+    cfg = _render(monkeypatch)
+    over = _render(monkeypatch, TALOS_ISO_CHECKSUM="sha256:" + "ab" * 32, FLUX_VERSION="v9.9.9")
+    assert over["isos"]["talos-install"]["checksum"] == "sha256:" + "ab" * 32
+    assert over["isos"]["talos-install"]["uri"] == cfg["isos"]["talos-install"]["uri"]
+    assert "flux_9.9.9_linux_amd64.tar.gz" in over["templates"]["control-base"]["cloudinit"]
+
+
+def test_boxmans_own_loader_reads_the_pins(tmp_path, monkeypatch):
+    # boxman pre-processes conf.yml before Jinja sees it; the include must
+    # survive that, from a copy so the rendered dump stays out of the repo
+    for var in _pins():
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("BOXMAN_CONF_FILE", str(tmp_path / "conf.yml"))
+    monkeypatch.setenv("BOXMAN_CONF_DIR", str(tmp_path))
+    for name in ("conf.yml", "versions.env"):
+        (tmp_path / name).write_text(open(os.path.join(BOX, name)).read())
+    mgr = BoxmanManager.__new__(BoxmanManager)
+    mgr.logger = logging.getLogger(__name__)
+    cfg = mgr.load_config(str(tmp_path / "conf.yml"))
+    assert cfg["isos"]["talos-install"]["checksum"] == _pins()["TALOS_ISO_CHECKSUM"]
+
+
+def _template_userdata(monkeypatch, **env) -> dict:
+    return yaml.safe_load(_render(monkeypatch, **env)["templates"]["control-base"]["cloudinit"])
 
 
 def _prepare_script(userdata: dict) -> str:
@@ -199,12 +277,8 @@ def template_build(tmp_path, monkeypatch):
             self.marker = marker
 
         def run(self):
-            for key in pins:
-                monkeypatch.delenv(key, raising=False)
-            for key, value in self.pins.items():
-                monkeypatch.setenv(key, value)
             script = tmp_path / "prepare-control-template"
-            script.write_text(_prepare_script(_template_userdata(monkeypatch)))
+            script.write_text(_prepare_script(_template_userdata(monkeypatch, **self.pins)))
             env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "FAKE_DOWNLOADS": str(downloads),
                    "TOOLS_BIN_DIR": str(tools), "READY_MARKER": str(marker)}
             return subprocess.run(["bash", str(script)], capture_output=True,
@@ -225,7 +299,7 @@ def test_template_ready_after_every_tool_installs(template_build):
 
 
 @pytest.mark.parametrize("breakage", [
-    "download_fails", "checksum_mismatch", "archive_lacks_binary", "pin_not_supplied"])
+    "download_fails", "checksum_mismatch", "archive_lacks_binary", "pin_empty"])
 def test_a_failed_tool_install_leaves_no_ready_marker(template_build, breakage):
     build = template_build
     build.marker.parent.mkdir()
@@ -241,8 +315,8 @@ def test_a_failed_tool_install_leaves_no_ready_marker(template_build, breakage):
         tarball = build.downloads / "flux_9.9.9_linux_amd64.tar.gz"
         subprocess.run(["tar", "-czf", str(tarball), "-C", str(empty), "README"], check=True)
         build.pins["FLUX_SHA256"] = _sha(tarball)
-    elif breakage == "pin_not_supplied":
-        del build.pins["KUBECTL_SHA256"]
+    elif breakage == "pin_empty":
+        build.pins["KUBECTL_SHA256"] = ""
     proc = build.run()
     assert proc.returncode != 0
     assert not build.marker.exists(), breakage
@@ -414,6 +488,10 @@ def lab(tmp_path):
     python3.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     python3.chmod(0o755)
     log = tmp_path / "talosctl.log"
+    # synthetic tests pin no real release: an empty version set, every value
+    # from the environment below; tests of the shipped pins pass versions=None
+    no_pins = tmp_path / "no-pins.env"
+    no_pins.write_text("# no pins\n")
     env = {
         "PATH": f"{bin_dir}:/usr/bin:/bin",
         "HOME": str(tmp_path),
@@ -437,11 +515,12 @@ def lab(tmp_path):
         state = tmp_path / "state"
         nodes = _node_table(tmp_path / "nodes.txt")
 
-        def run(self, *args, **overrides):
+        def run(self, *args, versions=no_pins, **overrides):
             e = dict(env, **overrides)
             for key in [k for k, v in overrides.items() if v is None]:
                 del e[key]
-            return subprocess.run(["bash", GEN_CONFIG, "--nodes", str(self.nodes), *args],
+            pins = ["--versions", str(versions)] if versions else []
+            return subprocess.run(["bash", GEN_CONFIG, "--nodes", str(self.nodes), *pins, *args],
                                   capture_output=True, text=True, env=e, timeout=60)
 
         def calls(self):
@@ -911,4 +990,42 @@ def test_shipped_inputs_example_is_refused_as_is(lab):
                              "TALOS_INSTALLER_IMAGE", "KUBERNETES_VERSION")}
     proc = lab.run("--inputs", os.path.join(BOX, "inputs.env.example"), **env)
     assert proc.returncode != 0 and "placeholder" in proc.stderr
+    assert lab.calls() == []
+
+
+# ---- gen-config.sh reads the pinned version set ---------------------------- #
+PINNED_VARS = {"TALOS_VERSION": None, "KUBERNETES_VERSION": None, "TALOS_INSTALLER_IMAGE": None}
+
+
+def test_gen_config_defaults_to_the_shipped_version_set(lab):
+    pins = _pins()
+    out = _ok(lab.run("--dry-run", versions=None, **PINNED_VARS))
+    plan = out.stdout
+    assert f"--talos-version {pins['TALOS_VERSION']}" in plan
+    assert f"--kubernetes-version {pins['KUBERNETES_VERSION']}" in plan
+    assert f"--install-image {pins['TALOS_INSTALLER_IMAGE']}" in plan
+    assert "overrides the pinned" not in out.stderr
+
+
+def test_an_overridden_pin_is_used_and_logged(lab):
+    pins = _pins()
+    proc = _ok(lab.run("--dry-run", versions=None, **dict(PINNED_VARS, KUBERNETES_VERSION="1.36.0")))
+    assert "--kubernetes-version 1.36.0" in proc.stdout
+    assert f"KUBERNETES_VERSION=1.36.0 overrides the pinned {pins['KUBERNETES_VERSION']}" \
+        in proc.stderr
+
+
+@pytest.mark.parametrize("body,message", [
+    ("TALOS_VERSION=$(touch pwned)\n", "expected KEY=value"),
+    ('TALOS_VERSION="v1.2.3"\n', "expected KEY=value"),
+    ("TALOS_VERSION=v1.2.3 # trailing comment\n", "expected KEY=value"),
+    (None, "cannot read the version set"),
+])
+def test_a_malformed_or_missing_version_set_stops_the_run(lab, tmp_path, body, message):
+    versions = tmp_path / "versions.env"
+    if body is not None:
+        versions.write_text(body)
+    proc = lab.run("--dry-run", versions=versions)
+    assert proc.returncode != 0 and message in proc.stderr, proc.stderr
+    assert not (tmp_path / "pwned").exists()
     assert lab.calls() == []
