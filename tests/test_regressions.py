@@ -55,7 +55,7 @@ class TestSnapshotOverlayPreservation057eb7d:
 
         call_order: list[str] = []
 
-        def record_preserve(_vm, _snap):
+        def record_preserve(_vm, _snap, skip=()):
             call_order.append("preserve")
             return [("/overlay.qcow2", "/overlay.qcow2.preserve")]
 

@@ -2617,7 +2617,8 @@ class LibVirtSession(SessionConfigMixin):
             self.logger.info(f"restoring latest snapshot '{snapshot_name}' for vm {vm_name}")
         else:
             self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
-        return snapshot_mgr.snapshot_restore(vm_name, snapshot_name)
+        return snapshot_mgr.snapshot_restore(
+            vm_name, snapshot_name, paths_in_use=self.disk_paths_in_use)
 
     def eject_cdrom(self, vm_name: str) -> None:
         """
