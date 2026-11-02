@@ -1349,3 +1349,55 @@ def test_the_fake_matches_the_real_layout(real_lab, tmp_path):
     checker = runpy.run_path(CHECK)
     kinds = {k for k, _ in layouts["real"]["controlplane"]}
     assert set(checker["PROTECTED_KINDS"]) <= kinds
+
+
+# ---- the shipped example patches ------------------------------------------ #
+PATCH_EXAMPLES = os.path.join(BOX, "patches.example")
+#: documents the generated node patch owns
+NODE_KINDS = {"HostnameConfig", "LinkAliasConfig", "DHCPv4Config", "Layer2VIPConfig"}
+
+
+def test_the_example_patches_cover_each_level_and_avoid_protected_documents():
+    files = sorted(os.listdir(PATCH_EXAMPLES))
+    assert files == ["all.yaml", "controlplane.yaml", "worker-01.yaml", "worker.yaml"]
+    protected = set(runpy.run_path(CHECK)["PROTECTED_KINDS"])
+    for name in files:
+        with open(os.path.join(PATCH_EXAMPLES, name)) as fobj:
+            for doc in yaml.safe_load_all(fobj):
+                # documents only: the legacy v1alpha1 forms conflict with them
+                assert "kind" in doc, name
+                assert doc["kind"] not in protected | NODE_KINDS, (name, doc["kind"])
+                assert "$patch" not in doc, name
+
+
+def _assert_examples_applied(nodes_dir, names):
+    for name in names:
+        docs = _docs(nodes_dir / f"{name}.yaml")
+        assert docs[("TimeSyncConfig", None)]["bootTimeout"] == "2m0s"
+        labels = docs[("KubeNodeConfig", None)].get("labels", {})
+        if name.startswith("cp-"):
+            assert docs[("KubeAPIServerConfig", None)]["certExtraSANs"] \
+                == ["kubernetes.talos-lab.example"]
+            assert "lab.example/pool" not in labels
+        else:
+            assert ("KubeAPIServerConfig", None) not in docs
+            assert labels["lab.example/pool"] == "general"
+            assert ("topology.kubernetes.io/zone" in labels) == (name == "worker-01")
+
+
+def test_the_example_patches_apply_and_keep_every_node_identity(lab):
+    proc = _ok(lab.run(TALOS_PATCH_DIR=PATCH_EXAMPLES))
+    assert proc.stdout.splitlines() == [f"{n}: created" for n in CP + WORKERS]
+    _assert_examples_applied(lab.state / "nodes", CP + WORKERS)
+    _assert_node_configs(lab.state / "nodes", CP + WORKERS,
+                         f"registry.example/installer/abc:{TALOS_VERSION}",
+                         ["ntp1.example", "ntp2.example"])
+
+
+@real
+def test_real_talosctl_validates_the_example_patches(real_lab):
+    proc = _ok(real_lab.run(TALOS_PATCH_DIR=PATCH_EXAMPLES))
+    assert proc.stderr.count("is valid for metal mode") == 6
+    _assert_examples_applied(real_lab.state / "nodes", CP + WORKERS)
+    _assert_node_configs(real_lab.state / "nodes", CP + WORKERS,
+                         _pins()["TALOS_INSTALLER_IMAGE"], ["ntp1.example", "ntp2.example"])

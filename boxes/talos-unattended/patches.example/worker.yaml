@@ -1,0 +1,7 @@
+# Example patch for the workers (TALOS_PATCH_DIR/worker.yaml). Kubelets may
+# only label their own node outside the kubernetes.io and k8s.io prefixes
+# (with a few exceptions such as node.kubernetes.io/ and topology zones).
+apiVersion: v1alpha1
+kind: KubeNodeConfig
+labels:
+  lab.example/pool: general

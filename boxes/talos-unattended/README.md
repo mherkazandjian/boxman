@@ -155,6 +155,14 @@ node address. Then it:
    never the VIP, once only. It publishes configs only after all of them
    pass and reports each node as `created`, `changed` or `unchanged`.
 
+`patches.example/` shows one patch at each level: `all.yaml` bounds the
+boot-time wait for NTP, `controlplane.yaml` adds an API certificate name,
+`worker.yaml` labels the workers and `worker-01.yaml` adds a zone label to
+one node. Copy the directory, adapt it and point `TALOS_PATCH_DIR` at the
+copy. A patch for one role must only touch documents that role's config
+has (the API server's exists only on control planes), or the check rejects
+it as an added document.
+
 Only commands and file paths are logged; no secret is printed. Back up
 `TALOS_STATE_DIR` off the control VM: losing the secrets bundle means losing
 the ability to manage the cluster.
