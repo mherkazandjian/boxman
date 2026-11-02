@@ -8,6 +8,7 @@ configures on the host beyond what libvirt does by itself.
   - [`mode: nat`](#mode-nat)
   - [`mode: route`](#mode-route)
   - [`mode: bridge`](#mode-bridge)
+  - [`mode: isolated`](#mode-isolated)
 - [Namespacing: why two clusters never collide](#namespacing-why-two-clusters-never-collide)
 - [The routed-network isolation contract](#the-routed-network-isolation-contract)
 - [Reconciliation: changing a network after it exists](#reconciliation-changing-a-network-after-it-exists)
@@ -18,15 +19,15 @@ configures on the host beyond what libvirt does by itself.
 
 ## Choosing an attachment
 
-There are five ways to get a NIC into a VM, and picking the wrong one is the
+There are six ways to get a NIC into a VM, and picking the wrong one is the
 single most common networking mistake with boxman. What separates them is who
 owns what:
 
-- **`nat`, `route` and `bridge`** are all boxman-owned libvirt networks,
-  declared per cluster, defined on provision and removed on destroy. They differ
-  in what sits *underneath*: for `nat` and `route` libvirt creates the Linux
-  bridge and deletes it again, while `bridge` wraps a host bridge that boxman
-  never creates, touches or removes.
+- **`nat`, `route`, `bridge` and `isolated`** are all boxman-owned libvirt
+  networks, declared per cluster, defined on provision and removed on destroy.
+  They differ in what sits *underneath*: for `nat`, `route` and `isolated`
+  libvirt creates the Linux bridge and deletes it again, while `bridge` wraps a
+  host bridge that boxman never creates, touches or removes.
 - **`shared_networks`** is a host Linux bridge that boxman creates but never
   destroys.
 - **`is_global`** is a bare reference to something boxman does not manage at
@@ -41,6 +42,7 @@ flowchart TD
     Q3 -->|"No, boxman VMs only"| Q4{"How should the guests<br/>reach the outside?"}
     Q4 -->|"NAT, behind the host address"| NAT["clusters.c.networks.n<br/>mode: nat"]
     Q4 -->|"Routed, and sealed off from the host"| RT["clusters.c.networks.n<br/>mode: route"]
+    Q4 -->|"Not at all: guests only,<br/>no host address, no DHCP"| ISO["clusters.c.networks.n<br/>mode: isolated"]
 
     Q1 -->|"Yes, a libvirt network"| G["network_adapters[].is_global: true<br/>network_source: default"]
     Q1 -->|"Yes, a host Linux bridge"| Q2{"Reference it by a stable<br/>libvirt network name?"}
@@ -49,6 +51,7 @@ flowchart TD
 
     style NAT fill:#2ecc71,color:#fff,stroke:none
     style RT fill:#e67e22,color:#fff,stroke:none
+    style ISO fill:#34495e,color:#fff,stroke:none
     style BR fill:#9b59b6,color:#fff,stroke:none
     style SN fill:#3498db,color:#fff,stroke:none
     style G fill:#95a5a6,color:#fff,stroke:none
@@ -62,6 +65,7 @@ At a glance:
 | `mode: nat` | `clusters.<c>.networks` | yes | yes | yes | yes |
 | `mode: route` | `clusters.<c>.networks` | yes | yes | yes | **no** (DHCP only) |
 | `mode: bridge` | `clusters.<c>.networks` | the libvirt network only | the libvirt network only | yes | depends on the bridge |
+| `mode: isolated` | `clusters.<c>.networks` | yes | yes | yes | **no host address** (see [caveats](#mode-isolated)) |
 | `shared_networks` | top level | yes (the Linux bridge) | **no** | no | depends on the bridge |
 | `is_global: true` | on the adapter | no | no | no | depends |
 
@@ -69,8 +73,9 @@ At a glance:
 
 A network declared under `clusters.<cluster>.networks.<name>` is a libvirt
 network that boxman defines, starts, autostarts and — on `boxman destroy` —
-removes. `mode:` accepts exactly three values; anything else is rejected at
-validation time with `unsupported forward mode`.
+removes. `mode:` accepts exactly four values (`nat`, `route`, `bridge`,
+`isolated`); anything else is rejected at validation time with `unsupported
+forward mode`.
 
 ```yaml
 clusters:
@@ -222,10 +227,116 @@ dnsmasq holds `dhcp.hosts` reservations for *every* node's pinned
 `networks[].mac`, hpe2 runs a `shared_networks` bridge + `mode: bridge`
 network, and a VXLAN enslaved to both bridges (outside boxman) joins them.
 
-> **Ownership warning.** Moving a network between `nat`/`route` and `bridge`
-> crosses bridge ownership: libvirt deletes a bridge it manages, and preserves
+> **Ownership warning.** Moving a network between `nat`/`route`/`isolated` and
+> `bridge` crosses bridge ownership: libvirt deletes a bridge it manages, and preserves
 > one it does not. Use different bridge names across that transition, or omit
 > the managed side's `bridge.name` so boxman reserves a fresh automatic one.
+
+### `mode: isolated`
+
+An **address-free** L2 segment for labs: guests on the bridge reach each other,
+and nothing else is configured. boxman renders the network with no `<forward>`
+element and no `<ip>` element:
+
+```yaml
+networks:
+  test:
+    mode: isolated
+    bridge: { stp: 'off', delay: '0' }   # name optional, as for nat/route
+```
+
+```xml
+<network>
+  <name>bprj__…__test</name>
+  <uuid>…</uuid>
+  <bridge name='virbr12' stp='off' delay='0'/>
+  <mac address='52:54:00:0a:0b:0c'/>
+</network>
+```
+
+libvirt creates the Linux bridge, and deletes it with the network, just as for
+`nat` and `route`. Without an `<ip>` the host holds no address on the bridge,
+so libvirt has nothing to run DHCP or DNS from and no gateway to hand out.
+Guests configure their own addresses: statically, or from a DHCP server that
+runs inside one of the guests. **boxman installs no firewall rules** for this
+mode. Whatever libvirt itself does for a network without `<forward>` still
+applies.
+
+Accepted keys: `bridge.name`, `bridge.stp`, `bridge.delay`, `mac` and `enable`,
+with the same meaning as for `nat`. Their values are checked before anything is
+written or defined: `bridge.name` must be a valid Linux bridge name (at most 15
+of `A-Z a-z 0-9 _ . -`), `bridge.delay` a non-negative integer and `mac` six
+colon-separated hex groups. These keys are **rejected**, because they contradict
+an address-free network:
+
+| Key | Why |
+|---|---|
+| `ip` (any form, even an empty `ip:`) | the address, the netmask and every DHCP setting live under it; use `nat` or `route` for an addressed network |
+| `dhcp` | libvirt serves no DHCP here; run a DHCP server in a guest if you need one |
+| `ipv6` | guest-to-guest IPv6 via `<network ipv6='yes'>` is not supported yet |
+
+This is narrower than libvirt's own "isolated network", which may also carry a
+host address. That addressed variant is not supported. When boxman reads back
+a live network that has no `<forward>`, it reports its mode as `isolated`. A
+live forward-less network that does hold an `<ip>` is drift from the
+address-free configuration, and so is one whose root carries
+`<network ipv6='yes'>` (a missing attribute and `ipv6='no'` both match). So is
+a change between `isolated` and any other mode. All of these are structural,
+so they need `--recreate-networks`. One exception: a live network whose `<ip>`
+uses an IPv6 `prefix` cannot be read back yet, so its plan fails instead of
+proposing a recreate.
+
+Consequences worth knowing before you choose this mode:
+
+- **The host cannot reach the guests over this network.** `boxman ssh` and the
+  generated `ssh_config` need another route in: a second adapter on a `nat`
+  network, or console access.
+- **`provision` and `up` still wait for every VM's address.** boxman looks for
+  it in DHCP leases, then the host's ARP table, then the qemu guest agent. On an
+  address-free network only the guest agent can answer, and only for a NIC in
+  the guest's root network namespace. Without the agent, the wait ends with a
+  warning when it times out (up to ten minutes on a first provision), and the
+  inventory and `ssh_config` stay incomplete.
+- **An address-free bridge is not, by itself, a containment boundary.** Linux
+  can still accept a frame that arrives on the bridge and is addressed to one
+  of the host's *other* addresses. If the lab depends on guests not reaching the
+  host, check the host's own settings (reverse-path filtering, routes, IPv6 on
+  the bridge) before relying on it.
+
+#### Example: a two-VM lab on two address-free networks
+
+`tx` and `rx` share the `test` segment. `rx` also has a NIC on a second
+segment, `outside`. Neither network has a host address or libvirt DHCP. The
+guests' addresses come from the image or from cloud-init, not from boxman.
+Credentials and the image source belong in the usual `templates:` section and
+are omitted here.
+
+```yaml
+clusters:
+  lab:
+    base_image: lab-base             # a template from the templates: section
+    networks:
+      test:
+        mode: isolated
+        bridge: { stp: 'off', delay: '0' }
+      outside:
+        mode: isolated
+        bridge: { stp: 'off', delay: '0' }
+    vms:
+      tx:
+        hostname: dev-tx
+        cpus: { sockets: 1, cores: 1, threads: 1 }
+        memory: 1024
+        network_adapters:
+          - { name: test, network_source: test, mac: '52:54:00:00:00:01', link_state: up }
+      rx:
+        hostname: dev-rx
+        cpus: { sockets: 1, cores: 1, threads: 1 }
+        memory: 1024
+        network_adapters:
+          - { name: test, network_source: test, mac: '52:54:00:00:00:02', link_state: up }
+          - { name: outside, network_source: outside, mac: '52:54:00:00:00:03', link_state: up }
+```
 
 ## Namespacing: why two clusters never collide
 
@@ -448,7 +559,7 @@ flowchart TD
 | `ip.dhcp.range` | same, as delete + add (libvirt refuses `modify` on a range) | no |
 | network defined but stopped | started | no |
 | network absent | defined and started | no |
-| `mode`, `ip.address`, `ip.netmask`, `mac`, `bridge.name`, `bridge.stp`, `bridge.delay`, DHCP option suppression | destroy + define again | **yes**, needs `--recreate-networks` |
+| `mode`, `ip.address`, `ip.netmask`, `mac`, `bridge.name`, `bridge.stp`, `bridge.delay`, DHCP option suppression; for `mode: isolated`, a host address on the live network | destroy + define again | **yes**, needs `--recreate-networks` |
 
 `bridge.name` is only compared when the config pinned one; otherwise boxman
 assigned it and libvirt is authoritative.

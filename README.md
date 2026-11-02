@@ -10,7 +10,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - Declarative VM provisioning via YAML configuration
 - Supports libvirt/KVM with QEMU
 - Network and disk management
-- **Networking**: per-cluster libvirt networks (`nat`, `route`, `bridge`), host bridges for hybrid labs via `shared_networks`, automatic reconciliation of network changes on `up`/`update`, and self-healing host isolation for routed networks — see [Networking](doc/network.md)
+- **Networking**: per-cluster libvirt networks (`nat`, `route`, `bridge`, and an address-free `isolated` for labs), host bridges for hybrid labs via `shared_networks`, automatic reconciliation of network changes on `up`/`update`, and self-healing host isolation for routed networks — see [Networking](doc/network.md)
 - Snapshot support
 - Cloud-init integration
 - **Cloud-init template creation**: build template VMs from cloud images with inline cloud-init config
