@@ -56,6 +56,11 @@ from boxman.providers.libvirt.disk_ownership import (
     disk_logical_name,
     read_disk_records,
 )
+from boxman.providers.libvirt.storage_pools import (
+    ensure_pool_on,
+    set_autostart,
+    workdir_pool_name,
+)
 from boxman.providers.libvirt.virsh_parse import LOCAL_SOURCE_TYPES
 from boxman.utils.hostnames import hostname_problem
 
@@ -166,34 +171,70 @@ class VMsMixin:
 
     ### end networks define / remove / destroy
     ### vms define / remove / destroy
-    def _ensure_libvirt_storage_pool(self, workdir: str, cluster_name: str) -> None:
+    def _ensure_libvirt_storage_pool(self, workdir: str,
+                                     cluster_name: str) -> str | None:
         """
-        Ensure the libvirt directory storage pool exists for the given workdir.
+        See to an active storage pool on *cluster_name*'s *workdir* before
+        its VMs are cloned there, and return its name: ``None`` when there
+        is none, the reason in a warning.
 
-        virt-clone automatically tries to define a pool for the target directory
-        when given a --file path. When multiple VMs are cloned in parallel into
-        the same directory, every process races to define the same pool and all
-        but the first fail with "pool already exists". Pre-defining the pool
-        here (sequentially, before parallel cloning begins) eliminates the race.
+        virt-install and virt-clone define a pool on a directory they are
+        handed when none is on it, and clones into one directory started
+        together race to: all but the first fail with "pool already
+        exists". One on it here, before they start, leaves them nothing to
+        define. Without one the clones go on as before, and the retry in
+        :func:`_clone_with_retry` absorbs the race.
+
+        The pool is found by its target, never by its name
+        (:func:`ensure_pool_on`): any pool on the workdir is used, whatever
+        it is called -- boxman's, an older boxman's ``<basename>``,
+        virt-install's ``<basename>-<n>`` -- and started if it is not
+        active. Another project's ``cluster_1`` on its own directory is
+        never taken for this one, as it was when the pool was looked up by
+        the workdir's basename: virt-install then defined a
+        ``cluster_1-<n>`` on the workdir, which leaked (#277). With none on
+        it, one named
+        :func:`workdir_pool_name` is defined, started and set to start with
+        the host; with that name taken on another directory, the first free
+        ``<name>_<n>``. Several clusters sharing a workdir share its pool:
+        the first to get here names it. One of boxman's own (a ``bprj__``
+        name) is set to start with the host if it does not
+        (:func:`set_autostart`): its ``pool-start`` failed when it was
+        defined, say.
+
+        The workdir is made here, by the user boxman runs as, like the files
+        boxman writes into it -- not by ``pool-build``, which made it as
+        root under ``use_sudo``.
 
         Uses *cluster_name*'s own libvirt session for the virsh connection so a
         compose-primary mixed project (where the default ``self.provider`` is
         the docker-compose session) still targets the configured libvirt
         URI/runtime instead of silently falling back to local qemu:///system.
+
+        Raises:
+            ProvisionError: the workdir is missing and cannot be made.
         """
         workdir = os.path.abspath(os.path.expanduser(workdir))
-        pool_name = os.path.basename(workdir)
+        try:
+            os.makedirs(workdir, exist_ok=True)
+        except OSError as exc:
+            raise ProvisionError(
+                f"could not create the workdir {workdir} of cluster "
+                f"'{cluster_name}': {exc}") from exc
         virsh = VirshCommand(self.session_for_cluster(cluster_name).provider_config)
-
-        result = virsh.execute("pool-info", pool_name, warn=True)
-        if result.ok:
-            self.logger.info(f"storage pool '{pool_name}' already exists")
-            return
-
-        self.logger.info(f"defining storage pool '{pool_name}' for {workdir}")
-        virsh.execute("pool-define-as", pool_name, "dir", "--target", workdir)
-        virsh.execute("pool-build", pool_name, warn=True)
-        virsh.execute("pool-start", pool_name, warn=True)
+        pool = ensure_pool_on(
+            virsh, workdir,
+            workdir_pool_name(self.config['project'], cluster_name))
+        if pool is None:
+            self.logger.warning(
+                f"no storage pool on the workdir {workdir}: virt-install and "
+                f"virt-clone define one there themselves, and clones started "
+                f"together may race to define it (each is retried)")
+            return None
+        if pool.startswith("bprj__"):
+            set_autostart(virsh, pool, workdir)
+        self.logger.info(f"storage pool '{pool}' is on {workdir}")
+        return pool
 
     def clone_vms(self) -> None:
         """

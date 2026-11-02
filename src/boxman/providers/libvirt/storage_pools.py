@@ -11,16 +11,19 @@ libvirt 10.0), but the pool then lists files that are gone — to
 are refreshed after a removal.
 
 A directory ``destroy`` removes takes no pool with it: the pool stays
-defined, and active, on a directory that is gone, and the next workdir of
-that basename gets a ``<basename>-<n>`` pool from virt-install instead,
-which leaks the same way (#277). So ``destroy`` retires the pools on the
+defined, and active, on a directory that is gone. While boxman looked the
+pool of a workdir up by the workdir's basename, the next workdir of that
+basename got a ``<basename>-<n>`` pool from virt-install instead, which
+leaked the same way (#277). So ``destroy`` retires the pools on the
 directories it removed (:func:`retire_pool`): they are stopped and
 undefined, never deleted with ``pool-delete``, which removes the directory
-itself.
+itself. And the pool of a workdir is found by its target now, and named
+after the project and the cluster (:func:`workdir_pool_name`).
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from collections.abc import Iterable
@@ -417,3 +420,74 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
         log.warning(f"storage pool {name} on {directory} will not start with "
                     f"the host: {(autostart.stderr or '').strip()}")
     return name
+
+
+#: what no pool name boxman gives may hold: libvirt refuses a ``/`` and a
+#: newline in one, a NUL cannot be passed to ``virsh`` at all, and any other
+#: control character would not be read back as written from ``pool-list``
+_UNFIT_IN_POOL_NAME = re.compile(r"[/\x00-\x1f\x7f]")
+
+#: the longest pool name boxman gives, in bytes. libvirt keeps a persistent
+#: pool as ``/etc/libvirt/storage/<name>.xml``, and a file name has at most
+#: 255; :func:`ensure_pool_on` may add ``_<n>`` to it
+POOL_NAME_MAX_BYTES = 200
+
+
+def workdir_pool_name(project: str, cluster: str) -> str:
+    """
+    The name of the storage pool boxman defines on *cluster*'s workdir:
+    ``bprj__<project>__bprj_<cluster>_workdir``, as the cluster's domains
+    and its ``_disk_snapshots`` pool are named. Two workdirs of one basename
+    -- every project's ``cluster_1`` -- no longer ask for the same pool, and
+    a pool of that name already on another directory is never taken for
+    this one (#277).
+
+    When that cannot be a pool's name -- a ``/`` or a control character in
+    *project* or *cluster*, or longer than :data:`POOL_NAME_MAX_BYTES` --
+    ``bprj__<digest>_workdir``, *digest* the first 16 hex digits of the
+    SHA-256 of ``<project>/<cluster>``: the same for the same cluster on
+    every run, and still a ``bprj__`` name.
+
+    Args:
+        project: The project's name, as in conf.yml.
+        cluster: The cluster's name, as under ``clusters:``.
+    """
+    name = f"bprj__{project}__bprj_{cluster}_workdir"
+    encoded = name.encode("utf-8", "surrogatepass")
+    if (_UNFIT_IN_POOL_NAME.search(name) is None
+            and len(encoded) <= POOL_NAME_MAX_BYTES):
+        return name
+    digest = hashlib.sha256(
+        f"{project}/{cluster}".encode("utf-8", "surrogatepass")).hexdigest()
+    return f"bprj__{digest[:16]}_workdir"
+
+
+def set_autostart(virsh, name: str, directory: str) -> bool:
+    """
+    Set the pool *name*, on *directory*, to start with the host, unless it
+    does already (:func:`autostarted_pools`). :func:`ensure_pool_on` sets
+    it only on a pool it defines and starts in one go: one whose
+    ``pool-start`` failed then, or whose ``pool-autostart`` did, is found
+    and started by a later run, but stays down after a reboot until then.
+
+    Best effort: a pool that cannot be set is named in a warning, never
+    raised.
+
+    Args:
+        virsh: Command executor with an ``execute`` method (a
+            :class:`VirshCommand`).
+        name: The pool.
+        directory: Its target, for the warning.
+
+    Returns:
+        Whether it starts with the host now.
+    """
+    autostarted = autostarted_pools(virsh)
+    if autostarted is not None and name in autostarted:
+        return True
+    result = virsh.execute("pool-autostart", name, warn=True)
+    if not result.ok:
+        log.warning(f"storage pool {name} on {directory} will not start with "
+                    f"the host: {(result.stderr or '').strip()}")
+        return False
+    return True
