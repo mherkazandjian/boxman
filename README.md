@@ -23,6 +23,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
 - **`boxman update`**: incrementally apply config changes to a running project — add/remove VMs, adjust CPU/memory, grow and detach disks; changes that need a guest restart are deferred unless `--restart` is given
 - **Windows guests (experimental)**: an unattended Windows Server install through the ISO-boot path, reachable over WinRM and OpenSSH — findings, gaps and design in [Windows guests](doc/windows-guests.md), proof of concept in [`boxes/windows-server-2022-iso-boot`](boxes/windows-server-2022-iso-boot)
+- **Talos Linux lab (work in progress)**: the VM topology (three control planes, three workers and an Ubuntu control VM), a pinned control-VM template and checked per-node machine-config generation for an unattended Talos install; the install driver follows — see [`boxes/talos-unattended`](boxes/talos-unattended)
 - **Disk reclaim and storage hygiene**: `boxman storage` inspects qcow2 footprint, runs guest-side fstrim, compacts qcow2 files, and compresses snapshot memory dumps with zstd — see [Disk Reclaim and Storage](doc/storage.md)
 
 ## Quick Start
