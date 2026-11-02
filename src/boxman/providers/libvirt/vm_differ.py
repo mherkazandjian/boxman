@@ -347,6 +347,19 @@ class VMStateDiffer:
             domain_name, provider_config=self.provider_config).get_attached_cdroms(
                 inactive=inactive)
 
+    def get_cdrom_media_read(self, domain_name: str,
+                             inactive: bool = False) -> dict[str, str]:
+        """
+        ``{target: image}`` for each CDROM whose media is built on another
+        image, the one it actually reads: the ISO under the qcow2 overlay a
+        snapshot revert leaves a drive on (#273). See
+        :meth:`CDROMManager.media_read`.
+        """
+        from .cdrom import CDROMManager
+        return CDROMManager(
+            domain_name, provider_config=self.provider_config).media_read(
+                inactive=inactive)
+
     def get_actual_shared_folders(self, domain_name: str,
                                   inactive: bool = False) -> list[dict[str, Any]]:
         """
@@ -620,6 +633,34 @@ class VMStateDiffer:
             entries.append(
                 (cdrom_config,
                  os.path.abspath(os.path.expanduser(raw_source))))
+
+        # Each drive is compared by the image it reads, not by the file it
+        # names. A snapshot revert leaves a CDROM on a qcow2 overlay of its
+        # ISO beside the ISO (#273), and compared by that file the drive
+        # holding a declared ISO was one to remove and the ISO one to attach
+        # anew. Asked only about a drive holding media nothing declares.
+        declared = {source for _config, source in entries} | install_media
+
+        def _as_read(cdroms: list[dict[str, Any]],
+                     inactive: bool) -> list[dict[str, Any]]:
+            odd = {c['target'] for c in cdroms
+                   if c.get('source') and c.get('target')
+                   and media_path(c['source']) not in declared}
+            if not odd:
+                return cdroms
+            read = self.get_cdrom_media_read(domain_name, inactive=inactive)
+            return [{**c, 'source': read[c['target']]}
+                    if c.get('target') in odd and c['target'] in read else c
+                    for c in cdroms]
+
+        live_is_persistent = live_cdroms is persistent_cdroms
+        persistent_cdroms = _as_read(persistent_cdroms, inactive=True)
+        live_cdroms = (persistent_cdroms if live_is_persistent
+                       else _as_read(live_cdroms, inactive=False))
+        persistent_by_target = {
+            c['target']: c for c in persistent_cdroms if c.get('target')
+        }
+        live_by_target = {c['target']: c for c in live_cdroms if c.get('target')}
 
         # Every explicit target is reserved before any matching happens.
         # Doing it inside a single loop made the result depend on declaration

@@ -26,14 +26,16 @@ Only virsh is faked, by :class:`FakeDomain`, which answers the way libvirt
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from xml.etree import ElementTree as ET
 
 import pytest
 
-from boxman.providers.libvirt.commands import VirshCommand
+from boxman.providers.libvirt.commands import LibVirtCommandBase, VirshCommand
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.providers.libvirt.vm_differ import VMStateDiffer
 from conftest import make_bare_manager
@@ -86,6 +88,11 @@ class FakeDomain:
     * ``change-media``: with ``--config`` virsh looks the drive up in the
       persistent definition, otherwise in the live one; ``--live`` fails
       for a drive the live definition lacks.
+    * ``update-device`` of a cdrom: the drive is looked up by target in
+      each definition the scope reaches, and the persistent definition is
+      saved only once the live change worked; the driver type of each is
+      kept in :attr:`driver_types`. ``dumpxml`` lists the cdroms of the
+      definition it reports, each on a raw image.
     * a start boots the persistent definition, which is the live one from
       then on.
     * *refuse* maps ``attach-device`` or ``detach-device`` to the reason
@@ -108,6 +115,9 @@ class FakeDomain:
                      else self._devices(live_cdroms))
         self.refuse = refuse or {}
         self.calls: list[tuple] = []
+        #: a qcow2 overlay a source is -> the raw image under it (#273): the
+        #: live definition records that chain, the persistent one none
+        self.overlays: dict[str, str] = {}
 
     def _devices(self, cdroms):
         bus = 'sata' if self.machine == Q35 else 'ide'
@@ -169,13 +179,30 @@ class FakeDomain:
                               + '-' * 60 + '\n' + rows + '\n'))
 
     def _dumpxml(self, *flags, **_kwargs):
+        live = self.active and '--inactive' not in flags
+
+        def image(source):
+            if source not in self.overlays:
+                return "<driver name='qemu' type='raw'/>" + (
+                    f"<source file='{source}'/>" if source else '')
+            chain = (f"<backingStore type='file'><format type='raw'/>"
+                     f"<source file='{self.overlays[source]}'/><backingStore/>"
+                     f"</backingStore>") if live else ''
+            return (f"<driver name='qemu' type='qcow2'/>"
+                    f"<source file='{source}'/>{chain}")
+        cdroms = ''.join(
+            f"<disk type='file' device='cdrom'>{image(source)}"
+            f"<target dev='{target}' bus='{bus}'/><readonly/></disk>"
+            for target, (device, bus, source) in
+            self.view('--inactive' in flags).items() if device == 'cdrom')
         return Result(stdout=(
             f"<domain type='kvm'><name>{VM}</name>"
             "<memory unit='KiB'>1048576</memory>"
             "<currentMemory unit='KiB'>1048576</currentMemory>"
             "<vcpu placement='static'>1</vcpu>"
             f"<os><type arch='x86_64' machine='{self.machine}'>hvm</type></os>"
-            "<devices><memballoon model='virtio'/></devices></domain>"))
+            f"<devices>{cdroms}<memballoon model='virtio'/></devices>"
+            "</domain>"))
 
     def _domblkinfo(self, target, **_kwargs):
         return Result(stdout=(
@@ -247,6 +274,41 @@ class FakeDomain:
             device, bus, _old = self.live[target]
             self.live[target] = (device, bus, source)
         return Result(stdout='Successfully updated media.\n')
+
+    def qemu_img(self, command, *_args, **_kwargs):
+        """``qemu-img info --backing-chain`` of an overlay in
+        :attr:`overlays`."""
+        path = command.split()[-1].strip("'")
+        if path not in self.overlays:
+            return Result(code=1, stderr=f"Could not open '{path}'")
+        return Result(stdout=json.dumps([
+            {'filename': path, 'format': 'qcow2'},
+            {'filename': self.overlays[path], 'format': 'raw'}]))
+
+    def _update_device(self, xml_path, *flags, **_kwargs):
+        """libvirt's ``virDomainUpdateDeviceFlags`` for a cdrom: the drive is
+        looked up by target in each definition the scope reaches, and the
+        persistent one is saved only once the live change has worked."""
+        disk = ET.parse(xml_path).getroot()
+        target = disk.find('target').get('dev')
+        source = disk.find('source').get('file')
+        #: the driver type each update put the media behind
+        self.driver_types = getattr(self, 'driver_types', [])
+        self.driver_types.append(disk.find('driver').get('type'))
+        scope = self._scope(flags)
+        if 'config' in scope and self.persistent.get(
+                target, ('',))[0] != 'cdrom':
+            return _refused('update', xml_path, (
+                f'operation failed: target {target} doesn\'t exist.'))
+        if 'live' in scope and target not in self.live:
+            return _refused('update', xml_path, (
+                f"internal error: disk '{target}' not found"))
+        for definition in ((self.persistent,) if scope == {'config'}
+                           else (self.live,) if scope == {'live'}
+                           else (self.persistent, self.live)):
+            device, bus, _old = definition[target]
+            definition[target] = (device, bus, source)
+        return Result(stdout='Device updated successfully\n\n')
 
     def _shutdown(self, **_kwargs):
         self.state = 'shut off'
@@ -554,7 +616,7 @@ class TestAPendingRemovalIsRedeclared:
 class TestMediaChanges:
 
     def test_a_running_vm_gets_it_live_and_in_the_config(self, isos):
-        """Unchanged: change-media --live --config."""
+        """update-device --live --config, the ISO behind a raw driver."""
         domain = FakeDomain(cdroms={'sda': None, 'sdb': isos['tools']})
 
         diff, ok = _reconcile(
@@ -563,8 +625,9 @@ class TestMediaChanges:
         assert diff['changed_cdroms'] == [{'target': 'sdb',
                                            'source': isos['data']}]
         assert ok is True
-        [change] = domain.calls_of('change-media')
+        [change] = domain.calls_of('update-device')
         assert _flags(change) == {'--live', '--config'}
+        assert domain.driver_types == ['raw']
         assert domain.cdroms()['sdb'] == domain.cdroms(inactive=True)['sdb'] \
             == isos['data']
 
@@ -600,7 +663,7 @@ class TestMediaChanges:
 
         assert [c['target'] for c in diff['changed_cdroms']] == ['sdb']
         assert ok is True
-        [change] = domain.calls_of('change-media')
+        [change] = domain.calls_of('update-device')
         assert _flags(change) == {'--config'}
         assert domain.cdroms(inactive=True)['sdb'] == isos['data']
         assert 'sdb' not in domain.cdroms()
@@ -613,9 +676,67 @@ class TestMediaChanges:
             domain, [{'name': 'data', 'source': isos['data'], 'target': 'sdb'}])
 
         assert ok is True
-        [change] = domain.calls_of('change-media')
+        [change] = domain.calls_of('update-device')
         assert _flags(change) == {'--config'}
         assert domain.cdroms(inactive=True)['sdb'] == isos['data']
+
+
+# ---------------------------------------------------------------------------
+# A drive a snapshot revert left on an overlay of its ISO (#273)
+# ---------------------------------------------------------------------------
+
+class TestADriveOnAnOverlayOfItsIso:
+    """A snapshot revert leaves each CDROM on a qcow2 overlay of its ISO,
+    ``<ISO stem>.<epoch>`` beside it, in both definitions. Compared by that
+    file, the drive holding the declared ISO was one to remove and the ISO
+    one to attach anew; it is compared by the image it reads."""
+
+    @staticmethod
+    def _on_an_overlay(isos, state='running') -> tuple[FakeDomain, str]:
+        overlay = os.path.splitext(isos['tools'])[0] + '.1793626526'
+        domain = FakeDomain(state=state,
+                            cdroms={'sda': None, 'sdb': overlay})
+        domain.overlays[overlay] = isos['tools']
+        return domain, overlay
+
+    def _diff(self, domain, desired):
+        with patch.object(LibVirtCommandBase, 'execute_shell',
+                          side_effect=domain.qemu_img):
+            return _diff(domain, desired)
+
+    @pytest.mark.parametrize('declared', ['explicit', 'targetless'])
+    @pytest.mark.parametrize('state', ['running', 'shut off'])
+    def test_it_holds_the_declared_iso(self, isos, declared, state):
+        domain, _overlay = self._on_an_overlay(isos, state)
+        entry = {'name': 'tools', 'source': isos['tools']}
+        if declared == 'explicit':
+            entry['target'] = 'sdb'
+
+        diff = self._diff(domain, [entry])
+
+        assert diff['new_cdroms'] == []
+        assert diff['removed_cdroms'] == []
+        assert diff['changed_cdroms'] == []
+        assert diff['cdroms_pending_targets'] == []
+
+    def test_other_media_than_declared_is_still_a_change(self, isos):
+        domain, _overlay = self._on_an_overlay(isos)
+
+        diff = self._diff(domain, [{'name': 'data', 'source': isos['data'],
+                                    'target': 'sdb'}])
+
+        assert diff['changed_cdroms'] == [{'target': 'sdb',
+                                           'source': isos['data']}]
+
+    def test_the_change_puts_the_new_iso_behind_a_raw_driver(self, isos):
+        """change-media kept the overlay's type='qcow2' on the raw ISO."""
+        domain, _overlay = self._on_an_overlay(isos, state='shut off')
+
+        assert _apply(domain, changed=[{'target': 'sdb',
+                                        'source': isos['data']}]) is True
+
+        assert domain.cdroms(inactive=True)['sdb'] == isos['data']
+        assert domain.driver_types == ['raw']
 
 
 # ---------------------------------------------------------------------------
