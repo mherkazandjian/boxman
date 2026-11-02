@@ -88,20 +88,23 @@ class SnapshotManager:
 
         A revert builds the overlay of a disk beside the disk's source and
         names it after it, its last suffix dropped: ``<ISO stem>.<epoch>``,
-        qcow2 (``virDomainSnapshotDefAssignExternalNames``). Over an overlay
+        qcow2 (``virDomainSnapshotDefAssignExternalNames``; the snapshot
+        definition's name is the revert's creation time). Over an overlay
         it builds the next one beside that, under the same stem, so a stack
-        of them keeps the name. Anything else under a CDROM is not boxman's
-        to take apart.
+        of them keeps the name. Anything else under a CDROM — a
+        ``<stem>.patched`` of the user's beside the ISO, say — is not
+        boxman's to take apart.
         """
         iso, fmt = layers[-1]
         if fmt != "raw":
             return f"{iso}, at the bottom of its chain, is not a raw image"
         directory = os.path.dirname(iso)
-        stem = os.path.splitext(os.path.basename(iso))[0] + "."
+        named = re.compile(
+            re.escape(os.path.splitext(os.path.basename(iso))[0]) + r"\.[0-9]+")
         for path, layer_format in layers[:-1]:
             if (layer_format != "qcow2" or path == iso
                     or os.path.dirname(path) != directory
-                    or not os.path.basename(path).startswith(stem)):
+                    or not named.fullmatch(os.path.basename(path))):
                 return f"{path} is not an overlay libvirt made of {iso}"
         return None
 
@@ -209,18 +212,22 @@ class SnapshotManager:
     def _retarget_snapshot_xml(xml_text: str,
                                retired: dict[str, str]) -> str | None:
         """
-        *xml_text*, a snapshot's XML, no longer naming the overlays of
-        *retired* — ``{overlay: the ISO under it}`` — or ``None`` when it
-        names none of them.
+        *xml_text*, a snapshot's XML, recording no overlay of a CDROM and
+        no longer naming the overlays of *retired* — ``{overlay: the ISO
+        under it}`` — or ``None`` when there is nothing to change.
 
-        A disk it records one of them as its external overlay of — under
-        ``<disks>``, or ``<revertDisks>``, where a revert to a snapshot with
-        children records them — becomes ``snapshot='no'``, as a take records
-        a CDROM. A CDROM of its saved definitions (``<domain>``,
-        ``<inactiveDomain>``) on one reads that ISO instead
-        (:func:`media_disk_xml`), and no revert to the snapshot builds on
-        the overlay again: neither the source nor the format of a disk is
-        part of the ABI a revert checks the memory image against.
+        A disk it records an external overlay of — under ``<disks>``, or
+        ``<revertDisks>``, where a revert to a snapshot with children
+        records them — becomes ``snapshot='no'``, as a take records a CDROM,
+        when that is one of *retired* or the disk is a CDROM of its saved
+        definitions. libvirt's own delete of a snapshot block-commits each
+        overlay it records into the image under it, a CDROM's into the ISO;
+        a CDROM overlay holds nothing, so no record of one is needed. A
+        CDROM of its saved definitions (``<domain>``, ``<inactiveDomain>``)
+        on one of *retired* reads that ISO instead (:func:`media_disk_xml`),
+        and no revert to the snapshot builds on the overlay again: neither
+        the source nor the format of a disk is part of the ABI a revert
+        checks the memory image against.
 
         Only those elements change, as text, and everything else goes back
         to libvirt as it gave it: an ElementTree round trip renames the
@@ -237,11 +244,17 @@ class SnapshotManager:
         except ET.ParseError as exc:
             raise ValueError(f"it does not parse ({exc})") from exc
         section_of = {}
+        cdroms = set()
         for section in root:
             if section.tag in ("disks", "revertDisks", "domain",
                                "inactiveDomain"):
                 for disk in section.iter("disk"):
                     section_of[id(disk)] = section.tag
+            if section.tag in ("domain", "inactiveDomain"):
+                cdroms.update(
+                    target.get("dev") for disk in section.iter("disk")
+                    if disk.get("device") == "cdrom"
+                    and (target := disk.find("target")) is not None)
         elements = list(root.iter("disk"))
         matches = list(_DISK_ELEMENT.finditer(xml_text))
         if len(matches) != len(elements):
@@ -259,16 +272,15 @@ class SnapshotManager:
                                  "order they parse")
             source = written.find("source")
             path = source.get("file") if source is not None else None
-            if path not in retired:
-                continue
             section = section_of.get(id(element))
             if (section in ("disks", "revertDisks")
-                    and written.get("snapshot") == "external"):
+                    and written.get("snapshot") == "external"
+                    and (path in retired or written.get("name") in cdroms)):
                 text = ET.tostring(ET.Element("disk", {
                     "name": written.get("name", ""), "snapshot": "no"}),
                     encoding="unicode")
             elif (section in ("domain", "inactiveDomain")
-                    and written.get("device") == "cdrom"):
+                    and written.get("device") == "cdrom" and path in retired):
                 text = media_disk_xml(written, retired[path])
             else:
                 continue
@@ -306,6 +318,61 @@ class SnapshotManager:
                 pass
         return bool(result.ok), (result.stderr or "").strip()
 
+    @classmethod
+    def _names_a_cdrom_overlay(cls, xml_text: str) -> bool:
+        """
+        Whether a snapshot's XML records an external overlay of a CDROM of
+        its saved definitions — what libvirt's own delete of it commits
+        into the ISO. One that does not parse is taken to.
+        """
+        try:
+            return cls._retarget_snapshot_xml(xml_text, {}) is not None
+        except ValueError:
+            return True
+
+    def _unrecord_cdrom_overlays(self, vm_name: str, snapshots: dict[str, str],
+                                 retired: dict[str, str]) -> set[str]:
+        """
+        Redefine each of *snapshots* — ``{name: XML}`` of *vm_name* — that
+        records an overlay of a CDROM or names one of *retired*, without it
+        (:meth:`_retarget_snapshot_xml`); the names of those that could not
+        be, and still record one.
+        """
+        left: set[str] = set()
+        for name, xml in snapshots.items():
+            try:
+                new_xml = self._retarget_snapshot_xml(xml, retired)
+            except ValueError as exc:
+                self.logger.warning(
+                    f"{vm_name}: snapshot '{name}' could not be edited "
+                    f"({exc}), so the CDROM overlays it names are kept")
+                left.add(name)
+                continue
+            if new_xml is None:
+                continue
+            ok, error = self._redefine_snapshot(vm_name, new_xml)
+            if ok:
+                self.logger.info(
+                    f"{vm_name}: snapshot '{name}' names its CDROMs' ISOs "
+                    f"again, not overlays of them")
+            else:
+                self.logger.warning(
+                    f"{vm_name}: snapshot '{name}' could not be redefined "
+                    f"({error}), so the CDROM overlays it names are kept")
+                left.add(name)
+        return left
+
+    def _has_managed_save(self, vm_name: str) -> bool | None:
+        """
+        Whether *vm_name* holds managed saved state (``boxman down`` saves
+        it that way), asked by name; ``None`` when that cannot be told.
+        """
+        listed = self.virsh.execute("list", "--all", "--with-managed-save",
+                                    "--name", warn=True)
+        if not listed.ok:
+            return None
+        return vm_name in listed.stdout.split('\n')
+
     def _pause_for_media(self, vm_name: str) -> bool | None:
         """
         Pause *vm_name* if it is running, for a media change. The tray may
@@ -341,35 +408,75 @@ class SnapshotManager:
                 f"resume {vm_name}")
 
     def _switch_cdrom_media(self, vm_name: str, cdroms: CDROMManager,
-                            disk: ET.Element, iso: str, scope: list[str],
-                            alias: str | None) -> tuple[bool, str]:
+                            target: str, disk: ET.Element, iso: str,
+                            scope: list[str],
+                            alias: str | None) -> tuple[bool, str, bool]:
         """
-        ``virsh update-device`` of the CDROM *disk* holding *iso* as a raw
-        image (:func:`media_disk_xml`), in *scope*; ``(ok, stderr)``.
+        ``virsh update-device`` of the CDROM *disk* (*target*) holding *iso*
+        as a raw image (:func:`media_disk_xml`), in *scope*; ``(ok, stderr,
+        whether the drive may have been left empty)``.
 
         Live, by force and with the guest paused (:meth:`_pause_for_media`).
         libvirt opens the tray before it takes a medium out — except on a
         domain a revert started, which it does not know has a tray, and qemu
         then refuses: "Tray of device 'sata0-0-0' is not open"
         (:meth:`CDROMManager.move_tray`). The tray is opened through QMP
-        then, by the drive's *alias*, and closed again if the change still
-        fails.
+        then, by the drive's *alias*, and the change made again.
+
+        libvirt takes the old medium out before it puts the new one in, so
+        a change that fails past that leaves the drive empty. What qemu
+        holds is asked then (:meth:`CDROMManager.medium_in`): an empty
+        drive gets one more try at the ISO, and is reported as empty if
+        that fails too, its tray left open for a manual insert; a tray this
+        opened over a medium still in is closed again — whatever raised.
         """
         xml = media_disk_xml(disk, iso)
         if "--live" not in scope:
-            return cdroms.update_media(xml, scope)
+            ok, error = cdroms.update_media(xml, scope)
+            return ok, error, False
         paused = self._pause_for_media(vm_name)
         if paused is None:
-            return False, "the guest could not be paused for the change"
+            return False, "the guest could not be paused for the change", False
+        flags = [*scope, "--force"]
+        opened = ok = empty = False
         try:
-            ok, error = cdroms.update_media(xml, [*scope, "--force"])
-            if not ok and "is not open" in error and alias:
-                if cdroms.move_tray(alias, open_it=True):
-                    ok, error = cdroms.update_media(xml, [*scope, "--force"])
-                    if not ok:
-                        cdroms.move_tray(alias, open_it=False)
-            return ok, error
+            ok, error = cdroms.update_media(xml, flags)
+            if ok or "is not open" not in error or not alias:
+                return ok, error, False
+            opened = cdroms.move_tray(alias, open_it=True)
+            if not opened:
+                return (False, f"{error}; nor could its tray be opened "
+                               f"through QMP", False)
+            ok, error = cdroms.update_media(xml, flags)
+            if ok:
+                return True, "", False
+            held = cdroms.medium_in(alias)
+            if held is not None and held[0] is not None:
+                return False, error, False
+            ok, again = cdroms.update_media(xml, flags)
+            if ok:
+                return True, "", False
+            empty = True
+            return (False,
+                    f"{error}; the drive may be left EMPTY, libvirt having "
+                    f"taken the medium out before it failed, and putting "
+                    f"{iso} in again failed too ({again}). Its tray is left "
+                    f"open. A power cycle of the VM gives it media again "
+                    f"from its persistent definition, and so does another "
+                    f"restore", True)
         finally:
+            if opened and not ok and not empty:
+                try:
+                    closed = cdroms.move_tray(alias, open_it=False)
+                except Exception:
+                    closed = False
+                if closed:
+                    self.logger.info(f"{vm_name}: closed the tray of CDROM "
+                                     f"{target} again")
+                else:
+                    self.logger.error(
+                        f"{vm_name}: the tray of CDROM {target} was opened "
+                        f"for the change and could not be closed again")
             if paused:
                 self._resume_after_media(vm_name)
 
@@ -394,10 +501,16 @@ class SnapshotManager:
         alias_elem = live["disk"].find("alias") if live else None
         alias = alias_elem.get("name") if alias_elem is not None else None
         for entry, scope in steps:
-            ok, error = self._switch_cdrom_media(
-                vm_name, cdroms, entry["disk"], entry["iso"], scope, alias)
+            ok, error, empty = self._switch_cdrom_media(
+                vm_name, cdroms, target, entry["disk"], entry["iso"], scope,
+                alias)
             where = " and ".join("live" if s == "--live" else "persistent"
                                  for s in scope)
+            if empty:
+                self.logger.error(
+                    f"{vm_name}: CDROM {target} could not be put back on "
+                    f"{entry['iso']}: {error}")
+                return False
             if not ok:
                 self.logger.warning(
                     f"{vm_name}: CDROM {target} is left on "
@@ -408,31 +521,6 @@ class SnapshotManager:
                 f"{vm_name}: CDROM {target} reads {entry['iso']} again, not "
                 f"an overlay of it ({where})")
         return True
-
-    def _overlays_also(self, cdroms: CDROMManager, also, isos: set,
-                       taken: set) -> list[tuple[list[str], str]]:
-        """
-        The chains — ``(overlays top first, the ISO under them)`` — of the
-        files of *also* that are overlays libvirt made of one of *isos*,
-        beside it, and that :meth:`_cdroms_on_overlays` did not find under
-        a CDROM (*taken*). Their names are looked at before anything is
-        read: an overlay of a data disk is passed over unread.
-        """
-        chains = []
-        for path in dict.fromkeys(also):
-            if path in taken or not os.path.lexists(path):
-                continue
-            if not any(os.path.dirname(path) == os.path.dirname(iso)
-                       and os.path.basename(path).startswith(
-                           os.path.splitext(os.path.basename(iso))[0] + ".")
-                       for iso in isos):
-                continue
-            layers = cdroms.image_layers(path)
-            if (not layers or len(layers) < 2 or layers[-1][0] not in isos
-                    or self._why_not_iso_overlays(layers)):
-                continue
-            chains.append(([p for p, _f in layers[:-1]], layers[-1][0]))
-        return chains
 
     @staticmethod
     def _why_keep_overlay(layer: str, iso: str, named: set,
@@ -575,8 +663,9 @@ class SnapshotManager:
            the ISO at the bottom of its chain again, in its live and
            persistent definition when *vm_name* is active, in the persistent
            one alone when it is not (:meth:`_put_cdrom_back`);
-        2. no snapshot of *vm_name* names those overlays any more
-           (:meth:`_retarget_snapshot_xml`). libvirt's own delete of a
+        2. no snapshot of *vm_name* names those overlays any more, nor
+           records any overlay of a CDROM (:meth:`_retarget_snapshot_xml`),
+           whatever step 1 managed. libvirt's own delete of a
            snapshot block-commits each overlay it records into the image
            under it: left recording a CDROM's, the delete opens the ISO
            read-write and commits into it — failing on the write lock while
@@ -587,10 +676,16 @@ class SnapshotManager:
         3. each one nothing needs any more is removed, top first
            (:meth:`_remove_iso_overlays`).
 
-        *also* names more files to judge in step 3, the CDROM overlays the
-        backup left to the revert (:meth:`_cdrom_overlays_a_revert_discards`):
-        one is taken only when it is an overlay libvirt made, beside it, of
-        an ISO a CDROM of *vm_name* reads.
+        *also* holds more chains — ``(overlays top first, the ISO under
+        them)`` — the CDROM overlays the backup left to the revert
+        (:meth:`_cdrom_overlays_a_revert_discards`), told before it. The
+        revert deleted those the current snapshot recorded, and left every
+        other record of them: none may name them afterwards, gone or not,
+        and those still there go in step 3.
+
+        A VM holding managed saved state is left alone: its next start
+        restores the definition saved with it, which names whatever its
+        CDROMs were on.
 
         Nothing is done without *paths_in_use*
         (``LibVirtSession.disk_paths_in_use``): moved off overlays that are
@@ -606,25 +701,37 @@ class SnapshotManager:
             return
         cdroms = CDROMManager(vm_name, provider_config=self.provider_config)
         active = self._domain_is_active(vm_name)
-        found = (None if active is None
-                 else self._cdroms_on_overlays(vm_name, cdroms, active))
+        saved = self._has_managed_save(vm_name) if active is False else False
+        if active is None or saved is None:
+            self.logger.warning(
+                f"{vm_name}: whether it runs, or holds saved state, cannot be "
+                f"told, so its CDROMs are left as they are")
+            return
+        if saved:
+            self.logger.warning(
+                f"{vm_name} holds managed saved state, whose next start "
+                f"restores the definition saved with it, so its CDROMs are "
+                f"left as they are")
+            return
+        found = self._cdroms_on_overlays(vm_name, cdroms, active)
         if found is None:
             self.logger.warning(
                 f"{vm_name}: its CDROMs could not be read, so one left on an "
                 f"overlay of its ISO stays there")
             return
-        entries, isos = found
+        entries, _isos = found
         taken = {layer for entry in entries for layer in entry["layers"]}
-        chains = self._overlays_also(cdroms, also, isos, taken)
-        if not entries and not chains:
-            return
+        chains = [([layer for layer in layers if layer not in taken], iso)
+                  for layers, iso in also]
+        chains = [(layers, iso) for layers, iso in chains if layers]
         snapshots = self._snapshot_xmls(vm_name)
         if snapshots is None:
             overlays = sorted(taken | {layer for layers, _iso in chains
                                        for layer in layers})
             self.logger.warning(
                 f"{vm_name}: its snapshots could not be read, so its CDROMs "
-                f"are left on {', '.join(overlays)}")
+                f"are left as they are"
+                + (f", on {', '.join(overlays)}" if overlays else ""))
             return
 
         groups: dict[str, list[dict]] = {}
@@ -634,45 +741,29 @@ class SnapshotManager:
             if self._put_cdrom_back(vm_name, cdroms, target, group):
                 chains.extend((entry["layers"], entry["iso"])
                               for entry in group)
-        if not chains:
-            return
 
         retired = {layer: iso for layers, iso in chains for layer in layers}
-        for name, xml in snapshots.items():
-            try:
-                new_xml = self._retarget_snapshot_xml(xml, retired)
-            except ValueError as exc:
-                self.logger.warning(
-                    f"{vm_name}: snapshot '{name}' could not be edited "
-                    f"({exc}), so the CDROM overlays it names are kept")
-                continue
-            if new_xml is None:
-                continue
-            ok, error = self._redefine_snapshot(vm_name, new_xml)
-            if ok:
-                self.logger.info(
-                    f"{vm_name}: snapshot '{name}' names its CDROMs' ISOs "
-                    f"again, not overlays of them")
-            else:
-                self.logger.warning(
-                    f"{vm_name}: snapshot '{name}' could not be redefined "
-                    f"({error}), so the CDROM overlays it names are kept")
-        self._remove_iso_overlays(vm_name, chains, paths_in_use)
+        self._unrecord_cdrom_overlays(vm_name, snapshots, retired)
+        if chains:
+            self._remove_iso_overlays(vm_name, chains, paths_in_use)
 
-    def _cdrom_overlays_a_revert_discards(self, vm_name: str,
-                                          paths_in_use=None) -> list[str]:
+    def _cdrom_overlays_a_revert_discards(
+            self, vm_name: str,
+            paths_in_use=None) -> list[tuple[list[str], str]]:
         """
         The overlays *vm_name*'s CDROMs are on that the overlay backup need
-        not keep, before a revert: no snapshot of it saves a CDROM on one,
-        so no revert opens it, and no other domain uses one.
+        not keep, before a revert, as chains — ``(overlays top first, the
+        ISO under them)``: no snapshot of it saves a CDROM on one, so no
+        revert opens it, and no other domain uses one.
 
         One a snapshot records as its overlay of a CDROM is at risk like any
         other (:meth:`_preserve_snapshot_overlays`). But it holds nothing —
         a guest cannot write to a CDROM — and copying it means writing
         beside the ISO, in a directory that may not be boxman's (#273). The
-        revert deletes it when the current snapshot records it, and
-        :meth:`_put_cdroms_back_on_their_isos` removes it afterwards when
-        not.
+        revert deletes it when the current snapshot records it — and leaves
+        every other record of it — and :meth:`_put_cdroms_back_on_their_isos`
+        takes them over afterwards: it rewrites the records, gone or not,
+        and removes what is still there.
 
         Empty when any of that cannot be told: then everything at risk is
         backed up, as before.
@@ -685,8 +776,6 @@ class SnapshotManager:
             vm_name, cdroms, active, quiet=True))
         if not found or not found[0]:
             return []
-        layers = list(dict.fromkeys(layer for entry in found[0]
-                                    for layer in entry["layers"]))
         snapshots = self._snapshot_xmls(vm_name)
         if snapshots is None:
             return []
@@ -703,20 +792,25 @@ class SnapshotManager:
         in_use = paths_in_use()
         if in_use is None:
             return []
-        discard = []
-        for layer in layers:
+        def unneeded(layer: str) -> bool:
             if layer in opened or os.path.realpath(layer) in opened:
-                continue
+                return False
             try:
                 info = os.stat(layer)
             except OSError:
-                continue
+                return False
             users = {in_use.get(layer), in_use.get(os.path.realpath(layer)),
                      getattr(in_use, "identities", {}).get(
                          (info.st_dev, info.st_ino))} - {None, vm_name}
-            if not users:
-                discard.append(layer)
-        return discard
+            return not users
+
+        chains: dict[tuple, str] = {}
+        for entry in found[0]:
+            layers = tuple(layer for layer in entry["layers"]
+                           if unneeded(layer))
+            if layers:
+                chains[layers] = entry["iso"]
+        return [(list(layers), iso) for layers, iso in chains.items()]
 
     def _cdrom_diskspec_args(self, vm_name: str) -> list[str]:
         """
@@ -959,6 +1053,19 @@ class SnapshotManager:
                     f"snapshot of the shut-off VM")
                 return False
             with_memory = state == 'active'
+            # Every CDROM back on its ISO first (#273): the saved memory and
+            # definition name whatever the CDROMs are on, and a revert to
+            # the snapshot would stack its next overlay on one -- and before
+            # --force deletes the snapshot it replaces, whose record of a
+            # CDROM overlay libvirt's delete would commit into the ISO.
+            # Housekeeping: it never stops the take.
+            try:
+                self._flatten_cdrom_overlays(vm_name,
+                                             paths_in_use=paths_in_use)
+            except Exception as exc:
+                self.logger.warning(
+                    f"{vm_name}: its CDROMs could not be put back on their "
+                    f"ISOs before the take ({type(exc).__name__}: {exc})")
             if force and not self._force_clear_for_retake(
                     vm_name, vm_dir, snapshot_name,
                     paths_in_use=paths_in_use, recorded_in_use=recorded_in_use,
@@ -990,12 +1097,6 @@ class SnapshotManager:
                 vm_name, snapshot_name, disk_dir)
             if overlay_args is None:
                 return False
-            # Before saving memory state, ensure cdroms point directly at
-            # their raw ISO backing files (not qcow2 overlays of them).
-            # This prevents snapshot-revert from failing with
-            # "Image is not in qcow2 format" when QEMU validates the chain.
-            self._flatten_cdrom_overlays(vm_name, paths_in_use=paths_in_use)
-
             # Exclude cdroms from the snapshot so no new qcow2 overlay is
             # created for them (they stay at the raw ISO after this call).
             cdrom_args = self._cdrom_diskspec_args(vm_name)
@@ -2849,7 +2950,8 @@ class SnapshotManager:
         paused = self._pause_for_backup(vm_name)
         try:
             preserved = self._preserve_snapshot_overlays(
-                vm_name, snapshot_name, skip=discarded)
+                vm_name, snapshot_name,
+                skip=[layer for layers, _iso in discarded for layer in layers])
         except Exception:
             self._resume_after_backup(vm_name, paused)
             raise
@@ -2979,12 +3081,40 @@ class SnapshotManager:
         - **Non-current external snapshot**: refused with a clear
           pointer to ``boxman snapshot collapse --to <name>``; rebasing
           a middle layer while preserving both ends is out of v1 scope.
+
+        First, no snapshot of the VM may record an overlay of a CDROM
+        (:meth:`_unrecord_cdrom_overlays`): libvirt's own delete would
+        commit it into the ISO (#273). One whose record cannot be rewritten
+        is not deleted.
         """
         info = self.virsh.execute("snapshot-info", vm_name, snapshot_name, warn=True)
         if not info.ok:
             self.logger.error(
                 f"snapshot '{snapshot_name}' not found on vm {vm_name}: "
                 f"{info.stderr.strip()}")
+            return False
+
+        # libvirt's own delete block-commits each overlay a snapshot records
+        # into the image under it -- a CDROM's into its ISO, opened
+        # read-write, shared by every VM booted from it (#273). A revert
+        # records a CDROM overlay in the reverted-to snapshot; one restored
+        # before that was undone, or where undoing it failed, still does.
+        # No record of one is needed: a CDROM overlay holds nothing.
+        snapshots = self._snapshot_xmls(vm_name)
+        if snapshots is None:
+            self.logger.error(
+                f"cannot delete snapshot '{snapshot_name}' of {vm_name}: its "
+                f"snapshots could not be read, to make sure none records an "
+                f"overlay of a CDROM, which libvirt's delete would commit "
+                f"into the ISO")
+            return False
+        left = self._unrecord_cdrom_overlays(vm_name, snapshots, {})
+        if snapshot_name in left:
+            self.logger.error(
+                f"cannot delete snapshot '{snapshot_name}' of {vm_name}: it "
+                f"records an overlay of a CDROM, which libvirt's delete would "
+                f"commit into the ISO, and that record could not be "
+                f"rewritten")
             return False
 
         # Try the native delete first — works for internal snapshots.

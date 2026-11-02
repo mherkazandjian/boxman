@@ -3440,7 +3440,10 @@ class _RevertingLibvirt:
       reads (``qemuSnapshotDeleteExternalPrepare``) -- and fails "failed to
       find parent disk source in backing chain" for one the domain no
       longer reads. With :attr:`native_delete` off it refuses external
-      snapshots, as libvirt before 9.0 did, and ``blockcommit`` is run.
+      snapshots, as libvirt before 9.0 did, and ``blockcommit`` is run;
+    * QMP ``query-block`` tells what qemu holds in the drive
+      (:attr:`medium`): a live change that fails with the tray open takes
+      the medium out first when :attr:`fail_after_removal` says so.
 
     Its files are real, under *root*; their chains are in :attr:`backing`,
     which ``qemu-img`` (:meth:`qemu_img`) reads.
@@ -3482,6 +3485,10 @@ class _RevertingLibvirt:
         #: (target, the overlay, the image it was committed into)
         self.commits: list[tuple] = []
         self.native_delete = True
+        #: what qemu holds in sda, None for an empty drive
+        self.medium: str | None = self.iso
+        self.fail_after_removal = None
+        self.managed_save = False
 
     # --- what boxman did before -------------------------------------------
 
@@ -3583,6 +3590,9 @@ class _RevertingLibvirt:
     def __call__(self, *args, **_kw):
         self.calls.append(args)
         verb = args[0]
+        if verb == "list" and "--with-managed-save" in args:
+            return _result(stdout=f"{self.VM}\n\n" if self.managed_save
+                           else "\n")
         if verb == "list":
             running = self.active and ("--state-running" not in args
                                        or not self.paused)
@@ -3623,6 +3633,14 @@ class _RevertingLibvirt:
         if verb == "blockcommit":
             self._commit(args[2], self.live[args[2]])
             return _result()
+        if verb == "snapshot-create-as":
+            self.take(args[args.index("--name") + 1])
+            return _result()
+        if verb == "qemu-monitor-command" and "query-block" in args[2]:
+            inserted = {"inserted": {"file": self.medium}} if self.medium else {}
+            return _result(stdout=json.dumps({"return": [
+                {"device": "", "qdev": "sata0-0-0",
+                 "tray_open": self.tray_open, **inserted}]}))
         if verb == "qemu-monitor-command":
             command = json.loads(args[2])
             assert command["arguments"]["id"] == "sata0-0-0"
@@ -3650,6 +3668,7 @@ class _RevertingLibvirt:
         else:
             snap["disks"] = dict(made)
         self.live, self.config = dict(made), dict(made)
+        self.medium = made.get("sda")
         self.current = name
         self.active, self.paused = True, False
         self.tray_known, self.tray_open = False, False
@@ -3717,11 +3736,15 @@ class _RevertingLibvirt:
                     "internal error: unable to execute QEMU command "
                     "'blockdev-remove-medium': Tray of device 'sata0-0-0' "
                     "is not open"))
+            if self.tray_open and self.fail_after_removal:
+                self.medium = None
+                return _result(ok=False, stderr=self.fail_after_removal)
             if driver != self.backing[source][0]:
                 return _result(ok=False, stderr=(
                     "error: internal error: unable to execute QEMU command "
                     "'blockdev-add': Image is not in qcow2 format"))
             self.live[target] = source
+            self.medium = source
             self.tray_open = False
         if "--config" in flags:
             self.config[target] = source
@@ -3819,25 +3842,81 @@ class TestARestorePutsTheCdromBackOnItsIso:
             "update-device", "resume"]
         assert vm.paused is False and vm.tray_open is False
 
-    def test_a_change_that_still_fails_closes_the_tray_again(self, sm, vm):
+    @staticmethod
+    def _switching_after_a_revert(sm, vm, update):
+        """Switch sda of a domain a revert started, with update-device
+        answered by *update* (the double's own, wrapped)."""
         execute, shell = _restoring(sm, vm)
         with execute, shell:
             vm._revert("s1")
             cdroms = CDROMManager(vm.VM, provider_config=sm.provider_config)
             disk = cdroms.cdrom_elements()["sda"]
-            refuses_a_closed_tray = vm._update
+            vm._update = update(vm._update)
+            return sm._switch_cdrom_media(
+                vm.VM, cdroms, "sda", disk, vm.iso, ["--live"], "sata0-0-0")
 
-            def refuses_an_open_one_too(disk, flags):
+    def test_a_change_that_still_fails_closes_the_tray_again(self, sm, vm):
+        """The medium is still in: the tray this opened is closed over it."""
+        def refusing_an_open_tray_too(update):
+            def refuse(disk, flags):
                 if vm.tray_open:
                     return _result(ok=False, stderr="error: Permission denied")
-                return refuses_a_closed_tray(disk, flags)
-            vm._update = refuses_an_open_one_too
-            ok, error = sm._switch_cdrom_media(
-                vm.VM, cdroms, disk, vm.iso, ["--live"], "sata0-0-0")
+                return update(disk, flags)
+            return refuse
 
-        assert ok is False and "Permission denied" in error
+        ok, error, empty = self._switching_after_a_revert(
+            sm, vm, refusing_an_open_tray_too)
+
+        assert ok is False and empty is False and "Permission denied" in error
         assert vm.tray_open is False and vm.paused is False
-        assert vm.live["sda"] != vm.iso
+        assert vm.medium == vm.live["sda"] != vm.iso
+
+    def test_one_that_fails_with_the_medium_out_tries_the_iso_again(
+            self, sm, vm):
+        """libvirt takes the old medium out before it puts the new one in."""
+        vm.fail_after_removal = "error: 'blockdev-add' failed"
+        tries = []
+
+        def once(update):
+            def fail_once(disk, flags):
+                tries.append(vm.tray_open)
+                if len(tries) == 3:
+                    vm.fail_after_removal = None
+                return update(disk, flags)
+            return fail_once
+
+        ok, error, empty = self._switching_after_a_revert(sm, vm, once)
+
+        # refused shut, refused open after taking the medium out, then in
+        assert tries == [False, True, True]
+        assert (ok, error, empty) == (True, "", False)
+        assert vm.medium == vm.live["sda"] == vm.iso
+
+    def test_a_drive_left_empty_is_said_to_be(self, sm, vm):
+        vm.fail_after_removal = "error: 'blockdev-add' failed"
+
+        ok, error, empty = self._switching_after_a_revert(
+            sm, vm, lambda update: update)
+
+        assert ok is False and empty is True
+        assert "EMPTY" in error and "power cycle" in error
+        assert vm.medium is None
+        # left open, for the medium to go back in
+        assert vm.tray_open is True and vm.paused is False
+
+    def test_a_change_that_raises_still_closes_the_tray_and_resumes(
+            self, sm, vm):
+        def raising_when_open(update):
+            def change(disk, flags):
+                if vm.tray_open:
+                    raise OSError("no space left for the temporary file")
+                return update(disk, flags)
+            return change
+
+        with pytest.raises(OSError):
+            self._switching_after_a_revert(sm, vm, raising_when_open)
+
+        assert vm.tray_open is False and vm.paused is False
 
     def test_a_stopped_vm_has_its_persistent_definition_switched_alone(
             self, sm, vm):
@@ -3917,16 +3996,85 @@ class TestARestorePutsTheCdromBackOnItsIso:
         assert not os.path.exists(old)
         assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
 
-    def test_a_switch_that_fails_leaves_the_records_and_the_overlay(
+    def test_a_switch_that_fails_leaves_the_overlay_but_no_record_of_it(
             self, sm, vm):
+        """No record of a CDROM overlay is needed, and libvirt's delete
+        commits the one a record names into the ISO."""
         vm.fail_update = "error: Failed to update device"
 
         assert _restore(sm, vm, "s1") is True
 
         overlay = vm.live["sda"]
         assert overlay != vm.iso and os.path.exists(overlay)
-        assert vm.snapshots["s1"]["revert_disks"]["sda"] == overlay
-        assert vm.redefined == []
+        assert vm.snapshots["s1"]["revert_disks"]["sda"] is None
+
+    def test_after_a_switch_that_failed_another_restore_leaves_it_valid(
+            self, sm, vm):
+        """The backup leaves the overlay the CDROM is on to the revert,
+        which deletes it and keeps the record that names it."""
+        vm.fail_update = "error: Failed to update device"
+        assert _restore(sm, vm, "s2") is True
+        vm.fail_update = None
+
+        assert _restore(sm, vm, "s1") is True
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            assert sm.validate_snapshot(vm.VM, "s2") == (True, [])
+        assert vm.snapshots["s2"]["disks"]["sda"] is None
+        assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
+
+    def test_a_restore_after_one_made_before_this_fix_leaves_every_snapshot_valid(
+            self, sm, vm):
+        """take s1, take s2, restore s1, restore s2 without #273: s2
+        records the CDROM's overlay. A restore of s1 now leaves it to the
+        revert, which deletes it and keeps s2's record of it -- and the
+        restore of s2 is then refused for an overlay missing."""
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            vm._revert("s1")
+            vm._revert("s2")
+        stale = vm.snapshots["s2"]["disks"]["sda"]
+        assert stale and os.path.exists(stale)
+
+        assert _restore(sm, vm, "s1") is True
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            assert sm.validate_snapshot(vm.VM, "s2") == (True, [])
+        assert not os.path.exists(stale)
+        assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
+        assert _restore(sm, vm, "s2") is True
+        assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
+
+    def test_a_file_beside_the_iso_libvirt_did_not_name_is_left_alone(
+            self, sm, vm):
+        """Only ``<stem>.<epoch>``, as libvirt names a revert's overlay:
+        a ``<stem>.patched`` of the user's is not boxman's."""
+        patched = str(vm.isodir / "nixos-minimal.patched")
+        Path(patched).write_bytes(b"the user's own overlay")
+        vm.backing[patched] = ("qcow2", vm.iso)
+        vm.live["sda"] = vm.config["sda"] = vm.medium = patched
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            sm._put_cdroms_back_on_their_isos(vm.VM, paths_in_use=vm.in_use)
+
+        assert vm.live["sda"] == vm.config["sda"] == patched
+        assert os.path.exists(patched) and vm.updates == []
+
+    def test_a_vm_holding_managed_saved_state_is_left_alone(self, sm, vm):
+        """Its next start restores the definition saved with it, which
+        names the overlay: switched and removed, that start would fail."""
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            vm._revert("s2")
+            vm.active, vm.managed_save = False, True
+            overlay = vm.config["sda"]
+            sm._put_cdroms_back_on_their_isos(vm.VM, paths_in_use=vm.in_use)
+
+        assert vm.config["sda"] == overlay and os.path.exists(overlay)
+        assert vm.updates == [] and vm.redefined == []
 
     def test_a_record_that_cannot_be_rewritten_keeps_the_overlay(
             self, sm, vm):
@@ -3977,6 +4125,111 @@ class TestNoDeleteCommitsIntoAnIso:
         assert Path(vm.iso).read_bytes() == b"the ISO"
 
 
+class TestNoRecordOfACdromOverlayReachesADelete:
+    """A VM restored before #273, or where undoing a revert failed, keeps a
+    snapshot that records its CDROM's overlay. libvirt's own delete of it
+    -- ``snapshot delete``, and ``take --force``, which deletes first --
+    commits that overlay into the ISO."""
+
+    @staticmethod
+    def _restored_before_this_fix(tmp_path) -> _RevertingLibvirt:
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        vm.take("s2")
+        execute, shell = _restoring(None, vm)
+        with execute, shell:
+            vm._revert("s1")
+            vm._revert("s2")
+        assert vm.snapshots["s2"]["disks"]["sda"]
+        return vm
+
+    @staticmethod
+    def _committed_into_the_iso(vm) -> list:
+        return [c for c in vm.commits if c[0] == "sda" or c[2] == vm.iso]
+
+    def test_deleting_on_a_vm_restored_before_this_fix(self, sm, tmp_path):
+        vm = self._restored_before_this_fix(tmp_path)
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            assert sm.delete_snapshot(vm.VM, "s2") is True
+
+        assert self._committed_into_the_iso(vm) == []
+        assert [t for t, _o, _b in vm.commits] == ["vda"]
+
+    def test_deleting_after_a_switch_that_failed(self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        vm.fail_update = "error: Failed to update device"
+        assert _restore(sm, vm, "s1") is True
+        vm.fail_update = None
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            assert sm.delete_snapshot(vm.VM, "s1") is True
+
+        assert self._committed_into_the_iso(vm) == []
+
+    def test_a_record_that_cannot_be_rewritten_refuses_the_delete(
+            self, sm, tmp_path):
+        vm = self._restored_before_this_fix(tmp_path)
+        vm.fail_redefine = "error: invalid argument"
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, patch.object(sm.logger, "error") as error:
+            assert sm.delete_snapshot(vm.VM, "s2") is False
+
+        assert vm.commits == [] and "s2" in vm.snapshots
+        assert "commit into the ISO" in " ".join(
+            str(c.args[0]) for c in error.call_args_list)
+
+    def test_take_force_on_a_vm_restored_before_this_fix(self, sm, tmp_path):
+        vm = self._restored_before_this_fix(tmp_path)
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            assert sm.create_snapshot(
+                vm.VM, str(tmp_path), "s2", "again", force=True,
+                paths_in_use=vm.in_use,
+                recorded_in_use=lambda: FilesInUse()) is True
+
+        assert self._committed_into_the_iso(vm) == []
+        assert vm.live["sda"] == vm.iso
+        assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
+
+    def test_the_cdroms_go_back_before_force_deletes_anything(
+            self, sm, tmp_path):
+        vm = self._restored_before_this_fix(tmp_path)
+        order = []
+        flatten = sm._flatten_cdrom_overlays
+        clear = sm._force_clear_for_retake
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, \
+             patch.object(sm, "_flatten_cdrom_overlays", side_effect=lambda
+                          *a, **k: order.append("flatten") or flatten(*a, **k)), \
+             patch.object(sm, "_force_clear_for_retake", side_effect=lambda
+                          *a, **k: order.append("force") or clear(*a, **k)):
+            assert sm.create_snapshot(
+                vm.VM, str(tmp_path), "s2", "again", force=True,
+                paths_in_use=vm.in_use,
+                recorded_in_use=lambda: FilesInUse()) is True
+
+        assert order == ["flatten", "force"]
+
+    def test_a_flatten_that_raises_does_not_stop_the_take(self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, \
+             patch.object(sm, "_flatten_cdrom_overlays",
+                          side_effect=RuntimeError("virsh went away")):
+            assert sm.create_snapshot(vm.VM, str(tmp_path), "s1", "first",
+                                      paths_in_use=vm.in_use) is True
+
+        assert "s1" in vm.snapshots
+
+
 class TestFlattenCdromOverlays:
     """Before a take, a CDROM left on an overlay of its ISO goes back on the
     ISO, the way a restore puts it back (#273): through update-device with
@@ -4006,8 +4259,140 @@ class TestFlattenCdromOverlays:
         assert ("qemu-img",) not in vm.calls
 
 
+#: a snapshot's XML as libvirt 10.10 writes it after a revert to a snapshot
+#: with children: indented, attributes in its own order, live chains with
+#: indexes, a <seclabel> on a CDROM's source, an empty drive, and metadata
+#: whose namespaces are declared on the elements that use them
+_LIBVIRT_METADATA = (
+    '    <metadata>\n'
+    '      <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">\n'
+    '        <libosinfo:os id="http://nixos.org/nixos/unknown"/>\n'
+    '      </libosinfo:libosinfo>\n'
+    '      <boxman:disks xmlns:boxman="https://github.com/mherkazandjian/boxman/disks/1.0">\n'
+    '        <boxman:disk name="root" target="vda" role="boot"/>\n'
+    '      </boxman:disks>\n'
+    '    </metadata>\n')
+
+
+def _libvirt_devices(live: bool) -> str:
+    chain = ("        <backingStore type='file' index='3'>\n"
+             "          <format type='raw'/>\n"
+             "          <source file='/iso/nixos.iso'/>\n"
+             "          <backingStore/>\n"
+             "        </backingStore>\n") if live else ""
+    return (
+        "    <devices>\n"
+        "      <disk type='file' device='disk'>\n"
+        "        <driver name='qemu' type='qcow2' discard='unmap'/>\n"
+        "        <source file='/ws/vm01.s1'"
+        + (" index='2'" if live else "") + "/>\n"
+        "        <target dev='vda' bus='virtio'/>\n"
+        "      </disk>\n"
+        "      <disk device='cdrom' type='file'>\n"
+        "        <driver name='qemu' type='qcow2'/>\n"
+        "        <source file='/iso/nixos.1793626526'"
+        + (" index='4'" if live else "") + ">\n"
+        "          <seclabel model='dac' relabel='no'/>\n"
+        "        </source>\n"
+        + chain +
+        "        <target dev='sda' bus='sata'/>\n"
+        "        <readonly/>\n"
+        + ("        <alias name='sata0-0-0'/>\n" if live else "") +
+        "        <address type='drive' controller='0' bus='0' target='0' "
+        "unit='0'/>\n"
+        "      </disk>\n"
+        "      <disk type='file' device='cdrom'>\n"
+        "        <driver name='qemu'/>\n"
+        "        <target dev='sdb' bus='sata'/>\n"
+        "        <readonly/>\n"
+        "      </disk>\n"
+        "    </devices>\n")
+
+
+def _recorded(overlays: dict) -> str:
+    return "".join(
+        f"    <disk name='{t}' snapshot='external' type='file'>\n"
+        f"      <driver type='qcow2'/>\n"
+        f"      <source file='{p}'/>\n"
+        f"    </disk>\n" for t, p in overlays.items()) + \
+        "    <disk name='sdb' snapshot='no'/>\n"
+
+
+_LIBVIRT_SNAPSHOT_XML = (
+    "<domainsnapshot>\n"
+    "  <name>s2</name>\n"
+    "  <state>running</state>\n"
+    "  <parent>\n    <name>s1</name>\n  </parent>\n"
+    "  <creationTime>1793626043</creationTime>\n"
+    "  <memory snapshot='external' file='/ws/vm01_snapshot_s2.raw'/>\n"
+    "  <disks>\n"
+    + _recorded({"vda": "/ws/vm01.1793626528",
+                          "sda": "/iso/nixos.1793626528"}) +
+    "  </disks>\n"
+    "  <revertDisks>\n"
+    + _recorded({"vda": "/ws/vm01.1793626530",
+                                "sda": "/iso/nixos.1793626530"}) +
+    "  </revertDisks>\n"
+    "  <domain type='kvm' id='3'>\n"
+    "    <name>vm01</name>\n"
+    + _LIBVIRT_METADATA + _libvirt_devices(True) +
+    "  </domain>\n"
+    "  <inactiveDomain type='kvm'>\n"
+    "    <name>vm01</name>\n"
+    + _LIBVIRT_METADATA + _libvirt_devices(False) +
+    "  </inactiveDomain>\n"
+    "  <cookie>\n"
+    "    <cpu mode='custom' match='exact' check='full'>\n"
+    "      <model fallback='forbid'>EPYC</model>\n"
+    "    </cpu>\n"
+    "  </cookie>\n"
+    "</domainsnapshot>\n")
+
+
 class TestRetargetingASnapshotRecord:
     """What is rewritten of a snapshot's XML, and what is refused."""
+
+    @staticmethod
+    def _section(root, tag: str, name: str):
+        return next(d for d in root.find(tag) if d.get("name") == name)
+
+    def test_a_record_as_libvirt_writes_it(self):
+        retired = {"/iso/nixos.1793626526": "/iso/nixos.iso"}
+
+        out = SnapshotManager._retarget_snapshot_xml(_LIBVIRT_SNAPSHOT_XML,
+                                                     retired)
+
+        root = ET.fromstring(out)
+        for tag in ("disks", "revertDisks"):
+            # a CDROM's overlay is no record's, retired or not
+            sda = self._section(root, tag, "sda")
+            assert sda.get("snapshot") == "no" and sda.find("source") is None
+            assert self._section(root, tag, "vda").get("snapshot") == "external"
+        for tag in ("domain", "inactiveDomain"):
+            cdrom, empty = [d for d in root.find(tag).iter("disk")
+                            if d.get("device") == "cdrom"]
+            source = cdrom.find("source")
+            assert source.get("file") == "/iso/nixos.iso"
+            assert source.find("seclabel").get("relabel") == "no"
+            assert cdrom.find("driver").get("type") == "raw"
+            assert cdrom.find("backingStore") is None
+            assert empty.find("source") is None
+        # everything else, as text, as libvirt wrote it
+        assert out.count(_LIBVIRT_METADATA) == 2
+        assert ("<memory snapshot='external' "
+                "file='/ws/vm01_snapshot_s2.raw'/>") in out
+        assert "<parent>\n    <name>s1</name>\n  </parent>" in out
+        assert "<model fallback='forbid'>EPYC</model>" in out
+
+    def test_a_cdrom_saved_on_an_overlay_not_retired_is_left_on_it(self):
+        out = SnapshotManager._retarget_snapshot_xml(_LIBVIRT_SNAPSHOT_XML,
+                                                     {})
+
+        root = ET.fromstring(out)
+        cdrom = next(d for d in root.find("domain").iter("disk")
+                     if d.get("device") == "cdrom")
+        assert cdrom.find("source").get("file") == "/iso/nixos.1793626526"
+        assert self._section(root, "disks", "sda").get("snapshot") == "no"
 
     def test_a_record_naming_none_of_them_is_left_alone(self, tmp_path):
         vm = _RevertingLibvirt(tmp_path)

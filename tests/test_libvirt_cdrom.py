@@ -759,6 +759,18 @@ class TestTheImageACdromReads:
                           side_effect=_qemu_img({})):
             assert cd.media_read(inactive=True) == {}
 
+    def test_what_its_source_holds_is_kept(self):
+        """A <seclabel relabel='no'> on the source says how libvirt may
+        label the file; the ISO takes it over."""
+        disk = ET.fromstring(_OVERLAY_SDA.replace(
+            "index='4'/>",
+            "index='4'><seclabel model='dac' relabel='no'/></source>"))
+        source = ET.fromstring(
+            media_disk_xml(disk, "/isos/tools.iso")).find("source")
+        assert source.get("file") == "/isos/tools.iso"
+        assert source.get("index") is None
+        assert source.find("seclabel").get("relabel") == "no"
+
     def test_the_iso_goes_in_behind_a_raw_driver_and_nothing_under_it(self):
         xml = media_disk_xml(ET.fromstring(_OVERLAY_SDA), "/isos/tools.iso")
         disk = ET.fromstring(xml)

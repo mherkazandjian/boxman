@@ -135,9 +135,10 @@ def media_disk_xml(disk: ET.Element, source: str) -> str:
     raw image *source* instead, for ``virsh update-device``.
 
     Everything else is kept, as ``virsh change-media`` keeps it — target,
-    bus, address, ``startupPolicy`` — except what describes the image it
-    held: the driver's ``type`` becomes ``raw`` and every ``<backingStore>``
-    goes. ``change-media`` replaces the ``<source>`` alone, so a drive on a
+    bus, address, ``startupPolicy``, what the ``<source>`` holds (a
+    ``<seclabel>``, say) — except what describes the image it held: the
+    driver's ``type`` becomes ``raw``, the source's ``index`` goes, and so
+    does every ``<backingStore>``. ``change-media`` replaces the ``<source>`` alone, so a drive on a
     qcow2 overlay keeps ``type='qcow2'`` on the raw ISO, which qemu then
     refuses to open ("Image is not in qcow2 format"): at once for the live
     domain, at its next start for the persistent definition.
@@ -153,10 +154,13 @@ def media_disk_xml(disk: ET.Element, source: str) -> str:
     attrs = {"file": source}
     if old is not None and old.get("startupPolicy"):
         attrs["startupPolicy"] = old.get("startupPolicy")
+    replacement = ET.Element("source", attrs)
+    if old is not None:
+        replacement.extend(list(old))
     where = list(new).index(old) if old is not None else list(new).index(driver) + 1
     if old is not None:
         new.remove(old)
-    new.insert(where, ET.Element("source", attrs))
+    new.insert(where, replacement)
     for level in new.findall("backingStore"):
         new.remove(level)
     return ET.tostring(new, encoding="unicode")
@@ -534,6 +538,31 @@ class CDROMManager:
         except ValueError:
             return False
         return isinstance(reply, dict) and "return" in reply
+
+    def medium_in(self, alias: str) -> tuple[str | None, bool] | None:
+        """
+        What qemu holds in the drive whose device alias is *alias*, through
+        QMP ``query-block``: ``(the file of its medium, or None for an empty
+        drive, whether its tray is open)``; ``None`` when that cannot be
+        told. libvirt's definition keeps naming the medium it meant to
+        replace when a media change fails part-way, after it took the old
+        one out.
+        """
+        result = self.virsh.execute("qemu-monitor-command", self.vm_name,
+                                    json.dumps({"execute": "query-block"}),
+                                    warn=True)
+        if not result.ok:
+            return None
+        try:
+            reply = json.loads(result.stdout or '')
+        except ValueError:
+            return None
+        for device in (reply.get("return") or []) if isinstance(reply, dict) else []:
+            if isinstance(device, dict) and alias in (device.get("qdev"),
+                                                      device.get("device")):
+                inserted = device.get("inserted") or {}
+                return inserted.get("file"), bool(device.get("tray_open"))
+        return None
 
     def configure_from_config(self, cdrom_config: dict[str, Any],
                               reserved: Iterable[str] = (),
