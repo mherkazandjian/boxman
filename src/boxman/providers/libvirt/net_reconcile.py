@@ -41,7 +41,23 @@ STRUCTURAL_FIELDS = (
     # `action: none` -- so it could never be migrated, not even with
     # --recreate-networks, which only permits an already-planned recreate
     ('dhcp_options_trimmed', 'dhcp router/dns suppression'),
+    # Only an isolated network sets this on the desired side (to False): it
+    # tells an address-free network apart from a forward-less one that holds
+    # a host address, which the ip_address comparison cannot -- a desired
+    # value of None is never compared. Every other mode leaves it unset, so
+    # their plans are unchanged.
+    ('has_ip', 'host address (<ip> element)'),
+    # The root ``ipv6='yes'`` attribute turns on guest-to-guest IPv6 on a
+    # network without an IPv6 address, which an isolated network does not
+    # support. Only that mode sets it on the desired side (to 'no'), so a
+    # live isolated network carrying it is drift rather than converged, and
+    # nat, route and bridge plans are unchanged.
+    ('ipv6', 'guest IPv6 (<network ipv6> attribute)'),
 )
+
+#: Modes in which libvirt creates the Linux bridge and deletes it with the
+#: network. ``bridge`` mode references a host-owned bridge instead.
+MANAGED_BRIDGE_MODES = frozenset({'nat', 'route', 'isolated'})
 
 
 def _dhcp_options_trimmed(root) -> bool:
@@ -57,6 +73,11 @@ def _dhcp_options_trimmed(root) -> bool:
     values = {element.get('value') for element in root.iter()
               if element.tag.rsplit('}', 1)[-1] == 'option'}
     return 'dhcp-option=3' in values and 'dhcp-option=6' in values
+
+
+def _normalise_ipv6(value: str | None) -> str:
+    """The root ``ipv6`` attribute as 'yes' or 'no'; absent means 'no'."""
+    return 'yes' if (value or '').strip().lower() == 'yes' else 'no'
 
 
 def parse_network_xml(xml_text: str) -> dict[str, Any]:
@@ -79,7 +100,9 @@ def parse_network_xml(xml_text: str) -> dict[str, Any]:
     ip = root.find('ip')
 
     state: dict[str, Any] = {
-        'mode': forward.get('mode') if forward is not None else None,
+        # libvirt's own meaning of a network without <forward> is "isolated":
+        # no traffic leaves the bridge through the host
+        'mode': forward.get('mode') if forward is not None else 'isolated',
         'bridge_name': bridge.get('name') if bridge is not None else None,
         'bridge_stp': bridge.get('stp') if bridge is not None else None,
         'bridge_delay': bridge.get('delay') if bridge is not None else None,
@@ -89,6 +112,11 @@ def parse_network_xml(xml_text: str) -> dict[str, Any]:
         'dhcp_range': None,
         'dhcp_hosts': [],
         'dhcp_options_trimmed': _dhcp_options_trimmed(root),
+        # any family: an IPv6-only <ip> is still a host address on the bridge
+        'has_ip': ip is not None,
+        # libvirt treats a missing attribute as 'no'; normalise so the two
+        # spellings compare equal
+        'ipv6': _normalise_ipv6(root.get('ipv6')),
     }
 
     if ip is None:
@@ -148,6 +176,23 @@ def desired_state(network) -> dict[str, Any]:
             'dhcp_range': None,
             'dhcp_hosts': [],
             'dhcp_options_trimmed': False,
+        }
+
+    if network.forward_mode == 'isolated':
+        # mirrors the template: a managed bridge and its mac, nothing else
+        return {
+            'mode': 'isolated',
+            'bridge_name': network.bridge_name,
+            'bridge_stp': str(network.bridge_stp),
+            'bridge_delay': str(network.bridge_delay),
+            'mac': network.mac_address.lower() if network.mac_address else None,
+            'ip_address': None,
+            'netmask': None,
+            'dhcp_range': None,
+            'dhcp_hosts': [],
+            'dhcp_options_trimmed': False,
+            'has_ip': False,
+            'ipv6': 'no',
         }
 
     dhcp_range = None
@@ -311,9 +356,9 @@ def bridge_ownership_conflict(desired: dict[str, Any],
                               desired_bridge_is_pinned: bool = True) -> str | None:
     """Explain an unsafe same-name managed/external bridge transition.
 
-    In nat/route mode libvirt owns the Linux bridge and deletes it with the
-    network. In bridge mode the host owns it and libvirt deliberately leaves it
-    alone. Reusing one bridge name while crossing that ownership boundary
+    In nat, route and isolated mode libvirt owns the Linux bridge and deletes
+    it with the network. In bridge mode the host owns it and libvirt
+    deliberately leaves it alone. Reusing one bridge name while crossing that ownership boundary
     therefore cannot be reconciled by destroy/redefine: one direction deletes
     the desired prerequisite, the other leaves an interface the new managed
     network cannot claim. ``desired_bridge_is_pinned`` distinguishes that
@@ -325,7 +370,7 @@ def bridge_ownership_conflict(desired: dict[str, Any],
     new_mode = desired.get('mode')
     old_bridge = actual.get('bridge_name')
     new_bridge = desired.get('bridge_name')
-    managed = {'nat', 'route'}
+    managed = MANAGED_BRIDGE_MODES
 
     if not old_bridge or not new_bridge or old_bridge != new_bridge:
         return None
