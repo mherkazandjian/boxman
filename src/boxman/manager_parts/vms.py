@@ -47,6 +47,7 @@ from boxman.providers.libvirt.disk_cleanup import (
     remove_vm_storage,
     save_teardown_inventory,
     save_teardown_locator,
+    snapshot_only_overlays,
     teardown_inventory_path,
     teardown_locator_path,
 )
@@ -830,11 +831,15 @@ class VMsMixin:
                 f"storage under a possibly-live guest")
 
         # remove_vm_storage() raises on a filesystem error, which reaches
-        # _run_parallel's failure handling
+        # _run_parallel's failure handling. Other domains' overlays are
+        # asked about only where one can be removed: in a disk_snapshot_dir
+        overlay_dirs = self._cluster_disk_snapshot_dirs()
         outcome = remove_vm_storage(
             inventory, self._cluster_workdirs(), session.disk_paths_in_use,
             memory_dirs=self._cluster_memory_snapshot_dirs(),
-            memory_in_use=session.snapshot_memory_in_use)
+            recorded_in_use=lambda: session.snapshot_files_in_use(
+                overlays_too=bool(overlay_dirs)),
+            overlay_dirs=overlay_dirs)
         for path, reason in outcome.kept:
             self.logger.warning(
                 f"{full_vm_name}: left {path} in place because {reason}")
@@ -947,8 +952,9 @@ class VMsMixin:
         """
         Inventory *full_vm_name*'s storage before it is undefined: its block
         devices in both definitions, its ownership records, the backing
-        chain of each of its disks, its boot-disk family, and the identity
-        of every one of those files.
+        chain of each of its disks, its boot-disk family, the memory images
+        and (with a disk_snapshot_dir set) the overlays its snapshots
+        recorded, and the identity of every one of those files.
 
         A domain already gone (an interrupted teardown being retried) is
         inventoried by name only, and its ownership state is *unknown*, not
@@ -991,9 +997,6 @@ class VMsMixin:
             if row.device == 'disk':
                 targets.setdefault(row.source, row.target)
 
-        if disk_dirs is None:
-            disk_dirs = self._vm_disk_dirs(full_vm_name, disk_sources)
-
         records, records_state = None, RECORDS_UNKNOWN
         if exists:
             try:
@@ -1028,6 +1031,9 @@ class VMsMixin:
         sources = [*disk_sources, *media_sources]
         chains = session.backing_chains(sources) if sources else {}
 
+        if disk_dirs is None:
+            disk_dirs = self._vm_disk_dirs(full_vm_name, disk_sources)
+
         # decided with at capture and, for a domain undefined with nothing
         # saved, by the name-based fallback: a cluster workdir that cannot
         # be listed stops the teardown — before the undefine, at capture.
@@ -1053,13 +1059,58 @@ class VMsMixin:
                     + ("leaving it defined and its storage in place"
                        if exists else "leaving its storage in place")
                     + " — make that directory readable, then retry") from exc
+        if self._cluster_disk_snapshot_dirs():
+            # a disk in a disk_snapshot_dir is built on a boot disk in a
+            # workdir no listing above may have read: the layers under its
+            # own disks are its family one by one, under its names — their
+            # directories are never swept for them
+            found.update(
+                layer for source in disk_sources
+                if os.path.basename(source).startswith(f"{full_vm_name}.")
+                for layer in (chains or {}).get(source, ())
+                if os.path.basename(layer).startswith(f"{full_vm_name}."))
         boot_family = sorted(found)
+
+        # the overlays each snapshot recorded: with its disks and the layers
+        # below them, the only files a teardown removes from a
+        # disk_snapshot_dir, which it never lists — another VM's full name
+        # can begin with this one's and a dot (remove_vm_storage)
+        overlays: dict[str, list[str]] | None = None
+        overlays_unread = False
+        if exists and self._cluster_disk_snapshot_dirs():
+            overlays = session.snapshot_overlay_files(full_vm_name)
+            if overlays is None:
+                overlays_unread = True
+                self.logger.warning(
+                    f"{full_vm_name}: could not read the overlays its "
+                    f"snapshots recorded, one of which can be built on any "
+                    f"of its files, so nothing in a disk_snapshot_dir will be "
+                    f"removed, nor what that is built on")
+        # and what those only a snapshot records are built on: kept, one
+        # keeps that too (remove_vm_storage). Unread, so are their chains,
+        # which keeps everything: any of its files can be under one.
+        recorded_only = snapshot_only_overlays(overlays, sources)
+        if overlays_unread:
+            overlay_chains = None
+        else:
+            overlay_chains = (session.backing_chains(recorded_only)
+                              if recorded_only else {})
+        if overlay_chains is not None:
+            # gone already: saved as built on nothing, which a retry tells
+            # apart from one it knows nothing of
+            for overlay in recorded_only:
+                overlay_chains.setdefault(overlay, [])
+
         files = [*disk_sources, *boot_family, *(legacy_disks or ()),
                  *(record.source for record in records or ()),
                  *(layer for chain in (chains or {}).values()
                    for layer in chain),
                  *(path for recorded in memory_images.values()
-                   for path in (recorded, f"{recorded}.zst"))]
+                   for path in (recorded, f"{recorded}.zst")),
+                 *(path for paths in (overlays or {}).values()
+                   for path in paths),
+                 *(layer for chain in (overlay_chains or {}).values()
+                   for layer in chain)]
         inventory = StorageInventory(
             vm_name=full_vm_name,
             disk_sources=disk_sources,
@@ -1072,6 +1123,8 @@ class VMsMixin:
             identities=file_identities(files),
             targets=targets,
             memory_images=memory_images,
+            overlays=overlays,
+            overlay_chains=overlay_chains,
         )
         if exists:
             # saved before the undefine, which drops what it was read from;
@@ -1334,22 +1387,149 @@ class VMsMixin:
         target, its record and its dependencies. A media source gone since
         has no chain — boxman never removes one, and nothing depends on an
         image that is not there. A chain that cannot be read makes them all
-        unknown (``None``), which keeps everything.
+        unknown (``None``), which keeps everything. The overlays only its
+        snapshots recorded are read again too, and decided with only as
+        they were saved (:meth:`_overlay_chains_now`); what of them this
+        retry found is saved first.
         """
         sources = [*saved.disk_sources, *saved.media_sources]
-        chains = session.backing_chains(sources) if sources else {}
-        for source in saved.disk_sources:
+        chains = self._chains_left(
+            session, session.backing_chains(sources) if sources else {},
+            saved.disk_sources, saved.chains)
+        overlay_chains, found = self._overlay_chains_now(session, saved,
+                                                         sources)
+        if found:
+            # before anything is removed, as the next retry may find those
+            # files gone. Where it was found, alone: its locator, if it has
+            # one, names it already
+            saved = dataclasses.replace(saved, **found)
+            try:
+                save_teardown_inventory(saved,
+                                        os.path.dirname(saved.saved_at))
+            except OSError as exc:
+                raise ProvisionError(
+                    f"{saved.vm_name}: could not save what this retry found "
+                    f"to its teardown inventory at {saved.saved_at} ({exc}); "
+                    f"leaving its storage in place") from exc
+        return dataclasses.replace(saved, chains=chains,
+                                   overlay_chains=overlay_chains)
+
+    def _overlay_chains_now(self, session, saved: StorageInventory,
+                            sources: list[str],
+                            ) -> tuple[dict[str, list[str]] | None,
+                                       dict[str, object]]:
+        """
+        The chains of the overlays only *saved*'s snapshots recorded, read
+        again, now, for a retry to decide with — or ``None``, which keeps
+        everything — and what of them to save.
+
+        A retry decides only with chains read now that agree with those
+        saved, which are never rewritten. A teardown removes heads first,
+        so what an interruption leaves of a saved chain is its bottom part,
+        built as it was: the chain of its topmost layer still there, read
+        now, is the saved chain from that layer down. A layer rebased or
+        replaced since, or one gone at first (saved as ``[]``) and back, is
+        not what was decided with, and what depends on what cannot be told
+        again: that is saved, and every retry after keeps everything too,
+        should those files go. A chain that cannot be read, or a recorded
+        overlay with no chain saved, keeps everything this time. Saved as
+        ``None`` (none could be read), nothing was removed, so they are read
+        as at capture, all of them still there — and saved, for the retries
+        after this one to decide with; unless the overlays themselves could
+        not be read at capture, which no retry can do, the domain gone: then
+        every retry keeps everything.
+
+        Returns:
+            ``(chains, found)``: the chains to decide with, or ``None``; and
+            the inventory's fields to save before anything is removed
+            (empty: none).
+        """
+        def changed(reason: str) -> None:
+            self.logger.warning(
+                f"{saved.vm_name}: {reason}; what depends on what cannot be "
+                f"told, so no retry removes anything of it")
+
+        if saved.overlay_chains_changed:
+            changed(saved.overlay_chains_changed)
+            return None, {}
+        known = saved.overlay_chains
+        heads = list(dict.fromkeys([
+            *snapshot_only_overlays(saved.overlays, sources),
+            *(known or {})]))
+        if known is None and saved.overlays is None:
+            self.logger.warning(
+                f"{saved.vm_name}: the overlays its snapshots recorded could "
+                f"not be read when the teardown began, and cannot be now, so "
+                f"no retry removes anything one of them may be built on")
+            return None, {}
+        if known is None:
+            now = session.backing_chains(heads) if heads else {}
+            gone = [head for head in heads if now is not None
+                    and head not in now]
+            if gone:
+                self.logger.warning(
+                    f"{saved.vm_name}: {gone[0]}, an overlay a snapshot of it "
+                    f"recorded, is gone, and no chain was saved for it")
+            if now is None or gone:
+                return None, {}
+            return now, {"overlay_chains": now}
+        chains: dict[str, list[str]] = {}
+        unknown = False
+        for head in heads:
+            if head not in known:
+                self.logger.warning(
+                    f"{saved.vm_name}: no chain was saved for {head}, an "
+                    f"overlay a snapshot of it recorded")
+                unknown = True
+                continue
+            # [] — gone at first: it is read once more, and must be gone
+            layers = known[head]
+            for index, layer in enumerate(layers or [head]):
+                now = session.backing_chains([layer])
+                if now is None:
+                    unknown = True
+                    break
+                if layer not in now:
+                    continue      # removed since, from the top
+                if now[layer] != layers[index:]:
+                    built_on = ' -> '.join(now[layer][1:]) or 'nothing'
+                    reason = (
+                        f"{layer}, of an overlay a snapshot of it recorded, "
+                        f"was built on "
+                        f"{' -> '.join(layers[index + 1:]) or 'nothing'} "
+                        f"when its teardown began, and on {built_on} at a "
+                        f"retry" if layers else
+                        f"{layer}, an overlay a snapshot of it recorded, was "
+                        f"not there when its teardown began, and was built "
+                        f"on {built_on} at a retry")
+                    changed(reason)
+                    return None, {"overlay_chains_changed": reason}
+                chains[layer] = now[layer]
+                break
+        return (None if unknown else chains), {}
+
+    @staticmethod
+    def _chains_left(session, chains: dict[str, list[str]] | None,
+                     heads: list[str],
+                     saved: dict[str, list[str]] | None,
+                     ) -> dict[str, list[str]] | None:
+        """
+        *chains*, as read now, with each of *heads* removed since mapped to
+        the chain of the topmost layer of its *saved* one that is still
+        there; ``None`` when one cannot be read.
+        """
+        for head in heads:
             if chains is None:
                 break
-            if source in chains:
+            if head in chains:
                 continue
-            for layer in (saved.chains or {}).get(source, [])[1:]:
+            for layer in (saved or {}).get(head, [])[1:]:
                 below = session.backing_chains([layer])
                 if below is None or layer in below:
                     chains = (None if below is None
-                              else {**chains, source: below[layer]})
+                              else {**chains, head: below[layer]})
                     break
-        return dataclasses.replace(saved, chains=chains)
+        return chains
 
     def _vm_disk_dirs(self,
                       full_vm_name: str,
@@ -2304,7 +2484,7 @@ class VMsMixin:
         # (#171 A3).
         self.validate_direct_boot_config()
         self.validate_clone_identity_config()
-        self.validate_memory_snapshot_dirs()
+        self.validate_snapshot_dirs()
         self.validate_guest_os_config()
         # A new VM installed unattended needs its password, its computer
         # name and its answer file now. Checked where it is built, that came

@@ -197,6 +197,7 @@ clusters:
   <cluster_name>:
     workdir: <dir>                   # VM disks + cluster scratch (auto-derives)
     memory_snapshot_dir: <abs dir>   # optional: snapshot memory images (default: workdir)
+    disk_snapshot_dir: <abs dir>     # optional: snapshot disk overlays (default: beside each disk)
     base_image: <template-vm-name>   # cluster default; overridable per VM
     admin_user: ...
     admin_pass: file://...           # also: ${env:VAR}, or a plain literal
@@ -1154,15 +1155,39 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
 - A cluster's memory images (`<vm>_snapshot_<name>.raw`, or `.raw.zst`)
   go to its `memory_snapshot_dir` when it sets one (an absolute path, or
   `~/…`; made `0700` on first use, but never by creating a missing cluster
-  workdir), else to its `workdir`. Only those move: a disk snapshot is an
-  overlay libvirt creates beside its disk, and the newest overlay is the
-  disk the guest writes to. Images already taken stay where they were
+  workdir), else to its `workdir`. Disk overlays are set apart by
+  `disk_snapshot_dir` (below). Images already taken stay where they were
   written; restore, delete and compression follow the path libvirt recorded.
   A teardown removes an image only if one of the VM's own snapshots recorded
   it, and only from a cluster workdir or `memory_snapshot_dir`: after the
   key is changed or unset, one left anywhere else is kept and named in a
   warning, to remove by hand. Local runtime only: a container runtime
   refuses it up front (`provision`, `up`, `update`, `snapshot take`).
+- A cluster's disk overlays go to its `disk_snapshot_dir` when it sets one
+  (same path rules; made `0711` on first use, the directories made on the
+  way searchable, since QEMU opens the overlays as another user), else
+  beside each disk. They keep libvirt's names, `<vm>.<snapshot>` and
+  `<vm>_<disk>.<snapshot>`; a read-only disk, or one set `snapshot='no'`,
+  gets none, as without it. After a take the newest overlay *is* the disk
+  the guest writes to: the directory holds live disks, not backups — and
+  restore writes its `<overlay>.preserve` copies there too. A take sees to
+  a libvirt storage pool on it (`bprj__<project>__bprj_<cluster>_disk_snapshots`
+  unless one is already on it under that path; with that name taken, as
+  after the directory moved, the first free `<name>_<n>`); under
+  `use_sudo: false` the
+  in-use scan reads the overlays through it, and without one every
+  teardown keeps what it would remove (the take warns). A teardown never decides by name there —
+  another VM's full name can begin with this one's and a dot: it removes
+  the boot disk's overlays libvirt names as the VM's (its disks, the layers
+  below them, the overlays its snapshots recorded), a data disk's only as a
+  layer of a chain proven the VM's own (the one it is attached through, or
+  one only its snapshots record that is built on it), and nothing else; one
+  another
+  domain's snapshot records is kept. One directory may serve as both
+  `memory_snapshot_dir` and `disk_snapshot_dir`, or one sit inside the
+  other: a take makes the directories it creates on QEMU's way to the
+  overlays `0711`, and an existing `memory_snapshot_dir` there searchable
+  too, named in a warning. Local runtime only, like `memory_snapshot_dir`.
 - `snapshot restore [--name N]` restores (latest if omitted). `boxman restore`
   is the shortcut for "all VMs to latest".
 - **A restore backs up the overlays the revert deletes, and refuses if it
@@ -1171,6 +1196,13 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   are copied. If the revert itself fails the guest is deliberately left
   paused — check `virsh domstate` first. Do not name a snapshot
   `<something>.preserve`.
+- A restore puts the guest on new overlays libvirt makes beside each disk's
+  source as it was when the snapshot was taken (`<disk>.<epoch>`), not in a
+  `disk_snapshot_dir`; the next take goes back to it. An overlay the revert
+  discarded (reverting to a snapshot with no children, libvirt records the
+  new overlays in its place) is put back all the same and named in a
+  warning: nothing removes it, so remove it by hand once no other domain
+  uses it.
 - A VM holding a managed save (after `boxman down`) cannot be reverted to a
   snapshot that captured no memory; the restore refuses up front. Run `boxman
   up` first, or discard the saved memory with `virsh managedsave-remove`.

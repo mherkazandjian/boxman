@@ -150,7 +150,7 @@ class TestTheDirectory:
             "workdir": str(tmp_path / "c2"), "memory_snapshot_dir": 0, "vms": {}}
 
         with pytest.raises(ConfigError, match="cluster_2.memory_snapshot_dir"):
-            mgr.validate_memory_snapshot_dirs()
+            mgr.validate_snapshot_dirs()
 
     def test_validate_needs_no_workdir_of_a_cluster_that_sets_none(self):
         """A cluster with no workdir and no workspace.path to derive one
@@ -158,7 +158,7 @@ class TestTheDirectory:
         crash on it."""
         mgr = _manager({})
 
-        mgr.validate_memory_snapshot_dirs()
+        mgr.validate_snapshot_dirs()
 
         assert mgr._cluster_memory_snapshot_dirs() == []
 
