@@ -62,7 +62,7 @@ def _pins() -> dict:
 def _render(monkeypatch, **env) -> dict:
     """conf.yml rendered with the shipped pins and *env* only."""
     for var in ("TALOS_LAB_DIR", "TALOS_LAB_PREFIX", "TALOS_OPERATOR_KEY",
-                "TALOS_OPERATOR_PUBKEY", *_pins()):
+                "TALOS_OPERATOR_PUBKEY", "TALOS_PROFILE", *_pins()):
         monkeypatch.delenv(var, raising=False)
     for var, value in env.items():
         monkeypatch.setenv(var, value)
@@ -326,11 +326,14 @@ def test_a_failed_tool_install_leaves_no_ready_marker(template_build, breakage):
     assert not build.marker.exists(), breakage
 
 
+def _nodes_from_conf(**env) -> str:
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("TALOS_")}
+    return subprocess.run([sys.executable, NODES_FROM_CONF], capture_output=True,
+                          text=True, check=True, env=dict(clean, **env)).stdout
+
+
 def test_nodes_from_conf_prints_the_reserved_table():
-    out = subprocess.run([sys.executable, NODES_FROM_CONF], capture_output=True,
-                         text=True, check=True,
-                         env={k: v for k, v in os.environ.items()
-                              if not k.startswith("TALOS_")}).stdout
+    out = _nodes_from_conf()
     rows = [line.split() for line in out.splitlines()]
     assert [r[0] for r in rows] == CP + WORKERS
     assert [r[1] for r in rows] == ["controlplane"] * 3 + ["worker"] * 3
@@ -1401,3 +1404,48 @@ def test_real_talosctl_validates_the_example_patches(real_lab):
     _assert_examples_applied(real_lab.state / "nodes", CP + WORKERS)
     _assert_node_configs(real_lab.state / "nodes", CP + WORKERS,
                          _pins()["TALOS_INSTALLER_IMAGE"], ["ntp1.example", "ntp2.example"])
+
+
+# ---- the 1+1 smoke profile, rendered and generated ------------------------- #
+SMOKE = ["cp-01", "worker-01"]
+
+
+def test_the_smoke_profile_renders_one_plus_one_plus_control(monkeypatch):
+    cfg = _render(monkeypatch, TALOS_PROFILE="smoke")
+    assert list(cfg["clusters"]["talos"]["vms"]) == SMOKE
+    assert list(cfg["clusters"]["management"]["vms"]) == ["control"]
+    hosts = cfg["clusters"]["management"]["networks"]["fabric"]["ip"]["dhcp"]["hosts"]
+    assert [h["name"] for h in hosts] == SMOKE
+    full = _render(monkeypatch)
+    for name in SMOKE:   # the same VMs as in the full profile, not resized
+        assert cfg["clusters"]["talos"]["vms"][name] == full["clusters"]["talos"]["vms"][name]
+    mgr = BoxmanManager.__new__(BoxmanManager)
+    mgr.config = cfg
+    mgr.app_config = {}
+    mgr.validate_base_images()
+
+
+def test_an_unknown_profile_is_refused(monkeypatch):
+    with pytest.raises(Exception, match="TALOS_PROFILE must be one of: full, smoke; got big"):
+        _render(monkeypatch, TALOS_PROFILE="big")
+
+
+def test_the_smoke_render_feeds_gen_config(lab):
+    lab.nodes.write_text(_nodes_from_conf(TALOS_PROFILE="smoke"))
+    proc = _ok(lab.run())
+    assert proc.stdout.splitlines() == [f"{n}: created" for n in SMOKE]
+    assert lab.calls()[-2].endswith("config endpoint 192.168.53.11")
+    _assert_node_configs(lab.state / "nodes", SMOKE,
+                         f"registry.example/installer/abc:{TALOS_VERSION}",
+                         ["ntp1.example", "ntp2.example"])
+
+
+@real
+def test_real_talosctl_generates_the_smoke_render(real_lab):
+    real_lab.nodes.write_text(_nodes_from_conf(TALOS_PROFILE="smoke"))
+    proc = _ok(real_lab.run(TALOS_PATCH_DIR=PATCH_EXAMPLES))
+    assert proc.stdout.splitlines() == [f"{n}: created" for n in SMOKE]
+    assert proc.stderr.count("is valid for metal mode") == 2
+    _assert_node_configs(real_lab.state / "nodes", SMOKE,
+                         _pins()["TALOS_INSTALLER_IMAGE"], ["ntp1.example", "ntp2.example"])
+    _assert_examples_applied(real_lab.state / "nodes", SMOKE)

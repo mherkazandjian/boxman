@@ -23,6 +23,10 @@ Talos API from the control VM.
 Total: 20 vCPU, 32 GiB RAM, 640 GiB of (thin) boot disks, plus headroom for
 building the template.
 
+`TALOS_PROFILE=smoke` renders the 1+1 smoke profile instead: `control`,
+`cp-01` and `worker-01`, sized as above (8 vCPU, 12 GiB RAM, 240 GiB). Pick
+the profile before `boxman up`; the default, `full`, is the table above.
+
 - **management** owns the `fabric` NAT network. Its DHCP reservations map
   every Talos node's pinned MAC to its address and hostname, so a node's role
   never depends on boot or discovery order.
@@ -96,7 +100,13 @@ scripts/gen-config.sh --inputs inputs.env --nodes nodes.txt
 ```
 
 The pins come from `versions.env` beside `scripts/` unless `--versions FILE`
-names another file.
+names another file. Render the node table with the same `TALOS_PROFILE` as
+the VMs. For the smoke profile:
+
+```sh
+TALOS_PROFILE=smoke python3 scripts/nodes-from-conf.py > nodes.txt   # cp-01, worker-01
+scripts/gen-config.sh --inputs inputs.env --nodes nodes.txt --dry-run
+```
 
 `gen-config.sh` validates every input and the node table (3+3, or the 1+1
 smoke profile) before it does anything. That includes CIDRs Talos would

@@ -16,6 +16,9 @@
   generated on the control VM (scripts/gen-config.sh) and delivered through
   the Talos API by the install driver; see README.md.
 
+  TALOS_PROFILE picks the node set: `full` (default) is the seven VMs above;
+  `smoke` keeps cp-01, worker-01 and the control VM for a small first run.
+
   Addressing is deterministic: every Talos node pins a MAC that the fabric
   network reserves, so a node's role never depends on discovery order. The
   same table feeds scripts/nodes-from-conf.py, which writes the node list
@@ -40,7 +43,7 @@
 {% set operator_pubkey = env("TALOS_OPERATOR_PUBKEY", default="ssh-ed25519 AAAAPLACEHOLDER operator@example") %}
 {#- role, sizing and identity of every Talos node; the VIP (.5) and the
     control VM sit outside these, the dynamic range is .100-.199 #}
-{% set nodes = [
+{% set all_nodes = [
      {'name': 'cp-01',     'role': 'controlplane', 'mac': '52:54:00:53:00:11', 'host': 11},
      {'name': 'cp-02',     'role': 'controlplane', 'mac': '52:54:00:53:00:12', 'host': 12},
      {'name': 'cp-03',     'role': 'controlplane', 'mac': '52:54:00:53:00:13', 'host': 13},
@@ -48,6 +51,14 @@
      {'name': 'worker-02', 'role': 'worker',       'mac': '52:54:00:53:00:22', 'host': 22},
      {'name': 'worker-03', 'role': 'worker',       'mac': '52:54:00:53:00:23', 'host': 23},
    ] %}
+{% set profiles = {'full': all_nodes | map(attribute='name') | list,
+                   'smoke': ['cp-01', 'worker-01']} %}
+{% set profile = env("TALOS_PROFILE", default="full") %}
+{% if profile not in profiles %}
+{{ env_required("TALOS_PROFILE_" ~ profile ~ "_IS_UNKNOWN",
+                "TALOS_PROFILE must be one of: " ~ (profiles | join(", ")) ~ "; got " ~ profile) }}
+{% endif %}
+{% set nodes = all_nodes | selectattr("name", "in", profiles[profile]) | list %}
 {% set size = {
      'controlplane': {'vcpus': 2, 'memory': 4096, 'disk_size': '50G'},
      'worker':       {'vcpus': 4, 'memory': 6144, 'disk_size': '150G'},
