@@ -221,18 +221,21 @@ class TestAShutOffVm:
         assert f"vdb,snapshot=external,file={overlays}/vm01_data.s1" in args
         assert "--disk-only" in args
 
-    def test_its_cdrom_media_is_left_alone(self, sm, tmp_path):
-        """Switching it to the ISO is there to keep the overlay out of the
-        saved memory, and there is none. Nor would ``--config`` alone do:
-        it keeps ``<driver type='qcow2'/>`` on the raw ISO, and the VM then
-        fails to start ("Image is not in qcow2 format") -- measured."""
+    def test_its_cdrom_is_put_back_on_its_iso_first_too(self, sm, tmp_path):
+        """The saved definition would name a CD-ROM overlay, and a revert to
+        the snapshot would stack its next one on it (#273). The switch does
+        the persistent definition alone behind a raw driver, so ``--config``
+        is enough: ``change-media`` kept ``type='qcow2'`` on the raw ISO,
+        and the VM then failed to start (see
+        test_a_stopped_vm_has_its_persistent_definition_switched_alone)."""
         domain = _Domain("shut off")
-
-        ok, logger = _take(sm, domain, tmp_path)
+        in_use = MagicMock(name="disk_paths_in_use")
+        with patch.object(sm, "_flatten_cdrom_overlays") as flatten:
+            ok, _logger = _take(sm, domain, tmp_path, paths_in_use=in_use)
 
         assert ok is True
+        flatten.assert_called_once_with(VM, paths_in_use=in_use)
         assert domain.calls_to("change-media") == []
-        assert "failed to switch cdrom" not in _logged(logger, "warning")
 
     def test_the_take_says_it_is_disk_only(self, sm, tmp_path):
         ok, logger = _take(sm, _Domain("shut off"), tmp_path)
@@ -298,14 +301,21 @@ class TestARunningOrPausedVm:
     @pytest.mark.parametrize("state", ["running", "paused"])
     def test_its_cdrom_is_still_switched_back_to_the_iso_first(
             self, sm, tmp_path, state):
+        """Through update-device behind a raw driver (#273), before the
+        memory is saved: see TestARestorePutsTheCdromBackOnItsIso."""
         domain = _Domain(state)
+        in_use = MagicMock(name="disk_paths_in_use")
+        before_the_snapshot = []
+        with patch.object(sm, "_flatten_cdrom_overlays",
+                          side_effect=lambda *_a, **_k: before_the_snapshot.append(
+                              not domain.calls_to("snapshot-create-as"))
+                          ) as flatten:
+            ok, _logger = _take(sm, domain, tmp_path, paths_in_use=in_use)
 
-        _take(sm, domain, tmp_path)
-
-        [change] = domain.calls_to("change-media")
-        assert "--live" in change and "/iso/seed.iso" in change
-        assert (domain.calls.index(change)
-                < domain.calls.index(domain.calls_to("snapshot-create-as")[0]))
+        assert ok is True
+        flatten.assert_called_once_with(VM, paths_in_use=in_use)
+        assert before_the_snapshot == [True]
+        assert domain.calls_to("change-media") == []
 
     def test_its_memory_is_compressed_when_asked(self, sm, tmp_path):
         with patch.object(sm, "compress_memory_file",

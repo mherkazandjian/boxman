@@ -7,14 +7,21 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from xml.etree import ElementTree as ET
 
 import pytest
 
 from boxman.exceptions import ProvisionError
-from boxman.providers.libvirt.cdrom import CDROMManager
+from boxman.providers.libvirt.cdrom import (
+    CDROMManager,
+    media_disk_xml,
+    recorded_layers,
+)
+from boxman.providers.libvirt.commands import LibVirtCommandBase
 
 pytestmark = pytest.mark.unit
 
@@ -590,17 +597,188 @@ class TestChangeMedia:
     def test_missing_file_returns_false(self, cd: CDROMManager):
         assert cd.change_media("hdc", "/missing.iso") is False
 
+    @staticmethod
+    def _virsh(definition: str, updates: list):
+        """dumpxml answers *definition*; update-device records its XML."""
+        def execute(*args, **_kw):
+            if args[0] == "dumpxml":
+                return _result(stdout=definition)
+            if args[0] == "update-device":
+                updates.append((Path(args[2]).read_text(), args[3:]))
+                return _result()
+            raise AssertionError(f"unexpected virsh call: {args}")
+        return execute
+
     def test_change_media_happy_path(self, cd: CDROMManager, tmp_path: Path):
         iso = tmp_path / "new.iso"
         iso.write_bytes(b"x")
-        with patch.object(cd.virsh, "execute", return_value=_result()) as execute:
+        updates: list = []
+        with patch.object(cd.virsh, "execute",
+                          side_effect=self._virsh(_domain(_RAW_HDC), updates)):
             assert cd.change_media("hdc", str(iso)) is True
-        args, _kwargs = execute.call_args
-        assert args[0] == "change-media"
-        assert args[1] == "vm01"
-        assert args[2] == "hdc"
-        assert "--live" in args
-        assert "--config" in args
+        [(xml, flags)] = updates
+        disk = ET.fromstring(xml)
+        assert disk.find("target").get("dev") == "hdc"
+        assert disk.find("source").get("file") == str(iso)
+        assert set(flags) == {"--live", "--config"}
+
+    def test_a_drive_on_a_qcow2_overlay_gets_the_iso_behind_a_raw_driver(
+            self, cd: CDROMManager, tmp_path: Path):
+        """change-media replaced the <source> alone: the ISO went in behind
+        the overlay's type='qcow2', which qemu refuses to open, and on a
+        stopped VM the next start failed (#273)."""
+        iso = tmp_path / "new.iso"
+        iso.write_bytes(b"x")
+        updates: list = []
+        with patch.object(cd.virsh, "execute",
+                          side_effect=self._virsh(_domain(_OVERLAY_SDA),
+                                                  updates)):
+            assert cd.change_media("sda", str(iso), live=False) is True
+        [(xml, flags)] = updates
+        disk = ET.fromstring(xml)
+        assert disk.find("driver").get("type") == "raw"
+        assert disk.find("source").get("file") == str(iso)
+        assert disk.find("backingStore") is None
+        # what the drive is otherwise is kept, as change-media keeps it
+        assert disk.find("address").get("unit") == "0"
+        assert disk.find("readonly") is not None
+        assert flags == ("--config",)
+
+    def test_a_drive_the_definition_lacks_is_refused(self, cd: CDROMManager,
+                                                     tmp_path: Path):
+        iso = tmp_path / "new.iso"
+        iso.write_bytes(b"x")
+        updates: list = []
+        with patch.object(cd.virsh, "execute",
+                          side_effect=self._virsh(_domain(_RAW_HDC), updates)):
+            assert cd.change_media("sdb", str(iso)) is False
+        assert updates == []
+
+
+_RAW_HDC = ("<disk type='file' device='cdrom'><driver name='qemu' type='raw'/>"
+            "<source file='/isos/old.iso'/><target dev='hdc' bus='ide'/>"
+            "<readonly/></disk>")
+
+#: a CDROM after a snapshot revert, as the live definition shows it
+_OVERLAY_SDA = (
+    "<disk type='file' device='cdrom'><driver name='qemu' type='qcow2'/>"
+    "<source file='/isos/tools.1793626526' index='4'/>"
+    "<backingStore type='file' index='1'><format type='raw'/>"
+    "<source file='/isos/tools.iso'/><backingStore/></backingStore>"
+    "<target dev='sda' bus='sata'/><readonly/><alias name='sata0-0-0'/>"
+    "<address type='drive' controller='0' bus='0' target='0' unit='0'/>"
+    "</disk>")
+
+#: the same drive in the persistent definition: no chain, or a piece of one
+_OVERLAY_SDA_PERSISTENT = (
+    "<disk type='file' device='cdrom'><driver name='qemu' type='qcow2'/>"
+    "<source file='/isos/tools.1793626528'/>"
+    "<target dev='sda' bus='sata'/><readonly/></disk>")
+
+
+def _domain(*disks: str) -> str:
+    return f"<domain><devices>{''.join(disks)}</devices></domain>"
+
+
+def _qemu_img(chains: dict, calls: list | None = None):
+    """An execute_shell double answering ``qemu-img info --backing-chain``
+    with *chains*: {path: [(filename, format), ...]}."""
+    def run(command, *_a, **_kw):
+        if calls is not None:
+            calls.append(command)
+        path = command.split()[-1].strip("'")
+        if path not in chains:
+            return _result(ok=False, stderr="Could not open")
+        return _result(stdout=json.dumps(
+            [{"filename": f, "format": fmt} for f, fmt in chains[path]]))
+    return run
+
+
+class TestTheImageACdromReads:
+    """#273: what a drive on a revert's overlay actually reads."""
+
+    def test_a_live_definition_records_the_whole_chain(self):
+        layers = recorded_layers(ET.fromstring(_OVERLAY_SDA))
+        assert layers == [("/isos/tools.1793626526", "qcow2"),
+                          ("/isos/tools.iso", "raw")]
+
+    def test_a_persistent_definition_records_none(self):
+        assert recorded_layers(ET.fromstring(_OVERLAY_SDA_PERSISTENT)) is None
+
+    def test_a_piece_of_a_chain_is_not_taken_for_one(self):
+        cut = _OVERLAY_SDA.replace("<backingStore/>", "")
+        assert recorded_layers(ET.fromstring(cut)) is None
+
+    def test_a_raw_image_is_built_on_nothing(self):
+        assert recorded_layers(ET.fromstring(_RAW_HDC)) == [
+            ("/isos/old.iso", "raw")]
+
+    def test_the_drive_on_an_overlay_reads_the_iso_under_it(
+            self, cd: CDROMManager):
+        with patch.object(cd.virsh, "execute",
+                          return_value=_result(stdout=_domain(_OVERLAY_SDA,
+                                                              _RAW_HDC))), \
+             patch.object(LibVirtCommandBase, "execute_shell",
+                          side_effect=AssertionError("no qemu-img needed")):
+            assert cd.media_read() == {"sda": "/isos/tools.iso"}
+
+    def test_without_a_recorded_chain_qemu_img_tells(self, cd: CDROMManager):
+        calls: list = []
+        chains = {"/isos/tools.1793626528": [
+            ("/isos/tools.1793626528", "qcow2"),
+            ("/isos/tools.1793626527", "qcow2"),
+            ("/isos/tools.iso", "raw")]}
+        with patch.object(cd.virsh, "execute", return_value=_result(
+                stdout=_domain(_OVERLAY_SDA_PERSISTENT, _RAW_HDC))), \
+             patch.object(LibVirtCommandBase, "execute_shell",
+                          side_effect=_qemu_img(chains, calls)):
+            # stacked: the bottom of the chain, not the layer under the top
+            assert cd.media_read(inactive=True) == {"sda": "/isos/tools.iso"}
+        # read with -U: a running qemu holds the overlay locked
+        [command] = calls
+        assert "--backing-chain" in command and " -U " in command
+
+    def test_the_persistent_definition_takes_the_chain_the_live_one_records(
+            self, cd: CDROMManager):
+        """A revert's overlay is root and 0600, which qemu-img without sudo
+        cannot read; libvirt records its chain in the live definition."""
+        same = _OVERLAY_SDA_PERSISTENT.replace("1793626528", "1793626526")
+
+        def execute(*args, **_kw):
+            return _result(stdout=_domain(
+                same if "--inactive" in args else _OVERLAY_SDA))
+        with patch.object(cd.virsh, "execute", side_effect=execute), \
+             patch.object(LibVirtCommandBase, "execute_shell",
+                          side_effect=AssertionError("no qemu-img needed")):
+            assert cd.media_read(inactive=True) == {"sda": "/isos/tools.iso"}
+
+    def test_one_that_cannot_be_read_is_left_out(self, cd: CDROMManager):
+        with patch.object(cd.virsh, "execute", return_value=_result(
+                stdout=_domain(_OVERLAY_SDA_PERSISTENT))), \
+             patch.object(LibVirtCommandBase, "execute_shell",
+                          side_effect=_qemu_img({})):
+            assert cd.media_read(inactive=True) == {}
+
+    def test_what_its_source_holds_is_kept(self):
+        """A <seclabel relabel='no'> on the source says how libvirt may
+        label the file; the ISO takes it over."""
+        disk = ET.fromstring(_OVERLAY_SDA.replace(
+            "index='4'/>",
+            "index='4'><seclabel model='dac' relabel='no'/></source>"))
+        source = ET.fromstring(
+            media_disk_xml(disk, "/isos/tools.iso")).find("source")
+        assert source.get("file") == "/isos/tools.iso"
+        assert source.get("index") is None
+        assert source.find("seclabel").get("relabel") == "no"
+
+    def test_the_iso_goes_in_behind_a_raw_driver_and_nothing_under_it(self):
+        xml = media_disk_xml(ET.fromstring(_OVERLAY_SDA), "/isos/tools.iso")
+        disk = ET.fromstring(xml)
+        assert disk.find("driver").get("type") == "raw"
+        assert [s.get("file") for s in disk.iter("source")] == [
+            "/isos/tools.iso"]
+        assert disk.find("target").get("dev") == "sda"
+        assert disk.find("alias").get("name") == "sata0-0-0"
 
 
 class TestConfigureFromConfig:

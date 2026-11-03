@@ -641,7 +641,9 @@ def _diff_cdroms(desired_cdroms, actual_cdroms, vm_state='running'):
                                     'autodeflate': False,
                                     'stats_period': None}), \
          patch.object(differ, 'get_actual_cdroms',
-                      return_value=actual_cdroms):
+                      return_value=actual_cdroms), \
+         patch.object(differ, 'get_cdrom_media_read', return_value={}):
+        # each source is a plain ISO, built on nothing
         return differ.diff_vm(
             domain_name='vm01',
             desired_cpus=None,

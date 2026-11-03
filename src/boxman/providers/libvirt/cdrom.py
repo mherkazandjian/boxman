@@ -1,4 +1,7 @@
+import copy
+import json
 import os
+import shlex
 import tempfile
 from collections.abc import Iterable
 from typing import Any
@@ -8,7 +11,7 @@ from xml.sax.saxutils import escape
 from boxman import log
 from boxman.exceptions import ProvisionError
 
-from .commands import VirshCommand
+from .commands import LibVirtCommandBase, VirshCommand
 from .virsh_parse import parse_domblklist, parse_domblklist_strict
 
 #: Default CDROM targets on the IDE bus: two channels of two drives, the
@@ -89,6 +92,78 @@ def cdroms_awaiting_boot(live: list[dict[str, Any]],
     live_media = {(c['target'], c['source']) for c in live}
     persistent_media = {(c['target'], c['source']) for c in persistent}
     return sorted({target for target, _source in live_media ^ persistent_media})
+
+
+def recorded_layers(disk: ET.Element) -> list[tuple[str, str | None]] | None:
+    """
+    The images a ``<disk>`` element of a domain definition reads, as the
+    definition records them: ``(path, format)`` for its own image, then one
+    per ``<backingStore>`` level, down to the empty ``<backingStore/>`` that
+    ends a complete chain. A raw image is built on nothing, chain or none.
+
+    ``None`` when the definition does not tell: it records no chain, or one
+    that stops part-way — a persistent definition records none, or a stale
+    level without its end (libvirt 10.10) — or a level is not a local file.
+    """
+    source = disk.find("source")
+    path = source.get("file") if source is not None else None
+    if not path:
+        return None
+    driver = disk.find("driver")
+    layers = [(path, driver.get("type") if driver is not None else None)]
+    if layers[0][1] == "raw":
+        return layers
+    level = disk.find("backingStore")
+    if level is None:
+        return None
+    while level.attrib or len(level):
+        below = level.find("source")
+        fmt = level.find("format")
+        if level.get("type") != "file" or below is None or not below.get("file"):
+            return None
+        layers.append((below.get("file"),
+                       fmt.get("type") if fmt is not None else None))
+        level = level.find("backingStore")
+        if level is None:
+            return None
+    return layers
+
+
+def media_disk_xml(disk: ET.Element, source: str) -> str:
+    """
+    *disk*, a CD-ROM ``<disk>`` element of a domain definition, holding the
+    raw image *source* instead, for ``virsh update-device``.
+
+    Everything else is kept, as ``virsh change-media`` keeps it — target,
+    bus, address, ``startupPolicy``, what the ``<source>`` holds (a
+    ``<seclabel>``, say) — except what describes the image it held: the
+    driver's ``type`` becomes ``raw``, the source's ``index`` goes, and so
+    does every ``<backingStore>``. ``change-media`` replaces the ``<source>`` alone, so a drive on a
+    qcow2 overlay keeps ``type='qcow2'`` on the raw ISO, which qemu then
+    refuses to open ("Image is not in qcow2 format"): at once for the live
+    domain, at its next start for the persistent definition.
+    """
+    new = copy.deepcopy(disk)
+    new.set("type", "file")
+    driver = new.find("driver")
+    if driver is None:
+        driver = ET.Element("driver", {"name": "qemu"})
+        new.insert(0, driver)
+    driver.set("type", "raw")
+    old = new.find("source")
+    attrs = {"file": source}
+    if old is not None and old.get("startupPolicy"):
+        attrs["startupPolicy"] = old.get("startupPolicy")
+    replacement = ET.Element("source", attrs)
+    if old is not None:
+        replacement.extend(list(old))
+    where = list(new).index(old) if old is not None else list(new).index(driver) + 1
+    if old is not None:
+        new.remove(old)
+    new.insert(where, replacement)
+    for level in new.findall("backingStore"):
+        new.remove(level)
+    return ET.tostring(new, encoding="unicode")
 
 
 class CDROMManager:
@@ -262,6 +337,13 @@ class CDROMManager:
         """
         Swap ISO media in an existing CDROM slot.
 
+        Through ``virsh update-device``, with the drive's element from the
+        persistent definition — the one ``change-media --config`` edits —
+        holding *source_path* as a raw image (:func:`media_disk_xml`).
+        ``change-media`` keeps the driver type of the media it replaces, so
+        on a drive a snapshot revert left on a qcow2 overlay it put the ISO
+        behind ``type='qcow2'`` (#273).
+
         Args:
             target_dev: Target device name (e.g., 'hdc')
             source_path: Path to the new ISO image
@@ -281,15 +363,21 @@ class CDROMManager:
                 self.logger.error(f"ISO file does not exist: {source_path}")
                 return False
 
-            scope = ["--live", "--config"] if live else ["--config"]
-            result = self.virsh.execute(
-                "change-media", self.vm_name, target_dev,
-                source_path, *scope,
-                warn=True)
-
-            if not result.ok:
+            disk = (self.cdrom_elements(inactive=True) or {}).get(target_dev)
+            if disk is None:
                 self.logger.error(
-                    f"failed to change media on {target_dev}: {result.stderr}")
+                    f"failed to change media on {target_dev}: the persistent "
+                    f"definition of {self.vm_name} could not be read, or "
+                    f"holds no CDROM {target_dev}")
+                return False
+
+            scope = ["--live", "--config"] if live else ["--config"]
+            ok, error = self.update_media(
+                media_disk_xml(disk, source_path), scope)
+
+            if not ok:
+                self.logger.error(
+                    f"failed to change media on {target_dev}: {error}")
                 return False
 
             self.logger.info(
@@ -299,6 +387,182 @@ class CDROMManager:
         except Exception as e:
             self.logger.error(f"error changing CDROM media: {e}")
             return False
+
+    def cdrom_elements(self, inactive: bool = False) -> dict[str, ET.Element] | None:
+        """
+        ``{target: <disk>}`` for every CDROM of the live definition, or of
+        the persistent one (*inactive*); ``None`` when it cannot be read.
+        """
+        flags = ("--inactive",) if inactive else ()
+        result = self.virsh.execute("dumpxml", self.vm_name, *flags, warn=True)
+        if not result.ok:
+            return None
+        try:
+            root = ET.fromstring(result.stdout or '')
+        except ET.ParseError:
+            return None
+        found = {}
+        for disk in root.findall("./devices/disk"):
+            target = disk.find("target")
+            if (disk.get("device") == "cdrom" and target is not None
+                    and target.get("dev")):
+                found[target.get("dev")] = disk
+        return found
+
+    def media_layers(self, disk: ET.Element) -> list[tuple[str, str | None]] | None:
+        """
+        The images the CDROM *disk*, an element of one of the domain's
+        definitions, reads: ``(path, format)``, its own image first and the
+        one at the bottom of its chain last.
+
+        As the definition records them (:func:`recorded_layers`) — a live
+        one records the whole chain — or else as ``qemu-img info
+        --backing-chain`` reads them, run as configured for ``use_sudo``:
+        libvirt makes the overlay of a revert ``root`` and ``0600``. ``None``
+        when neither can tell.
+        """
+        layers = recorded_layers(disk)
+        if layers is not None:
+            return layers
+        source = disk.find("source")
+        path = source.get("file") if source is not None else None
+        return self.image_layers(path) if path else None
+
+    def image_layers(self, path: str) -> list[tuple[str, str | None]] | None:
+        """
+        ``(path, format)`` for the image at *path* and each one under it,
+        as ``qemu-img info --backing-chain`` reads them (see
+        :meth:`media_layers`); ``None`` when it cannot.
+        """
+        command = (f"qemu-img info --backing-chain --output=json -U "
+                   f"{shlex.quote(path)}")
+        try:
+            result = LibVirtCommandBase(
+                provider_config=self.provider_config).execute_shell(
+                    command, warn=True)
+        except Exception:
+            return None
+        if not result.ok:
+            return None
+        try:
+            chain = json.loads(result.stdout)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(chain, dict):
+            chain = [chain]
+        if not isinstance(chain, list) or not chain:
+            return None
+        layers = []
+        for image in chain:
+            if (not isinstance(image, dict)
+                    or not isinstance(image.get("filename"), str)
+                    or not image["filename"]):
+                return None
+            layers.append((image["filename"], image.get("format")))
+        return layers
+
+    def media_read(self, inactive: bool = False) -> dict[str, str]:
+        """
+        ``{target: image}`` for each CDROM of the live definition, or the
+        persistent one (*inactive*), whose media is built on another image:
+        the image at the bottom of its chain, the ISO it actually reads. A
+        snapshot revert leaves a drive on a qcow2 overlay of its ISO (#273).
+
+        Drives on an image built on nothing are left out, and so are empty
+        ones and any whose chain cannot be told (:meth:`media_layers`). The
+        persistent definition records no chain: one the live definition
+        records for the same image is taken before ``qemu-img`` is asked,
+        which without ``sudo`` cannot read a revert's ``root`` ``0600``
+        overlay.
+        """
+        elements = self.cdrom_elements(inactive=inactive) or {}
+        live: dict[str, list] = {}
+        if inactive and any(disk.find("source") is not None
+                            and recorded_layers(disk) is None
+                            for disk in elements.values()):
+            for disk in (self.cdrom_elements() or {}).values():
+                layers = recorded_layers(disk)
+                if layers:
+                    live[layers[0][0]] = layers
+        read = {}
+        for target, disk in elements.items():
+            source = disk.find("source")
+            layers = (live.get(source.get("file")) if source is not None
+                      else None) or self.media_layers(disk)
+            if layers and len(layers) > 1:
+                read[target] = layers[-1][0]
+        return read
+
+    def update_media(self, disk_xml: str, flags: list[str]) -> tuple[bool, str]:
+        """
+        ``virsh update-device`` of the domain with *disk_xml* and *flags*
+        (its scope, and ``--force``); ``(ok, stderr)``.
+        """
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.xml',
+                                         delete=False) as temp:
+            temp.write(disk_xml)
+            temp_path = temp.name
+        try:
+            result = self.virsh.execute("update-device", self.vm_name,
+                                        temp_path, *flags, warn=True)
+        finally:
+            os.unlink(temp_path)
+        return bool(result.ok), (result.stderr or '').strip()
+
+    def move_tray(self, alias: str, open_it: bool) -> bool:
+        """
+        Open (*open_it*, by force) or close the tray of the drive whose
+        device alias is *alias*, through QMP; whether qemu did.
+
+        The way past a libvirt bug, and only that. libvirt learns which
+        drives have a tray when it refreshes the disks of a qemu it started,
+        which a start from a memory image skips — ``qemuProcessStart`` defers
+        it to an incoming migration's finish — and which a snapshot revert
+        never makes up (``qemuSnapshotRevertActive``; libvirt 10.10 and
+        master alike; ``virsh restore`` does, in ``qemuSaveImageStartVM``).
+        It then changes media without opening the tray, and qemu refuses:
+        "Tray of device 'sata0-0-0' is not open". libvirt marks the domain
+        tainted for a monitor command until its next start.
+        """
+        command = {"execute": ("blockdev-open-tray" if open_it
+                               else "blockdev-close-tray"),
+                   "arguments": {"id": alias}}
+        if open_it:
+            command["arguments"]["force"] = True
+        result = self.virsh.execute("qemu-monitor-command", self.vm_name,
+                                    json.dumps(command), warn=True)
+        if not result.ok:
+            return False
+        try:
+            reply = json.loads(result.stdout or '')
+        except ValueError:
+            return False
+        return isinstance(reply, dict) and "return" in reply
+
+    def medium_in(self, alias: str) -> tuple[str | None, bool] | None:
+        """
+        What qemu holds in the drive whose device alias is *alias*, through
+        QMP ``query-block``: ``(the file of its medium, or None for an empty
+        drive, whether its tray is open)``; ``None`` when that cannot be
+        told. libvirt's definition keeps naming the medium it meant to
+        replace when a media change fails part-way, after it took the old
+        one out.
+        """
+        result = self.virsh.execute("qemu-monitor-command", self.vm_name,
+                                    json.dumps({"execute": "query-block"}),
+                                    warn=True)
+        if not result.ok:
+            return None
+        try:
+            reply = json.loads(result.stdout or '')
+        except ValueError:
+            return None
+        for device in (reply.get("return") or []) if isinstance(reply, dict) else []:
+            if isinstance(device, dict) and alias in (device.get("qdev"),
+                                                      device.get("device")):
+                inserted = device.get("inserted") or {}
+                return inserted.get("file"), bool(device.get("tray_open"))
+        return None
 
     def configure_from_config(self, cdrom_config: dict[str, Any],
                               reserved: Iterable[str] = (),
