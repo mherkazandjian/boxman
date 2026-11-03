@@ -1218,3 +1218,23 @@ def test_an_unclear_flux_destination_stops_before_bootstrap(lab, gitlab, message
     lab.edit(lambda w: w["gitlab"].update(gitlab))
     _refused(_install(lab, **FLUX_ON), message)
     assert "bootstrap_calls" not in lab.world()["flux"]
+
+
+@pytest.mark.parametrize("var", ["TALOS_CALL_TIMEOUT", "TALOS_REQUEST_TIMEOUT", "TALOS_KUBE_TIMEOUT",
+                                 "TALOS_PREBOOT_CHECKS"])
+def test_a_zero_bound_is_refused_before_anything_runs(lab, var):
+    """B9: timeout(1) and kubectl read 0 as "no bound"."""
+    _refused(_install(lab, **{var: "0"}), f"{var} must be a positive whole number")
+    assert "calls" not in lab.world()["boxman"]
+
+
+@pytest.mark.parametrize("var", ["TALOS_CALL_TIMEOUT", "TALOS_REQUEST_TIMEOUT"])
+def test_a_zero_bound_in_the_shipped_inputs_is_refused_on_the_control_vm(lab, var):
+    _ok(_install(lab))
+    with open(lab.root / "control-home" / "talos-unattended" / "control.env", "a") as fobj:
+        fobj.write(f"{var}=0\n")
+    before = len(lab.calls("talosctl")) + len(lab.calls("kubectl"))
+    proc = lab.run("control-exec.sh", "run", "--", "talos-unattended/scripts/bootstrap.sh",
+                   "--inputs", "talos-unattended/control.env", "--nodes", "talos-unattended/nodes.txt")
+    _refused(proc, f"{var} must be a positive whole number")
+    assert len(lab.calls("talosctl")) + len(lab.calls("kubectl")) == before

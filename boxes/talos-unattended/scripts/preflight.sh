@@ -75,6 +75,14 @@ FLUX=${TALOS_FLUX:-off}
     || problem "TALOS_INSTALL_DISK must be /dev/vda, the one boot disk boxman creates for each node (got $TALOS_INSTALL_DISK)"
 case "$FLUX" in on|off) ;; *) problem "TALOS_FLUX must be on or off, got $FLUX" ;; esac
 case "${TALOS_LIBVIRT_USE_SUDO:-true}" in true|false) ;; *) problem "TALOS_LIBVIRT_USE_SUDO must be true or false" ;; esac
+# every bound must be positive: a zero timeout is no timeout at all
+for var in TALOS_CONTROL_TIMEOUT TALOS_LEASE_TIMEOUT TALOS_MAINTENANCE_TIMEOUT TALOS_INSTALL_TIMEOUT \
+           TALOS_AUTH_TIMEOUT TALOS_ETCD_TIMEOUT TALOS_KUBE_TIMEOUT TALOS_FLUX_TIMEOUT \
+           TALOS_CALL_TIMEOUT TALOS_REQUEST_TIMEOUT TALOS_PREBOOT_CHECKS TALOS_RAM_HEADROOM_MIB; do
+    [ -z "${!var:-}" ] || [[ ${!var} =~ ^[1-9][0-9]*$ ]] || problem "$var must be a positive whole number, got ${!var}"
+done
+[ -z "${TALOS_POLL_SECONDS:-}" ] || [[ $TALOS_POLL_SECONDS =~ ^[0-9]+$ ]] \
+    || problem "TALOS_POLL_SECONDS must be a whole number of seconds"
 [ $missing = 0 ] && ok "inputs complete${INPUTS_FILE:+ ($INPUTS_FILE)}"
 
 # ---- versions: one consistent, well-formed tested set ------------------------

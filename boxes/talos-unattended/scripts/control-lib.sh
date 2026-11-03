@@ -59,9 +59,13 @@ load_inputs() {
     POLL=${TALOS_POLL_SECONDS:-10}
     CALL_TIMEOUT=${TALOS_CALL_TIMEOUT:-60}
     REQUEST_TIMEOUT=${TALOS_REQUEST_TIMEOUT:-30}
-    local n
-    for n in "$POLL" "$CALL_TIMEOUT" "$REQUEST_TIMEOUT"; do
-        [[ $n =~ ^[0-9]+$ ]] || die "TALOS_POLL_SECONDS, TALOS_CALL_TIMEOUT and TALOS_REQUEST_TIMEOUT must be whole seconds"
+    # a zero bound is no bound (timeout(1) and kubectl both read 0 as "never"):
+    # every timeout must be a positive number of seconds; polling may be 0
+    [[ $POLL =~ ^[0-9]+$ ]] || die "TALOS_POLL_SECONDS must be a whole number of seconds"
+    local var
+    for var in TALOS_CALL_TIMEOUT TALOS_REQUEST_TIMEOUT TALOS_MAINTENANCE_TIMEOUT TALOS_INSTALL_TIMEOUT \
+               TALOS_AUTH_TIMEOUT TALOS_ETCD_TIMEOUT TALOS_KUBE_TIMEOUT TALOS_FLUX_TIMEOUT TALOS_PREBOOT_CHECKS; do
+        [ -z "${!var:-}" ] || [[ ${!var} =~ ^[1-9][0-9]*$ ]] || die "$var must be a positive whole number, got ${!var}"
     done
     STATE=$TALOS_STATE_DIR
     TC=$STATE/talosconfig
