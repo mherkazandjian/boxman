@@ -122,6 +122,10 @@ templates:
       users:
         - name: admin
           homedir: /admin
+          # Ubuntu's cloud images already have an "admin" group (the old sudo
+          # group), so useradd cannot create the user's own group of that
+          # name and refuses the user; it joins the default group instead
+          no_user_group: true
           groups: [sudo]
           sudo: "ALL=(ALL) NOPASSWD:ALL"
           shell: /bin/bash
@@ -152,7 +156,15 @@ templates:
             set -euo pipefail
             bin=${TOOLS_BIN_DIR:-/usr/local/bin}
             marker=${READY_MARKER:-/var/lib/talos-unattended/template-ready}
+            user=${OPERATOR_USER:-admin}
+            keys=${OPERATOR_KEYS:-/admin/.ssh/authorized_keys}
             rm -f "$marker"
+            # the operator account cloud-init's users module made before this
+            # runs: without it, or without the operator key, nobody can log
+            # in to a clone, so the template is not ready
+            getent passwd "$user" >/dev/null || { echo "user $user was not created" >&2; exit 1; }
+            grep -qF "{{ operator_pubkey.split()[1] }}" "$keys" \
+                || { echo "$keys does not authorize the operator key" >&2; exit 1; }
             tmp=$(mktemp -d)
             trap 'rm -rf "$tmp"' EXIT
             fetch() {   # fetch <name> <url> <sha256>

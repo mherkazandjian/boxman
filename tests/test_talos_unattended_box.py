@@ -274,6 +274,10 @@ def template_build(tmp_path, monkeypatch):
     tools = tmp_path / "tools"
     tools.mkdir()
     marker = tmp_path / "var" / "template-ready"
+    # the operator account the users module made: root, which exists
+    # everywhere, with the rendered (placeholder) operator key
+    keys = tmp_path / "authorized_keys"
+    keys.write_text("ssh-ed25519 AAAAPLACEHOLDER operator@example\n")
 
     class Build:
         def __init__(self):
@@ -281,12 +285,15 @@ def template_build(tmp_path, monkeypatch):
             self.downloads = downloads
             self.tools = tools
             self.marker = marker
+            self.keys = keys
+            self.user = "root"
 
         def run(self):
             script = tmp_path / "prepare-control-template"
             script.write_text(_prepare_script(_template_userdata(monkeypatch, **self.pins)))
             env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "FAKE_DOWNLOADS": str(downloads),
-                   "TOOLS_BIN_DIR": str(tools), "READY_MARKER": str(marker)}
+                   "TOOLS_BIN_DIR": str(tools), "READY_MARKER": str(marker),
+                   "OPERATOR_USER": self.user, "OPERATOR_KEYS": str(self.keys)}
             return subprocess.run(["bash", str(script)], capture_output=True,
                                   text=True, env=env, timeout=60)
 
@@ -302,6 +309,28 @@ def test_template_ready_after_every_tool_installs(template_build):
     assert f"/talos/releases/download/{TALOS_VERSION}/talosctl-linux-amd64" in requested
     assert "/release/v9.9.9/bin/linux/amd64/kubectl" in requested
     assert "/flux2/releases/download/v9.9.9/flux_9.9.9_linux_amd64.tar.gz" in requested
+
+
+def test_a_template_without_the_operator_account_is_not_ready(template_build):
+    """The users module can fail (Ubuntu's images have an "admin" group)."""
+    template_build.user = "no-such-operator-account"
+    proc = template_build.run()
+    assert proc.returncode != 0 and "was not created" in proc.stderr
+    assert not template_build.marker.exists()
+
+
+def test_a_template_that_does_not_authorize_the_operator_key_is_not_ready(template_build):
+    template_build.keys.write_text("ssh-ed25519 AAAAOTHERKEY someone@example\n")
+    proc = template_build.run()
+    assert proc.returncode != 0 and "does not authorize the operator key" in proc.stderr
+    assert not template_build.marker.exists()
+
+
+def test_the_operator_user_gets_no_group_of_its_own(monkeypatch):
+    """useradd cannot create a user group named like Ubuntu's "admin" group."""
+    users = _template_userdata(monkeypatch)["users"]
+    admin = next(u for u in users if u["name"] == "admin")
+    assert admin["no_user_group"] is True
 
 
 @pytest.mark.parametrize("breakage", [
