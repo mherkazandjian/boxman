@@ -1238,3 +1238,19 @@ def test_a_zero_bound_in_the_shipped_inputs_is_refused_on_the_control_vm(lab, va
                    "--inputs", "talos-unattended/control.env", "--nodes", "talos-unattended/nodes.txt")
     _refused(proc, f"{var} must be a positive whole number")
     assert len(lab.calls("talosctl")) + len(lab.calls("kubectl")) == before
+
+
+@pytest.mark.parametrize("list_format", ["single", "multi"])
+def test_both_talosctl_list_formats_are_read(lab, list_format):
+    """Attempt 3: for one node talosctl prints names only, without a header."""
+    _edit_node(lab, "192.168.53.11", list_format=list_format)
+    proc = _ok(_install(lab))
+    assert "cp-01=Preparing/data-empty" in proc.stderr
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+
+
+@pytest.mark.parametrize("text", ["NODE NAME\n192.168.53.11 . extra\n", "a b c\n", "\n"])
+def test_an_unexpected_list_output_is_unknown_and_never_bootstraps(lab, text):
+    lab.set_world(garbage={"talosctl list /var/lib/etcd": text})
+    _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "data-unknown", status=3)
+    assert "bootstrap_calls" not in lab.world()["talos"]

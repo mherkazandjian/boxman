@@ -69,8 +69,9 @@ etcd_state() { tauth "$1" service etcd 2>/dev/null | awk '$1 == "STATE" {print $
 
 # etcd_data ADDR: "empty" when ADDR's etcd data directory is positively
 # empty or absent, "data" when it holds anything, "unknown" otherwise. Read
-# with the authenticated file API and parsed strictly (a NODE/NAME header,
-# then one entry per line).
+# with the authenticated file API and parsed strictly. For one node, talosctl
+# v1.14 prints one name per line and no header (seen live: just "."); for
+# several, a NODE/NAME header and two columns. Anything else is unknown.
 etcd_data() {
     local out rc=0
     out=$(tauth "$1" list /var/lib/etcd 2>&1) || rc=$?
@@ -81,11 +82,11 @@ etcd_data() {
         esac
         return
     fi
-    awk 'NR == 1 { if ($1 != "NODE" || $NF != "NAME") bad = 1; next }
-         NF == 0 { next }
-         NF != 2 { bad = 1; next }
-         $2 != "." { data = 1 }
-         END { print bad ? "unknown" : data ? "data" : "empty" }' <<< "$out"
+    awk 'NF == 0 { next }
+         !seen++ && $1 == "NODE" && $2 == "NAME" && NF == 2 { cols = 2; next }
+         NF != (cols ? 2 : 1) { bad = 1; next }
+         $NF != "." { data = 1 }
+         END { print bad || !seen ? "unknown" : data ? "data" : "empty" }' <<< "$out"
 }
 
 # preboot: every control plane positively before its first bootstrap,

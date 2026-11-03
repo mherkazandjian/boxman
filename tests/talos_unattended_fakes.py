@@ -377,9 +377,14 @@ def talosctl(world: dict, argv: list[str]) -> None:
         entries = ["."]
         if mode == "data" or (talos.get("bootstrapped") and node.get("role") == "controlplane"):
             entries.append("member")
-        print("NODE   NAME")
-        for entry in entries:
-            print(f"{addr}   {entry}")
+        # one node: names only, no header (talosctl v1.14, seen live); several
+        # nodes: a NODE/NAME header and two columns
+        if node.get("list_format") == "multi":
+            print("NODE   NAME")
+            for entry in entries:
+                print(f"{addr}   {entry}")
+        else:
+            print("\n".join(entries))
     elif words == ["bootstrap"]:
         talos["bootstrap_calls"] = talos.get("bootstrap_calls", 0) + 1
         mode = talos.get("bootstrap_fail")
