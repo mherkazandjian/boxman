@@ -322,7 +322,10 @@ done <<< "$addrs"
 routes=$(ip -4 route show) || inventory_fail "list the host's IPv4 routes (ip -4 route show)"
 while read -r line; do
     [ -n "$line" ] || continue
+    set -f
+    # shellcheck disable=SC2086  # split the route into its words, no globbing
     set -- $line
+    set +f
     case "$1" in
         unicast|local|broadcast|multicast|throw|unreachable|prohibit|blackhole|nat) shift ;;
     esac

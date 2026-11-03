@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2034  # the variables set here are read by the sourcing scripts
 # Shared by the host-side scripts of boxes/talos-unattended (install.sh,
 # preflight.sh, control-exec.sh, status.sh). Sourced, never run. The caller
 # sets PROG before sourcing.

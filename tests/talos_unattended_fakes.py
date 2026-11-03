@@ -139,6 +139,7 @@ def virsh(world: dict, argv: list[str]) -> None:
                   f"Physical:       {disk.get('allocation', 200704)}")
         else:
             agent(dom, json.loads(args[1]))
+            save(world)
     elif cmd == "net-dhcp-leases":
         mac = opt(args, "--mac")
         print(" Expiry Time           MAC address         Protocol   IP address    Hostname   Client ID\n"

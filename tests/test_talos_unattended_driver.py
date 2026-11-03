@@ -40,7 +40,16 @@ CONTROL = f"{PREFIX}_management_control"
 CP1 = f"{PREFIX}_talos_cp-01"
 W1 = f"{PREFIX}_talos_worker-01"
 GIB = 1 << 30
-TALOS_VERSION = "v1.99.0"
+
+
+def _pins() -> dict:
+    with open(os.path.join(BOX, "versions.env")) as fobj:
+        lines = [line.strip() for line in fobj]
+    return dict(line.split("=", 1) for line in lines if line and not line.startswith("#"))
+
+
+PINS = _pins()
+TALOS_VERSION = PINS["TALOS_VERSION"]
 
 
 def _gen_fake() -> str:
@@ -425,3 +434,484 @@ def test_a_backup_symlinked_to_a_place_outside_the_workspace_passes(host):
     (host.root / "backup-link").symlink_to(elsewhere)
     _set_inputs(host, TALOS_BACKUP_DIR=f"{host.root}/backup-link/lab")
     _ok(host.run("preflight.sh"))
+
+
+# --------------------------------------------------------------------------- #
+# the whole driver: install.sh against a fake lab                             #
+# --------------------------------------------------------------------------- #
+CONTROL_MAC = "52:54:00:aa:bb:cc"
+CONTROL_IP = "192.168.53.150"
+HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyOfTheControlVm"
+NODES = {
+    "cp-01": ("controlplane", "192.168.53.11", "52:54:00:53:00:11", 50 * GIB),
+    "worker-01": ("worker", "192.168.53.21", "52:54:00:53:00:21", 150 * GIB),
+}
+
+
+def _arrange_lab(host) -> None:
+    """What `boxman up` creates: the control VM and two maintenance-mode nodes."""
+    lab = str(host.lab_dir)
+    creates = {CONTROL: {
+        "uuid": "uuid-control", "nics": [{"source": NETWORK, "mac": CONTROL_MAC}],
+        "disks": [{"device": "disk", "target": "vda", "source": f"{lab}/management/{CONTROL}.qcow2",
+                   "capacity": 40 * GIB}],
+        "agent": {"files": {"/etc/ssh/ssh_host_ed25519_key.pub": HOST_KEY + " root@control\n"}},
+    }}
+    leases = [{"mac": CONTROL_MAC, "ip": CONTROL_IP}]
+    talos = {"vip": "192.168.53.5", "nodes": {}}
+    for name, (role, addr, mac, size) in NODES.items():
+        dom = f"{PREFIX}_talos_{name}"
+        creates[dom] = {
+            "uuid": f"uuid-{name}", "nics": [{"source": NETWORK, "mac": mac}],
+            "disks": [{"device": "disk", "target": "vda", "source": f"{lab}/talos/{dom}.qcow2", "capacity": size},
+                      {"device": "cdrom", "target": "sda", "source": "/cache/talos.iso", "capacity": 366292992}],
+        }
+        leases.append({"mac": mac, "ip": addr})
+        talos["nodes"][addr] = {
+            "name": name, "role": role, "mode": "maintenance",
+            "links": [{"id": "ens3", "permanentAddr": mac, "hardwareAddr": mac}],
+            "disks": [{"id": "vda", "dev_path": "/dev/vda", "size": size, "readonly": False, "cdrom": False},
+                      {"id": "sr0", "dev_path": "/dev/sr0", "size": 366292992, "readonly": True, "cdrom": True}],
+            "volumes": [{"id": "sr0", "dev_path": "/dev/sr0", "parent": "", "name": "iso9660"}],
+        }
+    host.set_world(
+        boxman={"creates": creates, "networks": {NETWORK: {"address": "192.168.53.1", "bridge": "virbr53"}},
+                "leases": {NETWORK: leases}},
+        control={"user": "admin", "ip": CONTROL_IP, "host_key": HOST_KEY, "key_path": host.key_path,
+                 "home": str(host.root / "control-home")},
+        talos=talos, kubectl_version=PINS["KUBECTL_VERSION"], flux_version=PINS["FLUX_VERSION"],
+    )
+
+
+@pytest.fixture
+def lab(host):
+    _arrange_lab(host)
+    return host
+
+
+STATE = "control-home/state"
+
+
+def _talos_calls(host, *words) -> list[str]:
+    return [c for c in host.calls("talosctl") if all(w in c.split() for w in words)]
+
+
+def _install(host, **env):
+    return host.run("install.sh", **env)
+
+
+def test_install_converges_from_nothing(lab):
+    proc = _ok(_install(lab))
+    err = proc.stderr
+    assert "install: converged: project lab353, smoke profile" in err
+    # the order of the stages
+    stages = [line.split("== ", 1)[1].split(":")[0] for line in err.splitlines() if "install: == " in line]
+    assert stages == ["preflight", "up", "control", "nodes", "ship", "restore", "generate",
+                      "apply", "bootstrap", "status"]
+    world = lab.world()
+    assert world["boxman"]["calls"] == 1
+    # each node got its config once, through the maintenance API, then authenticated
+    assert len(_talos_calls(lab, "apply-config")) == 2
+    assert all("--insecure" in c for c in _talos_calls(lab, "apply-config"))
+    assert [n["mode"] for n in world["talos"]["nodes"].values()] == ["installed", "installed"]
+    # etcd bootstrapped exactly once, on the control plane's own address
+    assert world["talos"]["bootstrap_calls"] == 1
+    assert _talos_calls(lab, "bootstrap") == [
+        f"talosctl --talosconfig {lab.root}/{STATE}/talosconfig -e 192.168.53.11 -n 192.168.53.11 bootstrap"]
+    # no Talos API call ever went through the VIP
+    assert not [c for c in lab.calls("talosctl") if "192.168.53.5" in c.split()]
+    # the permanent_addr check ran and was recorded
+    assert "link ens3 has permanent_addr 52:54:00:53:00:11 (the reserved MAC)" in err
+    # status from the control VM
+    assert "kube       2/2 nodes Ready" in proc.stdout and "test pod: smoke-1 Running worker-01" in proc.stdout
+    # the private state: backup, record, kubeconfig
+    backup = lab.backup / "state"
+    assert (backup / "secrets.yaml").exists() and (backup / "journal" / "cp-01.applied").exists()
+    assert oct(os.stat(lab.backup).st_mode & 0o777) == "0o700"
+    kubeconfig = lab.driver / "kubeconfig"
+    assert oct(os.stat(kubeconfig).st_mode & 0o777) == "0o600"
+    record = (lab.driver / "run.env").read_text()
+    assert "uuid.control=uuid-control" in record and "uuid.cp-01=uuid-cp-01" in record
+    assert "identity=" in record
+
+
+def test_install_prints_no_secret(lab):
+    proc = _ok(_install(lab))
+    assert "FAKESECRET" not in proc.stdout + proc.stderr
+
+
+def test_a_second_run_converges_without_touching_identity_configs_or_etcd(lab):
+    _ok(_install(lab))
+    secrets = (lab.root / STATE / "secrets.yaml").read_bytes()
+    record = (lab.driver / "run.env").read_text()
+    calls = len(lab.calls("talosctl"))
+    proc = _ok(_install(lab))
+    new = lab.calls("talosctl")[calls:]
+    assert not [c for c in new if "apply-config" in c or c.endswith(" bootstrap") or "gen secrets" in c]
+    assert not [c for c in new if "--insecure" in c]
+    assert (lab.root / STATE / "secrets.yaml").read_bytes() == secrets
+    assert (lab.driver / "run.env").read_text() == record
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+    assert "cp-01: recorded" in proc.stdout and "worker-01: recorded" in proc.stdout
+    assert "etcd: bootstrapped earlier" in proc.stderr
+    assert "kubeconfig: keeping" in proc.stderr
+    assert "cp-01: unchanged" in proc.stdout
+
+
+def test_a_concurrent_install_is_refused(lab):
+    import fcntl
+    lab.driver.mkdir(parents=True)
+    with open(lab.driver / ".install.lock", "w") as fobj:
+        fcntl.flock(fobj, fcntl.LOCK_EX)
+        _refused(_install(lab), "another install.sh holds")
+    assert lab.world()["boxman"].get("calls", 0) == 0
+
+
+# ---- preflight and up --------------------------------------------------------
+def test_a_failed_preflight_stops_before_boxman(lab):
+    lab.meminfo(1 << 20)
+    _refused(_install(lab), "stage preflight failed")
+    assert "calls" not in lab.world()["boxman"]
+    assert not lab.backup.exists()
+
+
+def test_a_failed_boxman_up_stops_the_run(lab):
+    lab.edit(lambda w: w["boxman"].update(rc=1))
+    _refused(_install(lab), "stage up failed")
+    assert not lab.calls("ssh")
+
+
+def test_a_recreated_vm_is_drift(lab):
+    _ok(_install(lab))
+    lab.edit(lambda w: w["domains"][W1].update(uuid="someone-else"))
+    _refused(_install(lab), "is not the domain this driver created", status=1)
+    assert len(_talos_calls(lab, "apply-config")) == 2
+
+
+# ---- control -----------------------------------------------------------------
+def test_ssh_is_refused_when_the_host_key_is_not_the_guests(lab):
+    """The pinned key comes from the guest agent; a different server key fails."""
+    lab.edit(lambda w: w["control"].update(host_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAnImpostor"))
+    _refused(_install(lab, TALOS_CONTROL_TIMEOUT="1"), "Host key verification failed")
+    assert not (lab.root / STATE).exists()
+
+
+def test_a_control_vm_without_its_agent_is_not_trusted(lab):
+    lab.edit(lambda w: w["boxman"]["creates"][CONTROL].pop("agent"))
+    _refused(_install(lab, TALOS_CONTROL_TIMEOUT="1"), "guest agent")
+    assert not lab.calls("ssh")
+
+
+def test_ssh_uses_only_the_operator_key(lab):
+    other = lab.root / "keys" / "other"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(other)], check=True)
+    lab.edit(lambda w: w["control"].update(key_path=str(other)))
+    _refused(_install(lab, TALOS_CONTROL_TIMEOUT="1"), "Permission denied (publickey)")
+
+
+def test_unpinned_control_tools_stop_the_run(lab):
+    lab.set_world(flux_version="v2.9.0")
+    _refused(_install(lab), f"flux is v2.9.0, the version set pins {PINS['FLUX_VERSION']}")
+    assert not _talos_calls(lab, "gen", "secrets")
+
+
+def test_control_exec_quotes_arguments_for_the_remote_shell(lab):
+    _ok(_install(lab))
+    proc = _ok(lab.run("control-exec.sh", "run", "--", "printf", "%s|", "a b", "$HOME", "'q'"))
+    assert proc.stdout == "a b|$HOME|'q'|"
+
+
+# ---- nodes -------------------------------------------------------------------
+@pytest.mark.parametrize("change,message", [
+    (lambda w: w["boxman"]["leases"][NETWORK][1].update(ip="192.168.53.111"),
+     "cp-01: the lease for 52:54:00:53:00:11 is 192.168.53.111, not the reserved 192.168.53.11"),
+    (lambda w: w["boxman"]["creates"][CP1]["nics"][0].update(mac="52:54:00:53:00:99"),
+     "cp-01: expected exactly one NIC"),
+    (lambda w: w["boxman"]["creates"][CP1]["nics"].append({"source": "other", "mac": "52:54:00:00:00:01"}),
+     "cp-01: expected exactly one NIC"),
+    (lambda w: w["boxman"]["creates"][CP1]["disks"][0].update(source="/var/lib/libvirt/images/ceph.qcow2"),
+     "cp-01: its boot disk /var/lib/libvirt/images/ceph.qcow2 is not in this project's workspace"),
+    (lambda w: w["boxman"]["creates"][W1]["disks"][0].update(capacity=100 * GIB),
+     "worker-01: its boot disk is 107374182400 bytes"),
+])
+def test_node_identity_is_checked_before_anything_reaches_a_node(lab, change, message):
+    lab.edit(change)
+    _refused(_install(lab), message, status=3)
+    assert not _talos_calls(lab, "apply-config")
+    assert not (lab.root / STATE).exists()
+
+
+def test_a_node_without_a_lease_times_out(lab):
+    lab.edit(lambda w: w["boxman"]["leases"][NETWORK].pop())
+    _refused(_install(lab, TALOS_LEASE_TIMEOUT="1"), "worker-01: no DHCP lease for 52:54:00:53:00:21")
+    assert not _talos_calls(lab, "apply-config")
+
+
+# ---- apply -------------------------------------------------------------------
+def _node(addr):
+    return lambda w: w["talos"]["nodes"][addr]
+
+
+def _edit_node(host, addr, **changes):
+    host.edit(lambda w: w["talos"]["nodes"][addr].update(changes))
+
+
+@pytest.mark.parametrize("changes,message", [
+    ({"links": [{"id": "ens3", "permanentAddr": "", "hardwareAddr": "52:54:00:53:00:21"}]},
+     "carries 52:54:00:53:00:21 as its hardware address but not as permanent_addr"),
+    ({"links": [{"id": "ens3", "permanentAddr": "52:54:00:99:99:99", "hardwareAddr": "52:54:00:99:99:99"}]},
+     "no link has the reserved MAC 52:54:00:53:00:21"),
+    ({"disks": [{"id": "vda", "dev_path": "/dev/vda", "size": 100 * GIB, "readonly": False, "cdrom": False}]},
+     "/dev/vda is 107374182400 bytes, not the 161061273600-byte disk"),
+    ({"disks": [{"id": "vdb", "dev_path": "/dev/vdb", "size": 150 * GIB, "readonly": False, "cdrom": False}]},
+     "has no /dev/vda"),
+    ({"volumes": [{"id": "vda1", "dev_path": "/dev/vda1", "parent": "vda", "name": "xfs"}]},
+     "/dev/vda is not empty (/dev/vda1)"),
+    ({"volumes": [{"id": "vda", "dev_path": "/dev/vda", "parent": "", "name": "gpt"}]},
+     "/dev/vda is not empty (/dev/vda)"),
+])
+def test_a_node_whose_link_or_disk_is_not_the_expected_one_gets_nothing(lab, changes, message):
+    _edit_node(lab, "192.168.53.21", **changes)
+    _refused(_install(lab), message, status=3)
+    applied = _talos_calls(lab, "apply-config")
+    assert all("192.168.53.21" not in c for c in applied)
+    # the backup kept what was done, and a rerun after the fix converges
+    assert (lab.backup / "state" / "journal").is_dir()
+
+
+def test_disks_the_maintenance_api_cannot_list_volumes_of_are_still_size_checked(lab):
+    _edit_node(lab, "192.168.53.11", volumes_forbidden=True)
+    proc = _ok(_install(lab))
+    assert "volumes are not listable in maintenance mode" in proc.stderr
+
+
+def test_a_failed_apply_is_retried_only_while_the_node_is_unconfigured(lab):
+    lab.edit(lambda w: w["talos"].update(apply_fail={"192.168.53.21": "error"}))
+    _refused(_install(lab), "worker-01: apply-config failed")
+    assert (lab.root / STATE / "journal" / "worker-01.applying").exists()
+    lab.edit(lambda w: w["talos"].pop("apply_fail"))
+    proc = _ok(_install(lab))
+    assert "worker-01: an earlier apply never took effect" in proc.stderr
+    assert lab.world()["talos"]["nodes"]["192.168.53.21"]["applies"] == 2
+
+
+def test_an_apply_whose_answer_was_lost_is_recovered_not_resent(lab):
+    lab.edit(lambda w: w["talos"].update(apply_fail={"192.168.53.21": "lost"}))
+    _refused(_install(lab), "worker-01: apply-config failed")
+    lab.edit(lambda w: w["talos"].pop("apply_fail"))
+    proc = _ok(_install(lab))
+    assert "worker-01: recovered" in proc.stdout
+    assert lab.world()["talos"]["nodes"]["192.168.53.21"]["applies"] == 1
+
+
+def test_an_installed_node_that_stops_authenticating_is_never_retried_insecurely(lab):
+    _ok(_install(lab))
+    insecure = len([c for c in lab.calls("talosctl") if "--insecure" in c])
+    _edit_node(lab, "192.168.53.21", auth="reject")
+    _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "not retrying in insecure mode")
+    assert len([c for c in lab.calls("talosctl") if "--insecure" in c]) == insecure
+
+
+def test_a_node_reset_to_maintenance_after_install_is_not_reinstalled(lab):
+    _ok(_install(lab))
+    _edit_node(lab, "192.168.53.21", mode="maintenance")
+    _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "worker-01 was configured by this cluster")
+    assert lab.world()["talos"]["nodes"]["192.168.53.21"]["applies"] == 1
+
+
+def test_a_changed_config_on_an_installed_node_is_drift_not_an_update(lab, tmp_path):
+    _ok(_install(lab))
+    patches = tmp_path / "patches"
+    patches.mkdir()
+    (patches / "worker.yaml").write_text("apiVersion: v1alpha1\nkind: KubeletConfig\nextraArgs:\n  v: '2'\n")
+    with open(lab.inputs_file, "a") as fobj:
+        fobj.write(f"TALOS_PATCH_DIR={patches}\n")
+    proc = _refused(_install(lab), "worker-01: its config changed since it was applied", status=3)
+    assert "v0 does not update installed nodes" in proc.stderr
+    assert lab.world()["talos"]["nodes"]["192.168.53.21"]["applies"] == 1
+
+
+def test_an_unconfigured_looking_node_that_authenticates_is_left_alone(lab):
+    """No journal, but the node already trusts this CA: state was lost."""
+    _ok(_install(lab))
+    (lab.root / STATE / "journal" / "worker-01.applied").unlink()
+    (lab.backup / "state" / "journal" / "worker-01.applied").unlink()
+    _refused(_install(lab, TALOS_MAINTENANCE_TIMEOUT="1"), "no record of configuring it", status=3)
+    assert lab.world()["talos"]["nodes"]["192.168.53.21"]["applies"] == 1
+
+
+def test_a_node_that_never_answers_times_out(lab):
+    _edit_node(lab, "192.168.53.21", mode="off")
+    _refused(_install(lab, TALOS_MAINTENANCE_TIMEOUT="1"), "worker-01: no maintenance API at 192.168.53.21")
+
+
+# ---- bootstrap -----------------------------------------------------------------
+def test_a_bootstrap_whose_answer_was_lost_is_recovered_not_repeated(lab):
+    lab.edit(lambda w: w["talos"].update(bootstrap_fail="error-after"))
+    _refused(_install(lab), "the bootstrap RPC to cp-01 failed")
+    lab.edit(lambda w: w["talos"].pop("bootstrap_fail"))
+    proc = _ok(_install(lab))
+    assert "the earlier bootstrap took effect" in proc.stderr
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+    assert "recovered" in (lab.backup / "state" / "journal" / "bootstrap.done").read_text()
+
+
+def test_an_unconfirmed_bootstrap_without_etcd_stops_instead_of_bootstrapping_again(lab):
+    lab.edit(lambda w: w["talos"].update(bootstrap_fail="error-before"))
+    _refused(_install(lab), "the bootstrap RPC to cp-01 failed")
+    lab.edit(lambda w: w["talos"].pop("bootstrap_fail"))
+    proc = _refused(_install(lab, TALOS_ETCD_TIMEOUT="1"), "Not bootstrapping again", status=3)
+    assert "remove" in proc.stderr and "bootstrap.intent" in proc.stderr
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+
+
+def test_an_existing_etcd_is_never_bootstrapped(lab):
+    _ok(_install(lab))
+    for name in ("bootstrap.done", "bootstrap.intent"):
+        for root in (lab.root / STATE, lab.backup / "state"):
+            (root / "journal" / name).unlink(missing_ok=True)
+    proc = _ok(_install(lab))
+    assert "already reports members; the cluster exists, no bootstrap" in proc.stderr
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+
+
+def test_bootstrap_waits_for_time_sync_and_records_nothing_before(lab):
+    _edit_node(lab, "192.168.53.11", synced=False)
+    _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "cp-01's time is not synchronised")
+    assert not (lab.root / STATE / "journal" / "bootstrap.intent").exists()
+    assert "bootstrap_calls" not in lab.world()["talos"]
+
+
+@pytest.mark.parametrize("kube,message", [
+    ({"not_ready": ["worker-01"]}, "not every node is Ready"),
+    ({"not_rolled_out": ["deployment/coredns"]}, "CoreDNS did not roll out"),
+    ({"not_rolled_out": ["daemonset/kube-flannel"]}, "the CNI daemonset kube-flannel did not roll out"),
+    ({"not_rolled_out": ["deployment/smoke"]}, "the test Deployment did not become available"),
+    ({"smoke_pending": True}, "the test Deployment has no Running, scheduled pod"),
+])
+def test_an_unhealthy_cluster_fails_the_run_and_a_rerun_resumes(lab, kube, message):
+    lab.set_world(kube=kube)
+    _refused(_install(lab, TALOS_KUBE_TIMEOUT="1"), message)
+    lab.set_world(kube={})
+    _ok(_install(lab))
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+
+
+# ---- identity: restore, drift ------------------------------------------------
+def test_a_control_vm_that_lost_its_state_gets_it_back_from_the_backup(lab):
+    import shutil
+    _ok(_install(lab))
+    secrets = (lab.backup / "state" / "secrets.yaml").read_bytes()
+    shutil.rmtree(lab.root / STATE)
+    proc = _ok(_install(lab))
+    assert "restored from" in proc.stderr
+    assert (lab.root / STATE / "secrets.yaml").read_bytes() == secrets
+    assert len(_talos_calls(lab, "gen", "secrets")) == 1
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+
+
+def test_an_identity_lost_everywhere_stops_the_run(lab):
+    import shutil
+    _ok(_install(lab))
+    shutil.rmtree(lab.root / STATE)
+    shutil.rmtree(lab.backup / "state")
+    _refused(_install(lab), "neither the control VM nor", status=3)
+    assert len(_talos_calls(lab, "gen", "secrets")) == 1
+
+
+def test_a_changed_identity_on_the_control_vm_is_drift(lab):
+    _ok(_install(lab))
+    record = lab.driver / "run.env"
+    record.write_text(record.read_text().replace("identity=", "identity=0000"))
+    _refused(_install(lab), "the control VM's cluster identity changed", status=3)
+
+
+# ---- status --------------------------------------------------------------------
+def test_status_reports_a_healthy_lab_and_changes_nothing(lab):
+    _ok(_install(lab))
+    before = lab.world()
+    proc = _ok(lab.run("status.sh"))
+    assert "control    running, uuid as recorded" in proc.stdout
+    assert "etcd       bootstrapped once" in proc.stdout
+    assert lab.world()["talos"] == before["talos"]
+
+
+def test_status_fails_when_a_node_is_down(lab):
+    _ok(_install(lab))
+    _edit_node(lab, "192.168.53.21", mode="off")
+    proc = lab.run("status.sh")
+    assert proc.returncode == 1
+    assert "authenticated API DOES NOT answer" in proc.stdout
+
+
+# ---- flux ----------------------------------------------------------------------
+FLUX_ON = dict(FLUX_INPUTS, TALOS_FLUX="on")
+
+
+def _gitlab(lab, projects=("lab-group/fleet",)):
+    lab.edit(lambda w: (w.update(gitlab={"token": "glpat-FAKESECRET", "projects": list(projects)}),
+                        w.setdefault("flux", {}).update(token="glpat-FAKESECRET")))
+
+
+def test_flux_bootstraps_once_to_the_given_target_with_the_token_off_argv(lab):
+    _gitlab(lab)
+    proc = _ok(_install(lab, **FLUX_ON))
+    flux = lab.world()["flux"]
+    assert flux["bootstrap_calls"] == 1
+    assert flux["installed"] == {"url": "https://gitlab.example/lab-group/fleet.git", "branch": "main",
+                                 "path": "./clusters/lab"}
+    assert "--deploy-token-auth" in flux["args"] and "--personal" not in flux["args"]
+    assert "flux       root GitRepository and Kustomization Ready" in proc.stdout
+    # the token never reaches an argv, the log or a shipped file
+    assert not [c for c in lab.calls() if "FAKESECRET" in c]
+    assert "FAKESECRET" not in proc.stdout + proc.stderr
+    assert "glpat" not in (lab.root / "control-home" / "talos-unattended" / "control.env").read_text()
+    # a rerun checks and leaves it alone
+    _ok(_install(lab, **FLUX_ON))
+    assert lab.world()["flux"]["bootstrap_calls"] == 1
+
+
+def test_flux_never_creates_a_missing_repository(lab):
+    _gitlab(lab, projects=())
+    _refused(_install(lab, **FLUX_ON), "is not an existing project this credential can read")
+    assert "bootstrap_calls" not in lab.world()["flux"]
+
+
+def test_flux_bootstrapped_elsewhere_is_drift(lab):
+    _gitlab(lab)
+    _ok(_install(lab, **FLUX_ON))
+    _refused(_install(lab, **dict(FLUX_ON, GITOPS_CLUSTER_PATH="./clusters/other")),
+             "flux: already bootstrapped from", status=3)
+    assert lab.world()["flux"]["bootstrap_calls"] == 1
+
+
+def test_a_failed_flux_bootstrap_fails_the_run(lab):
+    _gitlab(lab)
+    lab.edit(lambda w: w["flux"].update(bootstrap_fail=True))
+    _refused(_install(lab, **FLUX_ON), "flux: bootstrap failed")
+
+
+def test_a_flux_that_does_not_become_ready_fails_the_run(lab):
+    _gitlab(lab)
+    lab.edit(lambda w: w["flux"].update(not_ready=True))
+    _refused(_install(lab, **dict(FLUX_ON, TALOS_FLUX_TIMEOUT="1")), "flux: flux check failed")
+
+
+def test_a_wrong_credential_fails_flux_and_is_not_printed(lab):
+    _gitlab(lab)
+    proc = _refused(_install(lab, **dict(FLUX_ON, GITLAB_TOKEN="glpat-WRONG")), "is not an existing project")
+    assert "glpat-WRONG" not in proc.stdout + proc.stderr
+    assert not [c for c in lab.calls() if "glpat" in c]
+
+
+def test_flux_off_runs_no_flux_and_needs_no_credential(lab):
+    _ok(_install(lab))
+    assert not lab.calls("flux") or all("version" in c for c in lab.calls("flux"))
+    assert not lab.calls("curl")
+
+
+def test_flux_sh_refuses_to_run_unless_flux_is_on(lab):
+    _ok(_install(lab))
+    proc = lab.run("control-exec.sh", "run", "--", "talos-unattended/scripts/flux.sh",
+                   "--inputs", "talos-unattended/control.env", stdin="glpat-FAKESECRET\n")
+    _refused(proc, "Flux is opt-in")
