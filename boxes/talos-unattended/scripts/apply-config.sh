@@ -6,7 +6,8 @@
 # Runs on the control VM, after gen-config.sh, with the node table it used
 # ("<name> <role> <ipv4> <mac>") and a disk table ("<name> <bytes>": the size
 # of the boot disk boxman created for that node). Every node is in one of
-# three states, decided from this cluster's journal, never from guesswork:
+# three states, decided from this cluster's journal, never from guesswork
+# (a journal entry that cannot be read stops the run):
 #
 #   recorded    journal/<node>.applied holds the hash of the config applied
 #               to it. Only the authenticated API is used: it must answer
@@ -27,8 +28,11 @@
 #                 - exactly one link has permanent_addr equal to the
 #                   reserved MAC: the selector of the generated
 #                   LinkAliasConfig, mac(link.permanent_addr), relies on it;
-#                 - TALOS_INSTALL_DISK exists, is the size boxman created,
-#                   is writable, not a CD-ROM, and holds no partitions.
+#                 - TALOS_INSTALL_DISK is the node's only writable disk, of
+#                   the size boxman created, and positively empty: the
+#                   maintenance volume listing shows nothing on it, or the
+#                   host saw nothing written to it since its creation
+#                   (third column of the disk table).
 #               Then the intent is journaled, the config is applied through
 #               the maintenance API, and the node must come back on the
 #               authenticated API (bounded wait) before it is recorded.
@@ -78,27 +82,40 @@ check_link() {
     esac
 }
 
-# check_disk NAME ADDR: the install disk is the empty disk boxman created
+# check_disk NAME ADDR: the install disk is the empty disk boxman created.
+# It must be the node's only writable disk, of the declared size, and there
+# must be positive evidence it is empty: either the maintenance API's volume
+# listing names it with nothing on it, or (when that listing is unavailable)
+# the host saw no byte written to it since boxman created it ("created-empty"
+# in the disk table). A listing that fails to parse is no evidence at all.
 check_disk() {
-    local name=$1 addr=$2 want rows row id size ro cdrom vols used
-    want=$(disk_bytes "$name")
+    local name=$1 addr=$2 want evidence rows id dev size vols used writable
+    want=$(awk -v n="$name" '$1 == n {print $2; exit}' "$DISKS_FILE")
+    evidence=$(awk -v n="$name" '$1 == n {print $3; exit}' "$DISKS_FILE")
     [[ $want =~ ^[0-9]+$ ]] || die "$name: no boot disk size in $DISKS_FILE"
     rows=$(tmaint "$addr" get disks -o yaml | yaml_rows dev_path size readonly cdrom) \
-        || die "$name: cannot list its disks through the maintenance API"
-    row=$(awk -v d="$TALOS_INSTALL_DISK" '$2 == d' <<< "$rows")
-    [ -n "$row" ] || drift "$name: has no $TALOS_INSTALL_DISK; disks: $(tr '\n' ';' <<< "$rows")"
-    read -r id _ size ro cdrom <<< "$row"
-    [ "$size" = "$want" ] || drift "$name: $TALOS_INSTALL_DISK is $size bytes, not the $want-byte disk boxman created for it; refusing to install on it"
-    [ "$ro" = false ] && [ "$cdrom" = false ] || drift "$name: $TALOS_INSTALL_DISK is read-only or a CD-ROM"
-    # a partition of the disk, or a filesystem or partition table on it,
-    # means it is not the empty disk boxman created
-    if vols=$(tmaint "$addr" get discoveredvolumes -o yaml 2>/dev/null | yaml_rows dev_path parent name); then
+        || die "$name: cannot list or read its disks through the maintenance API"
+    writable=$(awk '$5 == "false" && $4 == "false" && $2 !~ "^/dev/(loop|ram|zram|nbd|dm-|md)"' <<< "$rows")
+    [ "$(grep -c . <<< "$writable" || true)" = 1 ] \
+        || drift "$name: expected exactly one writable disk, the one boxman created; the maintenance API lists: ${writable//$'\n'/; }"
+    read -r id dev size _ <<< "$writable"
+    [ "$dev" = "$TALOS_INSTALL_DISK" ] \
+        || drift "$name: its one writable disk is $dev, not $TALOS_INSTALL_DISK"
+    [ "$size" = "$want" ] \
+        || drift "$name: $TALOS_INSTALL_DISK is $size bytes, not the $want-byte disk boxman created for it; refusing to install on it"
+    if vols=$(tmaint "$addr" get discoveredvolumes -o yaml 2>/dev/null); then
+        rows=$(yaml_rows dev_path parent name <<< "$vols") \
+            || die "$name: cannot read the maintenance API's volume listing; refusing to install without evidence the disk is empty"
+        awk -v d="$TALOS_INSTALL_DISK" '$2 == d {f=1} END {exit !f}' <<< "$rows" \
+            || die "$name: the maintenance API's volume listing does not name $TALOS_INSTALL_DISK; refusing to install without evidence it is empty"
         used=$(awk -v d="$TALOS_INSTALL_DISK" -v id="$id" '
-            ($2 == d && $4 != "-") || ($2 != d && index($2, d) == 1) || $3 == id {print $2}' <<< "$vols")
+            ($2 == d && $4 != "-") || ($2 != d && index($2, d) == 1) || $3 == id {print $2}' <<< "$rows")
         [ -z "$used" ] || drift "$name: $TALOS_INSTALL_DISK is not empty (${used//$'\n'/ }); only a newly created, empty disk is installed on"
-        log "$name: $TALOS_INSTALL_DISK ($id) is the empty $size-byte disk boxman created"
+        log "$name: $TALOS_INSTALL_DISK ($id) is its only writable disk, $size bytes as created, and empty (maintenance volume listing)"
+    elif [ "$evidence" = created-empty ]; then
+        log "$name: $TALOS_INSTALL_DISK ($id) is its only writable disk, $size bytes as created; the maintenance API lists no volumes, but the host saw nothing written to it since boxman created it"
     else
-        log "$name: $TALOS_INSTALL_DISK ($id) is the $size-byte disk boxman created (volumes are not listable in maintenance mode)"
+        die "$name: the maintenance API does not list volumes and the host has no evidence $TALOS_INSTALL_DISK is unwritten; refusing to install without evidence it is empty"
     fi
 }
 
@@ -111,6 +128,10 @@ for i in "${!NAMES[@]}"; do
     sha=$(sha256sum < "$cfg" | awk '{print $1}')
     done_sha=$(journal_get "$name.applied")
     intent_sha=$(journal_get "$name.applying")
+    for rec in "$done_sha" "$intent_sha"; do
+        [ -z "$rec" ] || [[ $rec =~ ^[0-9a-f]{64}$ ]] \
+            || die "$name: its journal entry in $JOURNAL is malformed; refusing to guess what happened"
+    done
 
     if [ -n "$done_sha" ]; then
         wait_for "$AUTH_TIMEOUT" "$name: authenticated API answers" auth_ok "$addr" \
@@ -159,7 +180,9 @@ for i in "${APPLIED[@]}"; do
     name=${NAMES[$i]} addr=${IPS[$i]}
     wait_for "$INSTALL_TIMEOUT" "$name: installed; the authenticated API answers at $addr" auth_ok "$addr" \
         || die "$name: did not come back on the authenticated API within ${INSTALL_TIMEOUT}s after its config was applied; a rerun resumes from the journal"
-    journal_put "$name.applied" "$(journal_get "$name.applying")"
+    rec=$(journal_get "$name.applying")
+    [[ $rec =~ ^[0-9a-f]{64}$ ]] || die "$name: its journal entry $name.applying vanished or is malformed"
+    journal_put "$name.applied" "$rec"
     rm -f "$JOURNAL/$name.applying"
     echo "$name: applied"
 done

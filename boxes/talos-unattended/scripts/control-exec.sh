@@ -46,6 +46,7 @@ ACTION=$1; shift
 
 load_inputs "$INPUTS"
 read_facts
+bind_driver_dir
 TIMEOUT=${TALOS_CONTROL_TIMEOUT:-900}
 POLL=${TALOS_POLL_SECONDS:-5}
 ADDRESS_FILE=$DRIVER_DIR/control.address
@@ -97,8 +98,8 @@ remote_words() { local w out=""; for w in "$@"; do out+=$(printf '%q ' "$w"); do
 verify() {
     local deadline=$((SECONDS + TIMEOUT)) want state uuid addr key ADDR AMBIGUOUS
     want=$(record_get uuid.control)
-    [ -n "$want" ] || die "no recorded UUID for the control VM in $RECORD; run install.sh, which records it after boxman up"
-    private_dir "$DRIVER_DIR"
+    [ -n "$want" ] && [ "$(record_get created)" = yes ] \
+        || die "no recorded UUID for the control VM in $RECORD; run install.sh, which records it after boxman up"
     WHY="not tried yet"
     while :; do
         state=$(domain_state "$CONTROL_DOMAIN")

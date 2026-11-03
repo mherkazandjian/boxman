@@ -69,6 +69,10 @@ for var in TALOS_LAB_DIR TALOS_BACKUP_DIR TALOS_STATE_DIR TALOS_OPERATOR_KEY; do
     case "${!var:-/}" in /*) ;; *) problem "$var must be an absolute path" ;; esac
 done
 FLUX=${TALOS_FLUX:-off}
+# the fixed topology gives every node exactly one disk, which boxman creates
+# and the host checks; nothing else may be installed on
+[ -z "${TALOS_INSTALL_DISK:-}" ] || [ "$TALOS_INSTALL_DISK" = /dev/vda ] \
+    || problem "TALOS_INSTALL_DISK must be /dev/vda, the one boot disk boxman creates for each node (got $TALOS_INSTALL_DISK)"
 case "$FLUX" in on|off) ;; *) problem "TALOS_FLUX must be on or off, got $FLUX" ;; esac
 case "${TALOS_LIBVIRT_USE_SUDO:-true}" in true|false) ;; *) problem "TALOS_LIBVIRT_USE_SUDO must be true or false" ;; esac
 [ $missing = 0 ] && ok "inputs complete${INPUTS_FILE:+ ($INPUTS_FILE)}"
@@ -158,11 +162,23 @@ net_present=0
 listed "$NETWORK" "$ALL_NETS" && net_present=1
 template_present=0
 listed "$TEMPLATE" "$ALL_DOMAINS" && template_present=1
-if [ ! -e "$RECORD" ]; then
+# A domain or the network may be touched only with positive evidence that
+# this driver created them: their UUIDs, which install.sh records all at once
+# after `boxman up` succeeded on the run that created them (created=yes).
+# Matching names prove nothing, and neither does a record whose `up` never
+# finished: then nothing of the project may exist yet.
+if [ ! -e "$RECORD" ] || [ "$(record_get created)" != yes ]; then
     if [ ${#present[@]} -gt 0 ] || [ $net_present = 1 ]; then
         found=${present[*]:-}
         [ $net_present = 0 ] || found="$found $NETWORK"
-        problem "ownership: this driver has no record of project $PROJECT ($RECORD), but these already exist:$found; a run never adopts what it did not create -- destroy them, or pick another TALOS_PROJECT"
+        if [ -e "$RECORD" ]; then
+            why="boxman up never finished on the run that recorded $RECORD, so which of them it created cannot be proven"
+        else
+            why="this driver has no record of project $PROJECT ($RECORD)"
+        fi
+        problem "ownership: $why, but these exist:$found. A run never starts or adopts what it cannot prove it created; destroy them (boxman destroy) and start again, or pick another TALOS_PROJECT"
+    elif [ -e "$RECORD" ]; then
+        ok "ownership: project $PROJECT: an earlier boxman up created nothing; starting again"
     else
         ok "ownership: new project $PROJECT, none of its domains or its network exist"
     fi
@@ -181,7 +197,7 @@ else
     for i in "${!VM_DOMAIN[@]}"; do
         dom=${VM_DOMAIN[$i]} want=$(record_get "uuid.${VM_NAME[$i]}")
         if [ -z "$want" ]; then
-            continue    # boxman up did not finish on the recording run
+            problem "ownership: $RECORD records no uuid for $dom; refusing to touch a domain this driver cannot prove it created"; owned=0
         elif [ "${STATES[$i]}" = absent ]; then
             problem "ownership: $dom was created by this driver (uuid $want) and is gone; v0 does not recreate a node -- destroy the project and start again"; owned=0
         elif ! uuid=$(vsh domuuid "$dom" | sed -n '1{s/[[:space:]]*$//;p}') || [ -z "$uuid" ]; then
@@ -190,7 +206,17 @@ else
             problem "ownership: $dom is not the domain this driver created (uuid differs from $want); refusing to touch it"; owned=0
         fi
     done
-    [ $owned = 1 ] && ok "ownership: the recorded domains of $PROJECT are the ones present"
+    want=$(record_get net.uuid)
+    if [ -z "$want" ]; then
+        problem "ownership: $RECORD records no uuid for the network $NETWORK"; owned=0
+    elif [ $net_present = 0 ]; then
+        problem "ownership: the network $NETWORK this driver created (uuid $want) is gone; destroy the project and start again"; owned=0
+    elif ! uuid=$(vsh net-uuid "$NETWORK" | sed -n '1{s/[[:space:]]*$//;p}') || [ -z "$uuid" ]; then
+        die "ownership: cannot read the uuid of $NETWORK; nothing was changed"
+    elif [ "$uuid" != "$want" ]; then
+        problem "ownership: $NETWORK is not the network this driver created (uuid differs from $want); refusing to touch it"; owned=0
+    fi
+    [ $owned = 1 ] && ok "ownership: the domains and network of $PROJECT are the ones this driver created (by uuid)"
 fi
 
 # ---- capacity -----------------------------------------------------------------------
@@ -366,6 +392,16 @@ fi
 # The backup must survive a destroy of the workspace: compare where the data
 # would physically land, symlinks resolved on both sides. install.sh writes
 # only to this checked physical path.
+# The driver's own directory (default <workspace>/driver) receives the
+# kubeconfig and, transiently, the state archive: it must not be, or be able
+# to be, in a git checkout either, by its physical path.
+if ! driver_phys=$(physical_path "$DRIVER_DIR" 2>&1); then
+    problem "access: the driver's directory: $driver_phys"
+elif below "$driver_phys" "$BOX_DIR"; then
+    problem "access: the driver's directory $driver_phys is inside the box; set TALOS_LAB_DIR (or TALOS_DRIVER_DIR) outside the repository"
+else
+    ( outside_checkouts "$driver_phys" "the driver's directory" ) || problem "access: see above (the driver's directory $DRIVER_DIR)"
+fi
 if [ -n "${TALOS_BACKUP_DIR:-}" ]; then
     if ! backup_phys=$(physical_path "$TALOS_BACKUP_DIR" 2>&1); then
         problem "access: TALOS_BACKUP_DIR: $backup_phys"

@@ -16,12 +16,18 @@
 #               recorded; none within TALOS_ETCD_TIMEOUT is ambiguous and the
 #               run stops with what to check. It never bootstraps again.
 #   neither     if any control plane already reports etcd members, the
-#               cluster exists and is recorded as such. Otherwise every
-#               control plane must authenticate and the bootstrap node must
-#               report synchronised time; the intent is journaled, then the
+#               cluster exists and is recorded as such. Otherwise a missing
+#               journal is not taken as "never bootstrapped": every control
+#               plane must positively show etcd waiting for its bootstrap
+#               (`talosctl service etcd` in state Preparing, no members, and
+#               an empty etcd data directory, read with `talosctl list`) on
+#               TALOS_PREBOOT_CHECKS (3) consecutive observations, and the
+#               bootstrap node must report synchronised time. Anything else
+#               (etcd running or failed without members, a query that does
+#               not answer) stops the run. Then the intent is journaled, the
 #               bootstrap RPC goes to the bootstrap node (the first control
 #               plane) only, and success is recorded once etcd reports
-#               members.
+#               members. A journal entry that cannot be read stops the run.
 #
 # Health and access, bounded by TALOS_KUBE_TIMEOUT (900 s):
 #   - etcd has one member per control plane;
@@ -58,6 +64,50 @@ BOOT_NAME=${CP_NAMES[0]} BOOT=${CP_IPS[0]}
 members() { tauth "$1" etcd members 2>/dev/null | awk 'NR > 1 && NF' | grep -c . ; }
 has_members() { local n; n=$(members "$1") && [ "$n" -gt 0 ]; }
 time_synced() { tauth "$1" get timestatus -o yaml 2>/dev/null | yaml_rows synced | awk '$2 == "true" {f=1} END {exit !f}'; }
+# etcd_state ADDR: the etcd service's state on ADDR (empty if unknown)
+etcd_state() { tauth "$1" service etcd 2>/dev/null | awk '$1 == "STATE" {print $2; exit}'; }
+
+# etcd_data ADDR: "empty" when ADDR's etcd data directory is positively
+# empty or absent, "data" when it holds anything, "unknown" otherwise. Read
+# with the authenticated file API and parsed strictly (a NODE/NAME header,
+# then one entry per line).
+etcd_data() {
+    local out rc=0
+    out=$(tauth "$1" list /var/lib/etcd 2>&1) || rc=$?
+    if [ $rc -ne 0 ]; then
+        case "$out" in
+            *"no such file or directory"*) echo empty ;;
+            *) echo unknown ;;
+        esac
+        return
+    fi
+    awk 'NR == 1 { if ($1 != "NODE" || $NF != "NAME") bad = 1; next }
+         NF == 0 { next }
+         NF != 2 { bad = 1; next }
+         $2 != "." { data = 1 }
+         END { print bad ? "unknown" : data ? "data" : "empty" }' <<< "$out"
+}
+
+# preboot: every control plane positively before its first bootstrap,
+# several times in a row: no etcd members, the etcd service waiting
+# (Preparing), and an empty etcd data directory. The service phase alone is
+# no proof (Talos is also Preparing while it restarts an existing member).
+# EXISTING names a control plane that already has members.
+PREBOOT_CHECKS=${TALOS_PREBOOT_CHECKS:-3}
+preboot() {
+    local i state data seen=""
+    EXISTING=""
+    for i in "${!CP_IPS[@]}"; do
+        if has_members "${CP_IPS[$i]}"; then EXISTING=${CP_NAMES[$i]}; return 0; fi
+        state=$(etcd_state "${CP_IPS[$i]}")
+        data=$(etcd_data "${CP_IPS[$i]}")
+        seen+=" ${CP_NAMES[$i]}=${state:-unknown}/data-$data"
+        [ "$state" = Preparing ] && [ "$data" = empty ] || { PREBOOT_SEEN=$seen; PREBOOT_RUN=0; return 1; }
+    done
+    PREBOOT_SEEN=$seen
+    PREBOOT_RUN=$((PREBOOT_RUN + 1))
+    [ "$PREBOOT_RUN" -ge "$PREBOOT_CHECKS" ]
+}
 
 # ---- every control plane on the authenticated API ---------------------------
 for i in "${!CP_IPS[@]}"; do
@@ -66,21 +116,30 @@ for i in "${!CP_IPS[@]}"; do
 done
 
 # ---- etcd, once -------------------------------------------------------------
-if [ -n "$(journal_get bootstrap.done)" ]; then
-    wait_for "$ETCD_TIMEOUT" "etcd: bootstrapped earlier ($(journal_get bootstrap.done)); $BOOT_NAME reports members" has_members "$BOOT" \
-        || die "etcd was bootstrapped ($(journal_get bootstrap.done)) but $BOOT_NAME reports no members within ${ETCD_TIMEOUT}s; inspect: talosctl --talosconfig $TC -e $BOOT -n $BOOT service etcd"
-elif [ -n "$(journal_get bootstrap.intent)" ]; then
-    log "etcd: a bootstrap was requested ($(journal_get bootstrap.intent)) but never confirmed; inspecting instead of bootstrapping again"
+# the journal, read in checked assignments: an entry that exists but cannot be
+# read, is empty or is malformed stops the run instead of reading as absent
+boot_done=$(journal_get bootstrap.done)
+boot_intent=$(journal_get bootstrap.intent)
+for rec in "$boot_done" "$boot_intent"; do
+    [ -z "$rec" ] || [[ $rec =~ ^[a-z0-9-]+\ [0-9TZ:-]+(\ [a-z-]+)?$ ]] \
+        || die "the bootstrap journal in $JOURNAL holds a malformed entry ($rec); refusing to guess what happened"
+done
+if [ -n "$boot_done" ]; then
+    wait_for "$ETCD_TIMEOUT" "etcd: bootstrapped earlier ($boot_done); $BOOT_NAME reports members" has_members "$BOOT" \
+        || die "etcd was bootstrapped ($boot_done) but $BOOT_NAME reports no members within ${ETCD_TIMEOUT}s; inspect: talosctl --talosconfig $TC -e $BOOT -n $BOOT service etcd"
+elif [ -n "$boot_intent" ]; then
+    log "etcd: a bootstrap was requested ($boot_intent) but never confirmed; inspecting instead of bootstrapping again"
     if wait_for "$ETCD_TIMEOUT" "etcd: $BOOT_NAME reports members: the earlier bootstrap took effect" has_members "$BOOT"; then
         journal_put bootstrap.done "$BOOT_NAME $(now) recovered"
     else
-        drift "etcd: a bootstrap was requested at $(journal_get bootstrap.intent) but $BOOT_NAME reports no members after ${ETCD_TIMEOUT}s. Not bootstrapping again. Inspect: talosctl --talosconfig $TC -e $BOOT -n $BOOT service etcd; ... logs etcd. Only if certain it never ran, remove $JOURNAL/bootstrap.intent and rerun"
+        drift "etcd: a bootstrap was requested at $boot_intent but $BOOT_NAME reports no members after ${ETCD_TIMEOUT}s. Not bootstrapping again. Inspect: talosctl --talosconfig $TC -e $BOOT -n $BOOT service etcd; ... logs etcd. Only if certain it never ran, remove $JOURNAL/bootstrap.intent and rerun"
     fi
 else
-    existing=""
-    for i in "${!CP_IPS[@]}"; do
-        if has_members "${CP_IPS[$i]}"; then existing=${CP_NAMES[$i]}; break; fi
-    done
+    PREBOOT_RUN=0 PREBOOT_SEEN="" EXISTING=""
+    wait_for "$AUTH_TIMEOUT" "etcd: no members yet; checked whether every control plane waits for its bootstrap" preboot \
+        || drift "etcd: cannot establish that etcd was never bootstrapped (last seen:${PREBOOT_SEEN:- nothing}); the journal has no record of a bootstrap, but that alone never authorizes one. Inspect: talosctl --talosconfig $TC -e $BOOT -n $BOOT service etcd; restore $JOURNAL from the backup if it was lost"
+    existing=$EXISTING
+    [ -n "$existing" ] || log "etcd: never bootstrapped: seen $PREBOOT_CHECKS times in a row:$PREBOOT_SEEN, no members"
     if [ -n "$existing" ]; then
         log "etcd: $existing already reports members; the cluster exists, no bootstrap"
         journal_put bootstrap.done "$existing $(now) found-existing"
@@ -104,7 +163,7 @@ wait_for "$KUBE_TIMEOUT" "etcd: ${#CP_IPS[@]} member(s), one per control plane" 
     || die "etcd: $BOOT_NAME reports $(members "$BOOT" || echo 0) member(s), expected ${#CP_IPS[@]}, after ${KUBE_TIMEOUT}s"
 
 KC=$STATE/kubeconfig
-api_ok() { kc --request-timeout=10s get --raw=/readyz >/dev/null 2>&1; }
+api_ok() { kc get --raw=/readyz >/dev/null 2>&1; }
 fetch_kubeconfig() {
     local tmp
     tmp=$(mktemp -d "$STATE/.staging.XXXXXX") || return 1
@@ -128,12 +187,12 @@ wait_for "$KUBE_TIMEOUT" "kubernetes: the API answers through the endpoint" api_
 registered() { [ "$(kc get nodes --no-headers 2>/dev/null | grep -c .)" -eq ${#NAMES[@]} ]; }
 wait_for "$KUBE_TIMEOUT" "kubernetes: all ${#NAMES[@]} node(s) registered" registered \
     || die "kubernetes: $(kc get nodes --no-headers 2>/dev/null | grep -c . || true) of ${#NAMES[@]} nodes registered after ${KUBE_TIMEOUT}s"
-kc wait --for=condition=Ready nodes --all --timeout="${KUBE_TIMEOUT}s" >&2 \
+kcw "$KUBE_TIMEOUT" wait --for=condition=Ready nodes --all >&2 \
     || die "kubernetes: not every node is Ready after ${KUBE_TIMEOUT}s"
 log "kubernetes: every node Ready"
-kc -n kube-system rollout status deployment/coredns --timeout="${KUBE_TIMEOUT}s" >&2 \
+kcw "$KUBE_TIMEOUT" -n kube-system rollout status deployment/coredns >&2 \
     || die "kubernetes: CoreDNS did not roll out within ${KUBE_TIMEOUT}s"
-kc -n kube-system rollout status "daemonset/$CNI" --timeout="${KUBE_TIMEOUT}s" >&2 \
+kcw "$KUBE_TIMEOUT" -n kube-system rollout status "daemonset/$CNI" >&2 \
     || die "kubernetes: the CNI daemonset $CNI did not roll out within ${KUBE_TIMEOUT}s"
 log "kubernetes: CoreDNS and $CNI are running"
 
@@ -170,7 +229,7 @@ spec:
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}
 EOF
-kc -n talos-smoke rollout status deployment/smoke --timeout="${KUBE_TIMEOUT}s" >&2 \
+kcw "$KUBE_TIMEOUT" -n talos-smoke rollout status deployment/smoke >&2 \
     || die "kubernetes: the test Deployment did not become available within ${KUBE_TIMEOUT}s"
 running=$(kc -n talos-smoke get pods -l app=smoke \
     -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase} {.spec.nodeName}{"\n"}{end}' \

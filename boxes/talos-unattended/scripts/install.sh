@@ -70,7 +70,9 @@ read_facts
 PROFILE=${TALOS_PROFILE:-full}
 FLUX=${TALOS_FLUX:-off}
 
-private_dir "$DRIVER_DIR"
+# the driver's directory, at its checked physical path only (kubeconfig,
+# record, pinned host key, transient state archive)
+bind_driver_dir
 exec 8>"$DRIVER_DIR/.install.lock"
 flock -n 8 || die "another install.sh holds $DRIVER_DIR/.install.lock"
 
@@ -92,19 +94,50 @@ fi
 stage "up: boxman up, project $PROJECT"
 read -ra BOXMAN_CMD <<< "${BOXMAN:-boxman}"
 step up "${BOXMAN_CMD[@]}" --conf "$BOX_DIR/conf.yml" up
-for i in "${!VM_DOMAIN[@]}"; do
-    dom=${VM_DOMAIN[$i]} name=${VM_NAME[$i]}
-    [ "$(domain_state "$dom")" != absent ] || die "boxman up finished but $dom does not exist"
-    uuid=$(domain_uuid "$dom")
-    [ -n "$uuid" ] || die "cannot read the uuid of $dom"
-    want=$(record_get "uuid.$name")
-    if [ -z "$want" ]; then
-        record_set "uuid.$name" "$uuid"
-    elif [ "$want" != "$uuid" ]; then
-        drift "$dom has uuid $uuid, not the recorded $want: it was recreated outside this driver"
-    fi
-done
-log "up: ${#VM_DOMAIN[@]} VMs, each the domain this driver recorded"
+# what this run's up created: every UUID, the network's and each node's boot
+# disk, recorded together and only after up succeeded on a run that started
+# with none of them present (preflight), then created=yes. A later run
+# touches only what matches.
+boot_disk() {   # boot_disk DOMAIN: "<source> <allocation>" of its one disk, vda
+    local disks src alloc
+    disks=$(vsh domblklist "$1" --details | awk 'NR > 2 && $2 == "disk" {print $3, $4}') \
+        || die "$1: cannot list its disks"
+    [ "$(grep -c . <<< "$disks")" = 1 ] && [ "${disks%% *}" = vda ] \
+        || drift "$1: expected exactly one disk, vda; libvirt reports: ${disks//$'\n'/; }"
+    src=${disks#* }
+    alloc=$(vsh domblkinfo "$1" vda | awk '/^Allocation:/ {print $2}') || die "$1: cannot read its disk allocation"
+    [[ $alloc =~ ^[0-9]+$ ]] || die "$1: cannot read its disk allocation"
+    echo "$src $alloc"
+}
+if [ "$(record_get created)" != yes ]; then
+    entries=()
+    for i in "${!VM_DOMAIN[@]}"; do
+        dom=${VM_DOMAIN[$i]} name=${VM_NAME[$i]}
+        [ "$(domain_state "$dom")" != absent ] || die "boxman up finished but $dom does not exist"
+        uuid=$(domain_uuid "$dom")
+        [ -n "$uuid" ] || die "cannot read the uuid of $dom"
+        entries+=("uuid.$name=$uuid")
+        if [ "${VM_ROLE[$i]}" != control ]; then
+            bd=$(boot_disk "$dom") || exit $?
+            read -r src alloc <<< "$bd"
+            entries+=("disk.$name=$src" "alloc.$name=$alloc")
+        fi
+    done
+    net_uuid=$(vsh net-uuid "$NETWORK" | sed -n '1{s/[[:space:]]*$//;p}') && [ -n "$net_uuid" ] \
+        || die "boxman up finished but the uuid of $NETWORK cannot be read"
+    entries+=("net.uuid=$net_uuid")
+    for entry in "${entries[@]}"; do record_set "${entry%%=*}" "${entry#*=}"; done
+    record_set created yes
+    log "up: recorded the ${#VM_DOMAIN[@]} VMs and the network this run created, by uuid"
+else
+    for i in "${!VM_DOMAIN[@]}"; do
+        dom=${VM_DOMAIN[$i]} want=$(record_get "uuid.${VM_NAME[$i]}")
+        [ "$(domain_uuid "$dom")" = "$want" ] || drift "$dom is not the domain this driver created (uuid $want)"
+    done
+    [ "$(vsh net-uuid "$NETWORK" | sed -n '1{s/[[:space:]]*$//;p}')" = "$(record_get net.uuid)" ] \
+        || drift "$NETWORK is not the network this driver created"
+    log "up: ${#VM_DOMAIN[@]} VMs and the network, each the one this driver created"
+fi
 
 # ---- control --------------------------------------------------------------------
 stage "control: verify the control VM"
@@ -142,16 +175,21 @@ while read -r name role addr mac; do
         || die "$name: cannot list its NICs"
     [ "$nics" = "$NETWORK $mac" ] \
         || drift "$name: expected exactly one NIC on $NETWORK with MAC $mac, libvirt reports: ${nics//$'\n'/; }"
-    disk=$(vsh domblklist "$dom" --details | awk 'NR > 2 && $2 == "disk" && $3 == "vda" {print $4}') \
-        || die "$name: cannot list its disks"
-    [ -n "$disk" ] || drift "$name: has no vda disk"
+    bd=$(boot_disk "$dom") || exit $?
+    read -r disk alloc <<< "$bd"
+    [ "$disk" = "$(record_get "disk.$name")" ] \
+        || drift "$name: its boot disk is $disk, not $(record_get "disk.$name"), the one boxman created for it"
     case "$disk" in /*) ;; *) drift "$name: its boot disk $disk is not an absolute path" ;; esac
     disk_dir=$(physical_path "$(dirname -- "$disk")") || die "$name: cannot resolve the directory of its boot disk $disk"
     below "$disk_dir" "$WS_PHYS" || drift "$name: its boot disk $disk is not in this project's workspace $WS_PHYS"
     capacity=$(vsh domblkinfo "$dom" vda | awk '/^Capacity:/ {print $2}') || die "$name: cannot read its disk size"
     [ "$capacity" = "${VM_DISK[$j]}" ] \
         || drift "$name: its boot disk is $capacity bytes, conf.yml declares ${VM_DISK[$j]}"
-    echo "$name ${VM_DISK[$j]}" >> "$DRIVER_DIR/disks.txt"
+    # positive evidence the disk is still the empty one boxman created: not
+    # one byte allocated since this driver recorded it right after creation
+    evidence=-
+    [ "$alloc" != "$(record_get "alloc.$name")" ] || evidence=created-empty
+    echo "$name ${VM_DISK[$j]} $evidence" >> "$DRIVER_DIR/disks.txt"
     deadline=$((SECONDS + LEASE_TIMEOUT))
     while :; do
         ips=$(lease_ips "$mac")
@@ -160,7 +198,7 @@ while read -r name role addr mac; do
         sleep "$POLL"
     done
     [ "$ips" = "$addr" ] || drift "$name: the lease for $mac is ${ips//$'\n'/ }, not the reserved $addr"
-    log "nodes: $name ($role) is $dom, NIC $mac on the fabric, lease $addr as reserved, boot disk ${VM_DISK[$j]} bytes in the workspace"
+    log "nodes: $name ($role) is $dom, NIC $mac on the fabric, lease $addr as reserved, boot disk $disk (${VM_DISK[$j]} bytes, as created${evidence/#-/, written since})"
 done < "$DRIVER_DIR/nodes.txt"
 
 # ---- ship --------------------------------------------------------------------------
@@ -185,7 +223,8 @@ fi
     for var in TALOS_STATE_DIR TALOS_CLUSTER_NAME TALOS_INSTALL_DISK TALOS_VIP TALOS_NTP_SERVERS \
                TALOS_POD_CIDR TALOS_SERVICE_CIDR TALOS_SMOKE_IMAGE TALOS_CNI_DAEMONSET \
                TALOS_MAINTENANCE_TIMEOUT TALOS_INSTALL_TIMEOUT TALOS_AUTH_TIMEOUT TALOS_ETCD_TIMEOUT \
-               TALOS_KUBE_TIMEOUT TALOS_FLUX_TIMEOUT TALOS_POLL_SECONDS TALOS_FLUX \
+               TALOS_KUBE_TIMEOUT TALOS_FLUX_TIMEOUT TALOS_POLL_SECONDS TALOS_CALL_TIMEOUT \
+               TALOS_REQUEST_TIMEOUT TALOS_PREBOOT_CHECKS TALOS_FLUX \
                GITLAB_HOST GITLAB_OWNER GITOPS_REPOSITORY GITOPS_BRANCH GITOPS_CLUSTER_PATH GITLAB_PERSONAL; do
         [ -z "${!var:-}" ] || printf '%s=%q\n' "$var" "${!var}"
     done
@@ -214,6 +253,21 @@ backup() {
     rm -f "$tar"
     have=$(cat "$new/secrets.sha256" 2>/dev/null || true)
     [ -n "$have" ] || die "backup: the control VM's state has no secrets fingerprint"
+    # an entry the previous backup holds and the control VM lost is lost
+    # state, never a reason to act again: stop, and keep the old backup.
+    # Only X.applying may go, once X.applied replaced it.
+    local lost=() entry name
+    for entry in "$BACKUP/state/journal"/*; do
+        [ -e "$entry" ] || continue
+        name=${entry##*/}
+        [ -e "$new/journal/$name" ] && continue
+        [ "${name%.applying}" != "$name" ] && [ -e "$new/journal/${name%.applying}.applied" ] && continue
+        lost+=("$name")
+    done
+    if [ ${#lost[@]} -gt 0 ]; then
+        rm -rf "$new"
+        drift "backup: the control VM's journal lost ${lost[*]}, which the backup in $BACKUP/state holds; the backup was kept. Restore those entries from it before running again"
+    fi
     want=$(record_get identity)
     if [ -n "$want" ] && [ "$want" != "$have" ]; then
         rm -rf "$new"
@@ -231,6 +285,9 @@ backup() {
 }
 
 stage "restore: the control VM's state"
+# gen-config's own guard on TALOS_STATE_DIR (no checkout, a physical path,
+# valid inputs) before anything, a restored backup included, is written there
+step check cexec run -- "$REMOTE_BOX/scripts/gen-config.sh" "${REMOTE[@]}" --dry-run >/dev/null
 rc=0
 cexec run -- test -e "$TALOS_STATE_DIR/secrets.yaml" || rc=$?
 case "$rc" in

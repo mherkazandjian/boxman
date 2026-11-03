@@ -107,14 +107,14 @@ a node's initial config or bootstraps etcd a second time.
 
 | stage | what it does, and what it refuses |
 | --- | --- |
-| preflight | `scripts/preflight.sh`, before any side effect: inputs and pins, libvirt with the local runtime, exactly one control VM and 3+3 nodes (or 1+1 with `TALOS_PROFILE=smoke`), memory and disk for what is not yet running or created, the fabric subnet against every other libvirt network, host address and route, the operator key, the backup location, and Flux's inputs when it is on. Every reading is checked; a failed or partial one stops the run. A first run refuses to adopt existing domains or networks of the project; a later one finds exactly the domains it recorded |
-| up | one project-wide `boxman up` (`BOXMAN` overrides the command); each VM's UUID is recorded, and a later run stops if a domain was recreated |
+| preflight | `scripts/preflight.sh`, before any side effect: inputs and pins, libvirt with the local runtime, exactly one control VM and 3+3 nodes (or 1+1 with `TALOS_PROFILE=smoke`), memory and disk for what is not yet running or created, the fabric subnet against every other libvirt network, host address and route, the operator key, the backup location, and Flux's inputs when it is on. Every reading is checked; a failed or partial one stops the run. A domain or network of the project may exist only if this driver recorded creating it: a first run, or one after an `up` that never finished, refuses any that exist (matching names prove nothing); a later run finds exactly the domains and network it recorded, by UUID. `TALOS_INSTALL_DISK` must be `/dev/vda`, the one boot disk boxman creates |
+| up | one project-wide `boxman up` (`BOXMAN` overrides the command). Only once it succeeded on the run that created them are every VM's UUID, the network's UUID and each node's boot disk (path and allocation) recorded, together; a later run stops if any was recreated or swapped |
 | control | `scripts/control-exec.sh verify`: the control domain's UUID, its one lease on the fabric, and its ssh host key read from inside the guest through the libvirt guest agent. ssh then uses only the operator key, `BatchMode` and that pinned host key, nothing from `~/.ssh/config`. The control VM's `talosctl`, `kubectl` and `flux` must be the pinned versions |
-| nodes | per Talos node, from libvirt: one NIC on this project's fabric with the reserved MAC, a boot disk in the workspace of the declared size, and a DHCP lease for the MAC that is the reserved address |
+| nodes | per Talos node, from libvirt: one NIC on this project's fabric with the reserved MAC, exactly one disk (`vda`, the recorded one, in the workspace, of the declared size), and a DHCP lease for the MAC that is the reserved address. A disk with no byte allocated since its creation was recorded counts as evidence it is still empty |
 | ship | the control-side scripts, `versions.env`, the node and disk tables and the control-side inputs (never a credential) to `~/talos-unattended` on the control VM |
-| restore, generate | a control VM that lost its state gets it back from the backup; then `gen-config.sh` (identity created once) |
-| apply | `scripts/apply-config.sh` on the control VM: a fresh node must answer the maintenance API and not the authenticated one; exactly one link's `permanent_addr` must be its reserved MAC, and the install disk must be the empty disk of the declared size. The config goes out once, under a journal, and the node must come back on the authenticated API. A recorded node is only ever reached authenticated: no answer is an error, never a reason to retry insecurely, and a changed config is drift (v0 does not update installed nodes) |
-| bootstrap | `scripts/bootstrap.sh`: etcd is bootstrapped once, on the first control plane's own address (never the VIP), under the state lock and a journal. An unconfirmed earlier request is inspected, never repeated; an existing etcd is never bootstrapped. Then: one etcd member per control plane, a kubeconfig, every node Ready, CoreDNS and the CNI rolled out, and a test Deployment (`talos-smoke/smoke`) Running |
+| restore, generate | `gen-config.sh --dry-run` first, so its checks on `TALOS_STATE_DIR` (no checkout, physical path) run before anything is written there; a control VM that lost its state gets it back from the backup; then `gen-config.sh` (identity created once). A journal entry the backup holds but the control VM lost stops the run |
+| apply | `scripts/apply-config.sh` on the control VM: a fresh node must answer the maintenance API and not the authenticated one; exactly one link's `permanent_addr` must be its reserved MAC, and the install disk must be the node's only writable disk, of the declared size, and positively empty: the maintenance API's volume listing names it with nothing on it, or, when Talos does not list volumes in maintenance mode, the host saw nothing written to it since boxman created it. The config goes out once, under a journal, and the node must come back on the authenticated API. A recorded node is only ever reached authenticated: no answer is an error, never a reason to retry insecurely, and a changed config is drift (v0 does not update installed nodes) |
+| bootstrap | `scripts/bootstrap.sh`: etcd is bootstrapped once, on the first control plane's own address (never the VIP), under the state lock and a journal. An unconfirmed earlier request is inspected, never repeated; an existing etcd is never bootstrapped; a missing journal alone never authorizes a bootstrap: every control plane must show etcd waiting for it (service state `Preparing`, no members and an empty etcd data directory, read with `talosctl list`) several times in a row. An unreadable, empty or malformed journal entry stops the run, every journal write is checked, and a backup never drops an entry the control VM lost. Then: one etcd member per control plane, a kubeconfig, every node Ready, CoreDNS and the CNI rolled out, and a test Deployment (`talos-smoke/smoke`) Running |
 | flux | `scripts/flux.sh`, only with `TALOS_FLUX=on` (below) |
 | status | `scripts/status.sh` on the control VM |
 
@@ -135,16 +135,22 @@ verified), `TALOS_LEASE_TIMEOUT` (600, node leases), `TALOS_MAINTENANCE_TIMEOUT`
 `TALOS_ETCD_TIMEOUT` (600), `TALOS_KUBE_TIMEOUT` (900), `TALOS_FLUX_TIMEOUT`
 (600). `TALOS_SMOKE_IMAGE` (default `registry.k8s.io/pause:3.10`) and
 `TALOS_CNI_DAEMONSET` (default `kube-flannel`) name the test workload's image
-and the CNI to wait for.
+and the CNI to wait for. Every `talosctl` and `kubectl` call is killed after
+`TALOS_CALL_TIMEOUT` (60 s), and `kubectl` requests time out after
+`TALOS_REQUEST_TIMEOUT` (30 s), so a hung request cannot outlive its stage.
 
 ### Flux (opt-in)
 
 Flux is off unless `TALOS_FLUX=on`. Then preflight requires `GITLAB_HOST`,
 `GITLAB_OWNER`, `GITOPS_REPOSITORY`, `GITOPS_BRANCH`, `GITOPS_CLUSTER_PATH`
 (relative, inside the repository) and `GITLAB_TOKEN`, before anything is
-created. The project must already exist: `flux.sh` checks it through the
-GitLab API and stops otherwise, because `flux bootstrap` would create a
-missing one. It bootstraps with `--deploy-token-auth`, so Flux keeps only a
+created. Before a first bootstrap, `flux.sh` reads the destination through
+the GitLab API: the project and the branch must exist (`flux bootstrap`
+would create them, v0 never does), and the cluster path on that branch must
+be new, unless this cluster's journal records its own interrupted bootstrap
+to exactly that target. An occupied or unreadable destination stops the run.
+Whether Flux is already installed is read with `--ignore-not-found`; a read
+that fails is never taken for absence. It bootstraps with `--deploy-token-auth`, so Flux keeps only a
 read-only deploy token. The token travels to the control VM on stdin and
 reaches `flux` and `curl` through the environment and stdin, never argv, a
 file or the log. A rerun leaves an existing bootstrap alone if it points at
@@ -276,6 +282,10 @@ TALOS_UNATTENDED_TALOSCTL=$PWD/talosctl pytest tests/test_talos_unattended_box.p
   sent: a node where it does not stops the run.
 - v0 does not update an installed node, replace one, or change the profile
   of a built lab: those stop as drift.
+- Use a dedicated key for `TALOS_OPERATOR_KEY`. boxman treats the
+  management group's `admin_key_name` as its own: `boxman deprovision
+  --cleanup` deletes that key, and boxman generates a new one there if it is
+  missing (which the control template would not authorize).
 - The Talos ISO stays attached after installation. The firmware boots the
   disk first (`hd,cdrom`), so an installed node does not boot the ISO again.
 - Patches may change existing documents only. Adding a config document (for

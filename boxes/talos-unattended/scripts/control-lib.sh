@@ -11,7 +11,6 @@
 # configured. Nothing secret is printed: commands and paths only.
 
 HERE=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-POLL=${TALOS_POLL_SECONDS:-10}
 
 log() { printf '%s: %s\n' "${PROG:-talos}" "$*" >&2; }
 die() { printf '%s: error: %s\n' "${PROG:-talos}" "$*" >&2; exit "${DIE_STATUS:-1}"; }
@@ -52,6 +51,18 @@ load_inputs() {
         set +a
     fi
     [ -n "${TALOS_STATE_DIR:-}" ] || die "TALOS_STATE_DIR is not set"
+    # read only now, from the shipped inputs: the control VM inherits nothing
+    # from the host's environment. Every talosctl and kubectl call is bounded,
+    # so a hung request cannot hold a stage past its own timeout:
+    # TALOS_CALL_TIMEOUT (60 s) kills a call, and kubectl also gets a
+    # per-request timeout (TALOS_REQUEST_TIMEOUT, 30 s)
+    POLL=${TALOS_POLL_SECONDS:-10}
+    CALL_TIMEOUT=${TALOS_CALL_TIMEOUT:-60}
+    REQUEST_TIMEOUT=${TALOS_REQUEST_TIMEOUT:-30}
+    local n
+    for n in "$POLL" "$CALL_TIMEOUT" "$REQUEST_TIMEOUT"; do
+        [[ $n =~ ^[0-9]+$ ]] || die "TALOS_POLL_SECONDS, TALOS_CALL_TIMEOUT and TALOS_REQUEST_TIMEOUT must be whole seconds"
+    done
     STATE=$TALOS_STATE_DIR
     TC=$STATE/talosconfig
     JOURNAL=$STATE/journal
@@ -81,6 +92,7 @@ need_state() {
     [ -d "$STATE" ] || die "no state in $STATE; run gen-config.sh first"
     [ -r "$TC" ] || die "no talosconfig in $STATE; run gen-config.sh first"
     ( umask 077 && mkdir -p "$JOURNAL" ) && chmod 0700 "$JOURNAL" || die "cannot create $JOURNAL"
+    [ -r "$JOURNAL" ] && [ -x "$JOURNAL" ] && [ -w "$JOURNAL" ] || die "cannot read and write the journal $JOURNAL"
 }
 
 # lock: one driver step at a time on this state (shared with gen-config.sh)
@@ -90,19 +102,51 @@ lock() {
 }
 
 # journal_get NAME / journal_put NAME VALUE: small atomic records
-journal_get() { [ -r "$JOURNAL/$1" ] && cat "$JOURNAL/$1" || true; }
+# A missing entry reads empty; one that exists but cannot be read, or is
+# empty, stops the run: unreadable is never the same as "never happened".
+# Call it in a plain assignment (x=$(journal_get NAME)), never inside a
+# condition, so its failure stops the caller too.
+journal_get() {
+    local f=$JOURNAL/$1 value
+    if [ -e "$f" ] || [ -L "$f" ]; then
+        [ -f "$f" ] && [ ! -L "$f" ] && [ -r "$f" ] \
+            || die "cannot read the journal entry $f; refusing to guess what happened"
+        value=$(cat -- "$f") || die "cannot read the journal entry $f; refusing to guess what happened"
+        [ -n "$value" ] || die "the journal entry $f is empty; refusing to guess what happened"
+        printf '%s\n' "$value"
+    elif [ ! -d "$JOURNAL" ] || [ ! -x "$JOURNAL" ]; then
+        die "cannot read the journal $JOURNAL; refusing to guess what happened"
+    fi
+}
+# journal_put NAME VALUE: written, flushed, renamed into place and read back,
+# each step checked; any failure stops the run before the caller acts
 journal_put() {
-    printf '%s\n' "$2" > "$JOURNAL/.$1.tmp" && sync "$JOURNAL/.$1.tmp" 2>/dev/null; \
-        mv -f "$JOURNAL/.$1.tmp" "$JOURNAL/$1" || die "cannot write $JOURNAL/$1"
+    local f=$JOURNAL/$1 tmp=$JOURNAL/.$1.tmp
+    [ -n "$2" ] || die "refusing to journal an empty $1"
+    rm -f -- "$tmp" || die "cannot write $f (a stale $tmp is in the way)"
+    printf '%s\n' "$2" > "$tmp" || { rm -f -- "$tmp"; die "cannot write $f"; }
+    sync -- "$tmp" || { rm -f -- "$tmp"; die "cannot flush $f"; }
+    mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; die "cannot write $f"; }
+    sync -- "$JOURNAL" || die "cannot flush $JOURNAL"
+    [ "$(cat -- "$f" 2>/dev/null)" = "$2" ] || die "$f did not keep what was written"
 }
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # authenticated Talos API of the node at ADDR, never through the VIP
-tauth() { local addr=$1; shift; talosctl --talosconfig "$TC" -e "$addr" -n "$addr" "$@"; }
+tauth() { local addr=$1; shift; timeout --kill-after=10 "$CALL_TIMEOUT" talosctl --talosconfig "$TC" -e "$addr" -n "$addr" "$@"; }
 # the unauthenticated maintenance API: only for nodes never configured
-tmaint() { local addr=$1; shift; talosctl -n "$addr" "$@" --insecure; }
-# kubectl on this cluster's own kubeconfig
-kc() { kubectl --kubeconfig "$STATE/kubeconfig" "$@"; }
+tmaint() { local addr=$1; shift; timeout --kill-after=10 "$CALL_TIMEOUT" talosctl -n "$addr" "$@" --insecure; }
+# kubectl on this cluster's own kubeconfig, bounded per request and per call
+kc() {
+    timeout --kill-after=10 "$CALL_TIMEOUT" \
+        kubectl --kubeconfig "$STATE/kubeconfig" --request-timeout="${REQUEST_TIMEOUT}s" "$@"
+}
+# kcw SECONDS ARGS: a kubectl wait or rollout status with its own --timeout,
+# killed if it outlives that by more than a call's bound
+kcw() {
+    local t=$1; shift
+    timeout --kill-after=10 $((t + CALL_TIMEOUT)) kubectl --kubeconfig "$STATE/kubeconfig" "$@" --timeout="${t}s"
+}
 
 # auth_ok ADDR: the node answers the authenticated API with this cluster's CA
 auth_ok() { tauth "$1" version >/dev/null 2>&1; }
@@ -127,8 +171,10 @@ yaml_rows() {
 import sys, yaml
 fields = sys.argv[1:]
 for doc in yaml.safe_load_all(sys.stdin):
-    if not isinstance(doc, dict):
+    if doc is None:
         continue
+    if not isinstance(doc, dict) or not isinstance(doc.get("spec"), dict):
+        sys.exit("not a talosctl resource listing")
     spec = doc.get("spec") or {}
     row = [str((doc.get("metadata") or {}).get("id", "-"))]
     for f in fields:

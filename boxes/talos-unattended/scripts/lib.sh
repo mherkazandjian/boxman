@@ -78,6 +78,23 @@ read_facts() {
     REMOTE_BOX=${TALOS_CONTROL_BOX:-talos-unattended}
 }
 
+# bind_driver_dir: create the driver's directory at its checked physical
+# path (outside every git checkout, private) and use only that path from then
+# on: it receives the run record, the pinned host key, a kubeconfig and,
+# transiently, the cluster state archive
+bind_driver_dir() {
+    local phys
+    phys=$(physical_path "$DRIVER_DIR") || die "cannot resolve the driver's directory $DRIVER_DIR"
+    ! below "$phys" "$BOX_DIR" || die "the driver's directory $phys is inside the box"
+    outside_checkouts "$phys" "the driver's directory"
+    private_dir "$phys"
+    [ "$(cd -P -- "$phys" && pwd -P)" = "$phys" ] \
+        || die "the driver's directory $phys changed under us (a component was swapped for a link)"
+    DRIVER_DIR=$phys
+    RECORD=$DRIVER_DIR/run.env
+    KNOWN_HOSTS=$DRIVER_DIR/known_hosts
+}
+
 # vsh ARGS: virsh on this box's libvirt connection. Read-only queries and the
 # guest agent only; the driver never changes a domain, network or volume.
 vsh() {

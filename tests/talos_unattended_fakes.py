@@ -116,6 +116,10 @@ def virsh(world: dict, argv: list[str]) -> None:
         if args[0] not in nets:
             fail(f"error: failed to get network '{args[0]}'")
         print(f"Name: {args[0]}")
+    elif cmd == "net-uuid":
+        if args[0] not in nets:
+            fail(f"error: failed to get network '{args[0]}'")
+        print(nets[args[0]].get("uuid", "net-uuid-1"))
     elif cmd in ("domstate", "domuuid", "domiflist", "domblklist", "domblkinfo",
                  "qemu-agent-command"):
         dom = doms.get(args[0])
@@ -200,6 +204,8 @@ def boxman(world: dict, argv: list[str]) -> None:
     for net, leases in (up.get("leases") or {}).items():
         world.setdefault("leases", {})[net] = leases
     save(world)
+    if up.get("fail_after_create"):
+        fail("fake boxman: up failed after creating the domains", 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -235,7 +241,12 @@ def ssh(world: dict, argv: list[str]) -> None:
         fail("Host key verification failed.", 255)
     if opts.get("IdentityFile") != control["key_path"]:
         fail(f"{dest}: Permission denied (publickey).", 255)
-    env = dict(os.environ, HOME=control["home"])
+    # a real ssh session inherits nothing from the host: only the harness's
+    # plumbing (fake world, log, PATH) reaches the "remote" command, so every
+    # setting the control VM needs must arrive in the shipped inputs
+    env = {k: v for k, v in os.environ.items()
+           if k.startswith("FAKE_") or k in ("PATH", "PYTHONPATH", "LANG", "LC_ALL", "TMPDIR")}
+    env["HOME"] = control["home"]
     os.makedirs(control["home"], exist_ok=True)
     rc = subprocess.run(["bash", "-c", command], cwd=control["home"], env=env).returncode
     sys.exit(rc)
@@ -273,8 +284,17 @@ def dump_yaml(node_ip: str, kind: str, items: list[dict]) -> None:
     sys.stdout.write(yaml.safe_dump_all(docs, sort_keys=False))
 
 
+def hang_if(entries, words) -> None:
+    """Sleep "forever" when an entry's words all appear in *words*."""
+    import time
+    for entry in entries or []:
+        if all(w in words for w in entry.split()):
+            time.sleep(3600)
+
+
 def talosctl(world: dict, argv: list[str]) -> None:
     flags, words = talos_words(argv)
+    hang_if(world.get("talos", {}).get("hang"), words)
     if tuple(words[:2]) in GEN:
         gen = os.environ["FAKE_TALOSCTL_GEN"]
         os.execv(gen, [gen, *argv])
@@ -334,6 +354,32 @@ def talosctl(world: dict, argv: list[str]) -> None:
                   [{"id": "node", "synced": node.get("synced", True), "epoch": 0, "syncDisabled": False}])
     elif words[:2] == ["get", "links"]:
         dump_yaml(addr, "LinkStatuses.net.talos.dev", node.get("links", []))
+    elif words == ["service", "etcd"]:
+        state = node.get("etcd_state")
+        if state is None:
+            if etcd and not talos.get("etcd_down"):
+                state = "Running"
+            elif talos.get("bootstrapped"):
+                state = "Failed"
+            else:
+                state = "Preparing"
+        print(f"NODE     {addr}\nID       etcd\nSTATE    {state}\nHEALTH   ?\n"
+              "EVENTS   [Preparing]: Running pre state (1m ago)")
+    elif words == ["list", "/var/lib/etcd"]:
+        mode = node.get("etcd_dir")
+        if mode == "missing":
+            fail("rpc error: code = Unknown desc = lstat /var/lib/etcd: no such file or directory")
+        if mode == "error":
+            fail("rpc error: code = PermissionDenied desc = not allowed")
+        if mode == "garbage":
+            print("something unexpected")
+            return
+        entries = ["."]
+        if mode == "data" or (talos.get("bootstrapped") and node.get("role") == "controlplane"):
+            entries.append("member")
+        print("NODE   NAME")
+        for entry in entries:
+            print(f"{addr}   {entry}")
     elif words == ["bootstrap"]:
         talos["bootstrap_calls"] = talos.get("bootstrap_calls", 0) + 1
         mode = talos.get("bootstrap_fail")
@@ -345,6 +391,7 @@ def talosctl(world: dict, argv: list[str]) -> None:
             fail("rpc error: code = Unavailable desc = injected bootstrap failure")
         talos["etcd_members"] = [n["name"] for n in nodes.values()
                                  if n.get("role") == "controlplane" and n["mode"] == "installed"]
+        talos["bootstrapped"] = True
         save(world)
         if mode == "error-after":
             fail("rpc error: code = Unavailable desc = connection reset (response lost)")
@@ -380,6 +427,7 @@ def kubectl(world: dict, argv: list[str]) -> None:
     if not kc or not os.path.exists(kc) or "FAKESECRET-kube" not in open(kc).read():
         fail("error: no usable kubeconfig")
     talos, kube = world.get("talos", {}), world.setdefault("kube", {})
+    hang_if(kube.get("hang"), argv)
     up = bool(talos.get("etcd_members")) and not kube.get("api_down")
     if not up:
         fail("Unable to connect to the server: dial tcp: connect: connection refused")
@@ -412,8 +460,13 @@ def kubectl(world: dict, argv: list[str]) -> None:
         else:
             workers = [n["name"] for n in nodes if n.get("role") == "worker"] or ["?"]
             print(f"smoke-1 Running {workers[0]}")
+    elif words[:2] == ["get", "crd"]:
+        if world.get("flux", {}).get("installed") or world.get("flux", {}).get("crd"):
+            print("customresourcedefinition.apiextensions.k8s.io/" + words[2])
     elif words[:2] == ["get", "gitrepository"] or words[:2] == ["get", "kustomization"]:
         flux = world.get("flux", {}).get("installed")
+        if not flux and "--ignore-not-found" in argv:
+            return
         if not flux:
             fail(f'Error from server (NotFound): {words[1]}s "flux-system" not found')
         if words[1] == "gitrepository":
@@ -438,9 +491,15 @@ def flux(world: dict, argv: list[str]) -> None:
         save(world)
         if os.environ.get("GITLAB_TOKEN") != state.get("token"):
             fail("✗ failed to authenticate with GitLab: 401 Unauthorized")
-        if state.get("bootstrap_fail"):
-            fail("✗ injected bootstrap failure")
         host, owner = opt(argv, "--hostname"), opt(argv, "--owner")
+        path = opt(argv, "--path").removeprefix("./").rstrip("/")
+        if state.get("bootstrap_fail"):
+            if state["bootstrap_fail"] == "after-push":
+                world.setdefault("gitlab", {}).setdefault("paths", []).append(path)
+                state["crd"] = True
+                save(world)
+            fail("✗ injected bootstrap failure")
+        world.setdefault("gitlab", {}).setdefault("paths", []).append(path)
         state["installed"] = {"url": f"https://{host}/{owner}/{opt(argv, '--repository')}.git",
                               "branch": opt(argv, "--branch"), "path": opt(argv, "--path")}
         state["args"] = argv
@@ -455,16 +514,39 @@ def flux(world: dict, argv: list[str]) -> None:
 
 
 def curl(world: dict, argv: list[str]) -> None:
+    """The GitLab API: prints the body, a newline and the HTTP status."""
+    from urllib.parse import parse_qs, unquote, urlparse
     header = sys.stdin.read().strip() if "@-" in argv else ""
-    url = argv[-1]
     gitlab = world.get("gitlab", {})
+    if gitlab.get("down"):
+        fail("curl: (7) Failed to connect", 7)
+    url = urlparse(argv[-1])
     token = header.split(":", 1)[1].strip() if ":" in header else ""
+
+    def answer(status: int, body: str = "{}") -> None:
+        sys.stdout.write(f"{body}\n{status}")
+        sys.exit(0)
+
     if token != gitlab.get("token"):
-        fail("curl: (22) The requested URL returned error: 401", 22)
-    path = url.split("/api/v4/projects/", 1)[1].replace("%2F", "/")
-    if path not in gitlab.get("projects", []):
-        fail("curl: (22) The requested URL returned error: 404", 22)
-    print(json.dumps({"id": 1, "path_with_namespace": path}))
+        answer(401, '{"message":"401 Unauthorized"}')
+    rest = url.path.split("/api/v4/projects/", 1)[1]
+    project, _, sub = rest.partition("/")
+    project = unquote(project)
+    if project not in gitlab.get("projects", []):
+        answer(404, '{"message":"404 Project Not Found"}')
+    if not sub:
+        answer(200, json.dumps({"id": 1, "path_with_namespace": project}))
+    if sub.startswith("repository/branches/"):
+        branch = unquote(sub.split("repository/branches/", 1)[1])
+        answer(200 if branch in gitlab.get("branches", ["main"]) else 404)
+    if sub == "repository/tree":
+        if gitlab.get("tree_status"):
+            answer(gitlab["tree_status"], '{"message":"error"}')
+        path = parse_qs(url.query)["path"][0]
+        if path in gitlab.get("paths", []):
+            answer(200, '[{"name":"flux-system","type":"tree"}]')
+        answer(404, '{"message":"404 Tree Not Found"}')
+    fail("fake curl: unexpected " + argv[-1])
 
 
 TOOLS = {"virsh": virsh, "ip": ip, "df": df, "boxman": boxman, "ssh": ssh,

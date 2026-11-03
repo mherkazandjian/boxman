@@ -50,13 +50,13 @@ if [ "${1:-}" = --control ]; then
         if [ "$n" -eq ${#CP_IPS[@]} ]; then say etcd "bootstrapped once ($boot); $n member(s)"
         else flag etcd "bootstrapped once ($boot); $n member(s), expected ${#CP_IPS[@]}"; fi
     fi
-    if [ -s "$STATE/kubeconfig" ] && kc --request-timeout=10s get --raw=/readyz >/dev/null 2>&1; then
+    if [ -s "$STATE/kubeconfig" ] && kc get --raw=/readyz >/dev/null 2>&1; then
         nodes=$(kc get nodes --no-headers 2>/dev/null)
         ready=$(awk '$2 == "Ready"' <<< "$nodes" | grep -c . || true)
         if [ "$ready" -eq ${#NAMES[@]} ]; then say kube "$ready/${#NAMES[@]} nodes Ready"
         else flag kube "$ready/${#NAMES[@]} nodes Ready"; fi
         for target in deployment/coredns "daemonset/${TALOS_CNI_DAEMONSET:-kube-flannel}"; do
-            if kc -n kube-system rollout status "$target" --timeout=10s >/dev/null 2>&1; then say kube "$target rolled out"
+            if kcw 10 -n kube-system rollout status "$target" >/dev/null 2>&1; then say kube "$target rolled out"
             else flag kube "$target NOT rolled out"; fi
         done
         pod=$(kc -n talos-smoke get pods -l app=smoke \
@@ -69,7 +69,7 @@ if [ "${1:-}" = --control ]; then
         flag kube "no working kubeconfig in $STATE (the API does not answer)"
     fi
     if [ "${TALOS_FLUX:-off}" = on ]; then
-        if kc -n flux-system wait --for=condition=Ready gitrepository/flux-system kustomization/flux-system --timeout=10s >/dev/null 2>&1; then
+        if kcw 10 -n flux-system wait --for=condition=Ready gitrepository/flux-system kustomization/flux-system >/dev/null 2>&1; then
             say flux "root GitRepository and Kustomization Ready"
         else flag flux "root GitRepository/Kustomization NOT Ready"; fi
     else

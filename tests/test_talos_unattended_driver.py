@@ -278,12 +278,12 @@ def test_a_failed_domain_state_reading_is_not_absence(host):
 
 def test_preflight_never_adopts_existing_domains(host):
     host.edit(lambda w: w["domains"].update({CP1: {"uuid": "u1", "state": "shut off"}}))
-    _refused(host.run("preflight.sh"), "a run never adopts what it did not create")
+    _refused(host.run("preflight.sh"), "A run never starts or adopts what it cannot prove it created")
 
 
 def test_preflight_never_adopts_an_existing_network(host):
     host.edit(lambda w: w["networks"].update({NETWORK: {"address": "192.168.53.1"}}))
-    _refused(host.run("preflight.sh"), f"these already exist: {NETWORK}")
+    _refused(host.run("preflight.sh"), f"these exist: {NETWORK}")
 
 
 def test_a_new_cluster_refuses_a_backup_of_another_identity(host):
@@ -472,7 +472,8 @@ def _arrange_lab(host) -> None:
             "links": [{"id": "ens3", "permanentAddr": mac, "hardwareAddr": mac}],
             "disks": [{"id": "vda", "dev_path": "/dev/vda", "size": size, "readonly": False, "cdrom": False},
                       {"id": "sr0", "dev_path": "/dev/sr0", "size": 366292992, "readonly": True, "cdrom": True}],
-            "volumes": [{"id": "sr0", "dev_path": "/dev/sr0", "parent": "", "name": "iso9660"}],
+            "volumes": [{"id": "sr0", "dev_path": "/dev/sr0", "parent": "", "name": "iso9660"},
+                        {"id": "vda", "dev_path": "/dev/vda", "parent": "", "name": ""}],
         }
     host.set_world(
         boxman={"creates": creates, "networks": {NETWORK: {"address": "192.168.53.1", "bridge": "virbr53"}},
@@ -664,8 +665,12 @@ def _edit_node(host, addr, **changes):
     ({"disks": [{"id": "vda", "dev_path": "/dev/vda", "size": 100 * GIB, "readonly": False, "cdrom": False}]},
      "/dev/vda is 107374182400 bytes, not the 161061273600-byte disk"),
     ({"disks": [{"id": "vdb", "dev_path": "/dev/vdb", "size": 150 * GIB, "readonly": False, "cdrom": False}]},
-     "has no /dev/vda"),
-    ({"volumes": [{"id": "vda1", "dev_path": "/dev/vda1", "parent": "vda", "name": "xfs"}]},
+     "its one writable disk is /dev/vdb, not /dev/vda"),
+    ({"disks": [{"id": "vda", "dev_path": "/dev/vda", "size": 150 * GIB, "readonly": False, "cdrom": False},
+                {"id": "vdb", "dev_path": "/dev/vdb", "size": 150 * GIB, "readonly": False, "cdrom": False}]},
+     "expected exactly one writable disk"),
+    ({"volumes": [{"id": "vda", "dev_path": "/dev/vda", "parent": "", "name": ""},
+                  {"id": "vda1", "dev_path": "/dev/vda1", "parent": "vda", "name": "xfs"}]},
      "/dev/vda is not empty (/dev/vda1)"),
     ({"volumes": [{"id": "vda", "dev_path": "/dev/vda", "parent": "", "name": "gpt"}]},
      "/dev/vda is not empty (/dev/vda)"),
@@ -679,10 +684,34 @@ def test_a_node_whose_link_or_disk_is_not_the_expected_one_gets_nothing(lab, cha
     assert (lab.backup / "state" / "journal").is_dir()
 
 
-def test_disks_the_maintenance_api_cannot_list_volumes_of_are_still_size_checked(lab):
+def test_without_a_volume_listing_the_hosts_creation_evidence_is_required(lab):
+    """Review B4: no listing and no host evidence means no install."""
     _edit_node(lab, "192.168.53.11", volumes_forbidden=True)
     proc = _ok(_install(lab))
-    assert "volumes are not listable in maintenance mode" in proc.stderr
+    assert "the host saw nothing written to it since boxman created it" in proc.stderr
+
+
+def test_without_a_volume_listing_a_written_disk_gets_nothing(lab):
+    _edit_node(lab, "192.168.53.11", volumes_forbidden=True)
+    # a first run records the disks after up, then stops (unpinned flux)
+    lab.set_world(flux_version="v0.0.0")
+    _refused(_install(lab), "flux is v0.0.0")
+    # something writes to cp-01's disk before the next run
+    lab.edit(lambda w: w["domains"][CP1]["disks"][0].update(allocation=64 << 20))
+    lab.set_world(flux_version=PINS["FLUX_VERSION"])
+    _refused(_install(lab), "no evidence /dev/vda is unwritten")
+    assert not [c for c in _talos_calls(lab, "apply-config") if "192.168.53.11" in c]
+
+
+@pytest.mark.parametrize("entry,text,message", [
+    ("talosctl get discoveredvolumes", "garbage\n", "cannot read the maintenance API's volume listing"),
+    ("talosctl get discoveredvolumes", "", "volume listing does not name /dev/vda"),
+    ("talosctl get disks", "- not a listing\n", "cannot list or read its disks"),
+])
+def test_an_unreadable_disk_or_volume_listing_gets_no_install(lab, entry, message, text):
+    lab.set_world(garbage={entry: text})
+    _refused(_install(lab), message)
+    assert not _talos_calls(lab, "apply-config")
 
 
 def test_a_failed_apply_is_retried_only_while_the_node_is_unconfigured(lab):
@@ -915,3 +944,277 @@ def test_flux_sh_refuses_to_run_unless_flux_is_on(lab):
     proc = lab.run("control-exec.sh", "run", "--", "talos-unattended/scripts/flux.sh",
                    "--inputs", "talos-unattended/control.env", stdin="glpat-FAKESECRET\n")
     _refused(proc, "Flux is opt-in")
+
+
+
+# ---- review regressions: ownership (B6) ----------------------------------------
+def test_a_failed_up_that_created_domains_blocks_every_later_run(lab):
+    """B6: domains from an up that never finished are not provably ours."""
+    lab.edit(lambda w: w["boxman"].update(fail_after_create=True))
+    _refused(_install(lab), "stage up failed")
+    assert "created" not in (lab.driver / "run.env").read_text()
+    lab.edit(lambda w: w["boxman"].update(fail_after_create=False))
+    before = len(lab.calls())
+    proc = _refused(_install(lab), "boxman up never finished on the run that recorded")
+    assert "stage preflight failed" in proc.stderr
+    new = lab.calls()[before:]
+    assert not [c for c in new if c.split()[0] in ("boxman", "ssh", "talosctl")]
+    assert lab.world()["boxman"]["calls"] == 1
+
+
+def test_an_incomplete_record_never_adopts_a_replaced_domain(lab):
+    lab.edit(lambda w: w["boxman"].update(fail_after_create=True))
+    _refused(_install(lab), "stage up failed")
+    lab.edit(lambda w: (w["boxman"].update(fail_after_create=False),
+                        w["domains"][W1].update(uuid="someone-elses")))
+    _refused(_install(lab), "boxman up never finished")
+    assert lab.world()["boxman"]["calls"] == 1
+
+
+def test_an_up_that_created_nothing_may_be_retried(lab):
+    lab.edit(lambda w: w["boxman"].update(rc=1))
+    _refused(_install(lab), "stage up failed")
+    lab.edit(lambda w: w["boxman"].pop("rc"))
+    proc = _ok(_install(lab))
+    assert "an earlier boxman up created nothing; starting again" in proc.stderr
+
+
+def test_a_recreated_network_is_never_adopted(lab):
+    _ok(_install(lab))
+    lab.edit(lambda w: w["networks"][NETWORK].update(uuid="another-network"))
+    _refused(_install(lab), f"{NETWORK} is not the network this driver created")
+    assert lab.world()["boxman"]["calls"] == 1
+
+
+def test_a_swapped_boot_disk_is_drift(lab):
+    _ok(_install(lab))
+    lab.edit(lambda w: w["domains"][W1]["disks"][0].update(source=f"{lab.lab_dir}/talos/other.qcow2"))
+    _refused(_install(lab), "worker-01: its boot disk is", status=3)
+
+
+def test_an_extra_disk_on_a_node_is_refused_on_the_host(lab):
+    lab.edit(lambda w: w["boxman"]["creates"][W1]["disks"].insert(
+        1, {"device": "disk", "target": "vdb", "source": "/data/ceph.qcow2", "capacity": 150 * GIB}))
+    _refused(_install(lab), "expected exactly one disk, vda", status=3)
+    assert not _talos_calls(lab, "apply-config")
+
+
+def test_only_the_boot_disk_may_be_the_install_disk(host):
+    with open(host.inputs_file, "a") as fobj:
+        fobj.write("TALOS_INSTALL_DISK=/dev/vdb\n")
+    _refused(host.run("preflight.sh"), "TALOS_INSTALL_DISK must be /dev/vda")
+
+
+# ---- review regressions: credential destinations (B7) ------------------------
+def _checkout(path):
+    (path / ".git").mkdir(parents=True)
+    (path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    return path
+
+
+def test_a_driver_directory_in_a_checkout_is_refused_before_any_write(lab):
+    repo = _checkout(lab.root / "repo")
+    _refused(_install(lab, TALOS_DRIVER_DIR=str(repo / "driver")), "is inside a git checkout")
+    assert not (repo / "driver").exists()
+    assert "calls" not in lab.world()["boxman"]
+
+
+def test_a_workspace_reached_through_a_link_into_a_checkout_is_refused(lab):
+    repo = _checkout(lab.root / "repo")
+    (repo / "labs").mkdir()
+    (lab.root / "lab-link").symlink_to(repo / "labs")
+    with open(lab.inputs_file, "a") as fobj:
+        fobj.write(f"TALOS_LAB_DIR={lab.root}/lab-link/lab\n")
+    _refused(_install(lab), "is inside a git checkout")
+    assert not list((repo / "labs").iterdir())
+
+
+def test_a_restore_never_writes_into_a_checkout_on_the_control_vm(lab):
+    import shutil
+    _ok(_install(lab))
+    shutil.rmtree(lab.root / STATE)
+    repo = _checkout(lab.root / "control-home" / "repo")
+    with open(lab.inputs_file, "a") as fobj:
+        fobj.write(f"TALOS_STATE_DIR={repo}/state\n")
+    _refused(_install(lab), "keep cluster secrets out of repositories")
+    assert not (repo / "state").exists()
+
+
+# ---- review regressions: bootstrap exactly once (B3) -------------------------
+def _drop_bootstrap_journal(lab):
+    for name in ("bootstrap.done", "bootstrap.intent"):
+        for root in (lab.root / STATE, lab.backup / "state"):
+            (root / "journal" / name).unlink(missing_ok=True)
+
+
+def test_a_lost_journal_with_unhealthy_etcd_never_bootstraps_again(lab):
+    _ok(_install(lab))
+    _drop_bootstrap_journal(lab)
+    lab.edit(lambda w: w["talos"].update(etcd_down=True))
+    proc = _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "cannot establish that etcd was never bootstrapped",
+                    status=3)
+    assert "cp-01=Failed" in proc.stderr
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+
+
+@pytest.mark.parametrize("state", ["Running", "Waiting", "Starting", ""])
+def test_bootstrap_needs_etcd_positively_waiting_for_it(lab, state):
+    _edit_node(lab, "192.168.53.11", etcd_state=state)
+    _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "cannot establish that etcd was never bootstrapped", status=3)
+    assert "bootstrap_calls" not in lab.world()["talos"]
+
+
+def test_an_unanswered_etcd_query_never_bootstraps(lab):
+    lab.edit(lambda w: w.update(fail=["talosctl service etcd"]))
+    _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "cp-01=unknown", status=3)
+    assert "bootstrap_calls" not in lab.world()["talos"]
+
+
+def test_an_unreadable_journal_entry_stops_the_run(lab):
+    _ok(_install(lab))
+    entry = lab.root / STATE / "journal" / "bootstrap.done"
+    entry.chmod(0)
+    try:
+        # the driver stops at the first stage that reads the state: the backup
+        _refused(_install(lab), "backup: cannot read the control VM's state")
+        # bootstrap.sh itself refuses it too
+        proc = lab.run("control-exec.sh", "run", "--", "talos-unattended/scripts/bootstrap.sh",
+                       "--inputs", "talos-unattended/control.env", "--nodes", "talos-unattended/nodes.txt")
+        _refused(proc, "cannot read the journal entry")
+    finally:
+        entry.chmod(0o600)
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+
+
+def test_a_journal_lost_on_the_control_vm_only_is_drift_and_the_backup_is_kept(lab):
+    """B3: the backup never rotates away a journal entry the control VM lost."""
+    _ok(_install(lab))
+    lab.edit(lambda w: w["talos"].update(etcd_down=True))
+    (lab.root / STATE / "journal" / "bootstrap.done").unlink()
+    (lab.root / STATE / "journal" / "cp-01.applied").unlink()
+    proc = _refused(_install(lab), "the control VM's journal lost", status=3)
+    assert "bootstrap.done" in proc.stderr and "cp-01.applied" in proc.stderr
+    assert (lab.backup / "state" / "journal" / "bootstrap.done").exists()
+    assert (lab.backup / "state" / "journal" / "cp-01.applied").exists()
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+    assert len(_talos_calls(lab, "apply-config")) == 2
+
+
+def test_existing_etcd_data_is_not_mistaken_for_a_fresh_node(lab):
+    """B3: Preparing and no members, but the data directory is not empty."""
+    _ok(_install(lab))
+    _drop_bootstrap_journal(lab)
+    lab.edit(lambda w: (w["talos"].update(etcd_down=True),
+                        w["talos"]["nodes"]["192.168.53.11"].update(etcd_state="Preparing")))
+    proc = _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "cannot establish that etcd was never bootstrapped",
+                    status=3)
+    assert "cp-01=Preparing/data-data" in proc.stderr
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+
+
+@pytest.mark.parametrize("etcd_dir,seen", [("error", "data-unknown"), ("garbage", "data-unknown")])
+def test_an_unreadable_etcd_data_directory_never_bootstraps(lab, etcd_dir, seen):
+    _edit_node(lab, "192.168.53.11", etcd_dir=etcd_dir)
+    proc = _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "cannot establish that etcd was never bootstrapped",
+                    status=3)
+    assert seen in proc.stderr
+    assert "bootstrap_calls" not in lab.world()["talos"]
+
+
+def test_an_absent_etcd_data_directory_counts_as_empty(lab):
+    _edit_node(lab, "192.168.53.11", etcd_dir="missing")
+    proc = _ok(_install(lab))
+    assert "cp-01=Preparing/data-empty" in proc.stderr
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+
+
+def _stop_before_bootstrap(lab):
+    """A first run that applies the configs, then stops before bootstrapping."""
+    _edit_node(lab, "192.168.53.11", synced=False)
+    _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "time is not synchronised")
+    _edit_node(lab, "192.168.53.11", synced=True)
+    return lab.root / STATE / "journal"
+
+
+@pytest.mark.parametrize("arrange,message", [
+    (lambda j: (j / "bootstrap.intent").mkdir(), "cannot read the journal entry"),
+    (lambda j: (j / "bootstrap.intent").write_text(""), "is empty"),
+    (lambda j: (j / "bootstrap.intent").write_text("not a record at all\n"), "malformed entry"),
+])
+def test_an_unusable_bootstrap_journal_entry_stops_without_a_bootstrap(lab, arrange, message):
+    arrange(_stop_before_bootstrap(lab))
+    _refused(_install(lab), message)
+    assert "bootstrap_calls" not in lab.world()["talos"]
+
+
+def test_a_failed_intent_write_sends_no_bootstrap(lab):
+    journal = _stop_before_bootstrap(lab)
+    (journal / ".bootstrap.intent.tmp").mkdir()
+    (journal / ".bootstrap.intent.tmp" / "blocker").write_text("x")
+    _refused(_install(lab), "cannot write")
+    assert "bootstrap_calls" not in lab.world()["talos"]
+
+
+# ---- review regressions: bounded calls (B9) ------------------------------------
+@pytest.mark.parametrize("world,message", [
+    ({"kube": {"hang": ["get nodes"]}}, "nodes registered after"),
+    ({"kube": {"hang": ["--raw=/readyz"]}}, "does not answer within"),
+    ({"talos": {"hang": ["get timestatus"]}}, "time is not synchronised"),
+])
+def test_a_hung_request_cannot_outlive_its_stage(lab, world, message):
+    import time
+    def hang(w):
+        for key, value in world.items():
+            w.setdefault(key, {}).update(value)
+    lab.edit(hang)
+    start = time.monotonic()
+    _refused(_install(lab, TALOS_CALL_TIMEOUT="2", TALOS_KUBE_TIMEOUT="3", TALOS_AUTH_TIMEOUT="3"), message)
+    assert time.monotonic() - start < 100
+    # the bound reached the control VM in its shipped inputs, not through a
+    # leaked host environment (the fake ssh passes none)
+    shipped = (lab.root / "control-home" / "talos-unattended" / "control.env").read_text()
+    assert "TALOS_CALL_TIMEOUT=2\n" in shipped
+
+
+# ---- review regressions: Flux absence and destination (B5) -----------------------
+@pytest.mark.parametrize("failing,message", [
+    ("kubectl get crd", "cannot tell whether Flux is installed"),
+    ("kubectl get gitrepository", "cannot read the flux-system GitRepository"),
+])
+def test_a_failed_flux_lookup_is_not_absence(lab, failing, message):
+    _gitlab(lab)
+    lab.edit(lambda w: w["flux"].update(crd=True))
+    lab.set_world(fail=[failing])
+    _refused(_install(lab, **FLUX_ON), message)
+    assert "bootstrap_calls" not in lab.world()["flux"]
+    assert not lab.calls("curl")
+
+
+def test_flux_never_bootstraps_into_an_occupied_path(lab):
+    _gitlab(lab)
+    lab.edit(lambda w: w["gitlab"].update(paths=["clusters/lab"]))
+    _refused(_install(lab, **FLUX_ON), "already holds files, and this cluster has no record", status=3)
+    assert "bootstrap_calls" not in lab.world()["flux"]
+
+
+def test_flux_resumes_its_own_interrupted_bootstrap(lab):
+    _gitlab(lab)
+    lab.edit(lambda w: w["flux"].update(bootstrap_fail="after-push"))
+    _refused(_install(lab, **FLUX_ON), "flux: bootstrap failed")
+    assert "clusters/lab" in lab.world()["gitlab"]["paths"]
+    lab.edit(lambda w: w["flux"].pop("bootstrap_fail"))
+    proc = _ok(_install(lab, **FLUX_ON))
+    assert "this cluster's own interrupted bootstrap; resuming it" in proc.stderr
+    assert lab.world()["flux"]["bootstrap_calls"] == 2
+
+
+@pytest.mark.parametrize("gitlab,message", [
+    ({"branches": ["other"]}, "the branch main does not exist"),
+    ({"tree_status": 500}, "cannot tell whether clusters/lab exists"),
+    ({"down": True}, "cannot reach the GitLab API"),
+])
+def test_an_unclear_flux_destination_stops_before_bootstrap(lab, gitlab, message):
+    _gitlab(lab)
+    lab.edit(lambda w: w["gitlab"].update(gitlab))
+    _refused(_install(lab, **FLUX_ON), message)
+    assert "bootstrap_calls" not in lab.world()["flux"]
