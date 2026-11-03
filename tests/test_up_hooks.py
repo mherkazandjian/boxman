@@ -446,3 +446,52 @@ def test_a_relative_workspace_gives_the_hooks_an_absolute_record_path(mgr, tmp_p
     m.up(_args())
     assert _hook_lines(m) == [os.path.realpath(tmp_path / "project"), os.path.realpath(elsewhere)]
     assert (operator / "lab" / UP_RECORD_NAME).exists()
+
+
+def _running_project(m, plan_action, define_outcome="created"):
+    """The real _up all-running path and the real reconcile_networks, with
+    the provider stubbed: plan_network answers *plan_action* for net1."""
+    del m._up
+    m.validate_snapshot_dirs = lambda: None
+    m._get_vm_states = lambda: {D1: "running", D2: "running"}
+    for name in ("ensure_shared_bridges", "report_network_results", "raise_on_network_failures",
+                 "ensure_netlab_up", "connect_info"):
+        setattr(m, name, lambda *a, **k: None)
+    m._reconcile_compose_clusters = lambda: None
+    m.eject_install_media = lambda *a, **k: []
+    m._rewrite_ssh_config = lambda: []
+    m.provider = SimpleNamespace(plan_network=lambda name, info: {
+        "action": plan_action, "structural": [], "range_ops": [], "host_ops": []})
+    m._define_network = lambda *a, **k: define_outcome
+    m.wait_for_vm_ips = lambda *a, **k: None
+    (m.record.parent).mkdir(parents=True)
+
+
+@pytest.mark.parametrize("outcome", ["created"])
+def test_a_network_this_up_defined_on_the_running_path_is_recorded_as_created(mgr, outcome):
+    """H1 follow-up: reconcile_networks created it, so this up made it."""
+    before = {"domains": {D1: "uuid-1", D2: "uuid-2"}, "networks": {}}
+    after = {"domains": {D1: "uuid-1", D2: "uuid-2"}, "networks": {N1: "net-uuid-new"}}
+    m = mgr(hooks={"post_up": ["c"]}, inventories=(before, after), provisions=False)
+    _running_project(m, "create", outcome)
+    m.up(_args())
+    record = json.loads(m.record.read_text())
+    assert record["created"] == {"domains": {}, "networks": {N1: "net-uuid-new"}}
+    assert m._networks_created is None      # tracked only inside a hooked up
+
+
+def test_a_network_that_appeared_without_this_up_defining_it_is_not_claimed(mgr):
+    before = {"domains": {D1: "uuid-1", D2: "uuid-2"}, "networks": {}}
+    after = {"domains": {D1: "uuid-1", D2: "uuid-2"}, "networks": {N1: "net-uuid-other"}}
+    m = mgr(hooks={"post_up": ["c"]}, inventories=(before, after), provisions=False)
+    _running_project(m, "none")
+    m.up(_args())
+    assert json.loads(m.record.read_text())["created"] == EMPTY
+
+
+def test_network_tracking_is_off_without_hooks(mgr):
+    m = mgr(provisions=False)
+    _running_project(m, "create")
+    m.up(_args())
+    assert getattr(m, "_networks_created", None) is None
+    assert not m.record.exists()

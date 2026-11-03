@@ -328,14 +328,25 @@ class HooksMixin:
             return self._up_with_hooks_locked(cli_args, up_body)
 
     def _created_by_this_up(self, before: dict, after: dict) -> dict[str, dict[str, str]]:
-        """What this ``up`` created: only a provision it ran creates. An
-        ``up`` that found the project in place (start, resume, reconcile)
-        created nothing, whatever appeared meanwhile."""
-        if not getattr(self, '_provision_ran', False):
-            return {'domains': {}, 'networks': {}}
-        return self._created_between(before, after)
+        """What this ``up`` created, from its own successful operations only:
+        a provision it ran (every resource it left with a new UUID), and on
+        the other paths (start, resume, reconcile) the networks that
+        ``reconcile_networks`` created or recreated. Resources that merely
+        appeared meanwhile are never claimed."""
+        diff = self._created_between(before, after)
+        if getattr(self, '_provision_ran', False):
+            return diff
+        made = getattr(self, '_networks_created', None) or set()
+        return {'domains': {},
+                'networks': {name: uid for name, uid in diff['networks'].items() if name in made}}
 
     def _up_with_hooks_locked(self, cli_args: Any, up_body) -> None:
+        try:
+            return self._run_hooked_up(cli_args, up_body)
+        finally:
+            self._networks_created = None   # track only inside a hooked up
+
+    def _run_hooked_up(self, cli_args: Any, up_body) -> None:
         run_id = uuid.uuid4().hex
         force = bool(getattr(cli_args, 'force', False))
         env = {'BOXMAN_UP_RUN_ID': run_id, 'BOXMAN_UP_FORCE': '1' if force else '0'}
@@ -344,6 +355,7 @@ class HooksMixin:
             return up_body(cli_args)
         before = self.project_inventory()
         self._provision_ran = False
+        self._networks_created = set()
         try:
             result = up_body(cli_args)
         except Exception:

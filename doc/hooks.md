@@ -69,11 +69,16 @@ not run, and `boxman up` exits non-zero (2, like any boxman error).
 
 ## `--force`
 
-`--force` changes `boxman up` exactly as it does without hooks, and only on
-one path: when some of the project's VMs exist and others do not, `up
---force` deprovisions the project and provisions it again (without
-`--force` it refuses). A project with no VMs is provisioned with or without
-it; a complete project is started, resumed or reconciled, never
+`--force` changes `boxman up` exactly as it does without hooks, on two
+paths, where `up` otherwise refuses:
+
+- some of the project's VMs exist and others do not: `up --force`
+  deprovisions the project and provisions it again;
+- no VM exists but the project is still registered in boxman's cache (a
+  stale registration): `up --force` deprovisions first, then provisions.
+
+A project with no VMs and no registration is provisioned with or without
+it, and a complete project is started, resumed or reconciled, never
 recreated, with or without it. The hooks run as for any `up` and get
 `BOXMAN_UP_FORCE=1`, so a `pre_up` hook can refuse a run it does not
 support. Resources recreated by that partial-state reprovision have new
@@ -124,11 +129,11 @@ resolved against the directory boxman was run from):
 }
 ```
 
-- `created`: the project's domains and networks that a provision run by
-  this `up` created or recreated: present afterwards with a UUID they did
-  not have before it. An `up` that found the project in place (start,
-  resume or reconcile) provisions nothing and records nothing as created,
-  even if resources appeared meanwhile.
+- `created`: what this `up`'s own operations created or recreated: after a
+  provision it ran, every project domain and network present with a UUID
+  it did not have before; on the other paths (start, resume, reconcile),
+  only the networks that `up`'s network reconciliation defined or
+  recreated. Resources that merely appeared while it ran are never listed.
 - `present`: all of the project's domains and networks after this `up`.
 - `status`: `succeeded`, or `failed` for an `up` that raised (then no
   `post_up` hook runs; the record is for diagnosis).
