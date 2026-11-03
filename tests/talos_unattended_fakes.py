@@ -30,6 +30,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 
 WORLD = os.environ.get("FAKE_WORLD", "")
 
@@ -189,13 +190,53 @@ def df(world: dict, argv: list[str]) -> None:
     print(f"/dev/fake      999999999999 1 {world.get('df_avail_kib', 10 ** 12)} 1% /")
 
 
+def _render_conf(conf: str) -> dict:
+    """The box's conf.yml, rendered as boxman renders it."""
+    import yaml
+
+    from boxman.utils.jinja_env import create_jinja_env
+    os.environ["BOXMAN_CONF_DIR"] = os.path.dirname(conf)
+    os.environ["BOXMAN_CONF_FILE"] = conf
+    env = create_jinja_env(os.path.dirname(conf))
+    return yaml.safe_load(env.get_template(os.path.basename(conf)).render())
+
+
+def _inventory(world: dict, project: str) -> dict:
+    prefix = f"bprj__{project}__bprj"
+    return {"domains": {n: d["uuid"] for n, d in world.get("domains", {}).items() if n.startswith(prefix + "_")},
+            "networks": {n: d.get("uuid", "net-uuid-1") for n, d in world.get("networks", {}).items()
+                         if n.startswith(prefix + "__")}}
+
+
+def _run_hooks(phase: str, cfg: dict, conf: str, env: dict) -> None:
+    for name in (cfg.get("hooks") or {}).get(phase) or []:
+        task = cfg["tasks"][name]
+        rc = subprocess.run(["bash", "-c", task["command"]], cwd=task.get("workdir", os.path.dirname(conf)),
+                            env=dict(env, BOXMAN_HOOK=phase)).returncode
+        if rc:
+            fail(f"HookError: {phase} hook '{name}' failed (exit {rc}); boxman up stopped", 2)
+
+
 def boxman(world: dict, argv: list[str]) -> None:
+    """boxman up with the hooks of doc/hooks.md: pre_up, create, record, post_up."""
     if "up" not in argv:
         fail("fake boxman: unexpected " + " ".join(argv))
+    conf = os.path.abspath(opt(argv, "--conf") or "conf.yml")
+    cfg = _render_conf(conf)
+    project = cfg["project"]
+    run_id = world.get("boxman", {}).get("run_id_override") or uuid.uuid4().hex
+    env = dict(os.environ, BOXMAN_UP_RUN_ID=run_id, BOXMAN_UP_FORCE="1" if "--force" in argv else "0")
+    _run_hooks("pre_up", cfg, conf, env)
+
+    world = load()
     up = world.setdefault("boxman", {})
     up["calls"] = up.get("calls", 0) + 1
+    save(world)
+    before = _inventory(world, project)
     if up.get("rc"):
         fail("fake boxman: up failed", up["rc"])
+    workspace = os.path.expanduser(cfg["workspace"]["path"])
+    os.makedirs(workspace, exist_ok=True)
     for name, dom in (up.get("creates") or {}).items():
         world["domains"].setdefault(name, json.loads(json.dumps(dom)))
         world["domains"][name]["state"] = "running"
@@ -204,8 +245,24 @@ def boxman(world: dict, argv: list[str]) -> None:
     for net, leases in (up.get("leases") or {}).items():
         world.setdefault("leases", {})[net] = leases
     save(world)
+    after = _inventory(world, project)
+    created = {k: {n: u for n, u in after[k].items() if before[k].get(n) != u} for k in after}
+    # a record that disagrees with libvirt: the driver must notice
+    for name, value in (up.get("record_tamper") or {}).items():
+        if name in created["domains"]:
+            created["domains"][name] = value
+        after["domains"][name] = value
+    status = "failed" if up.get("fail_after_create") else "succeeded"
+    record = {"boxman_up_record": 1, "project": up.get("record_project", project),
+              "run_id": up.get("record_run_id", run_id), "status": status,
+              "force": "--force" in argv, "finished_at": "2026-01-01T00:00:00Z",
+              "created": created, "present": after}
+    path = os.path.join(workspace, "boxman-up-record.json")
+    with open(path, "w") as fobj:
+        json.dump(record, fobj)
     if up.get("fail_after_create"):
         fail("fake boxman: up failed after creating the domains", 1)
+    _run_hooks("post_up", cfg, conf, dict(env, BOXMAN_UP_RECORD=path))
 
 
 # --------------------------------------------------------------------------- #

@@ -196,6 +196,22 @@ def test_boxmans_own_loader_reads_the_pins(tmp_path, monkeypatch):
     assert cfg["isos"]["talos-install"]["checksum"] == _pins()["TALOS_ISO_CHECKSUM"]
 
 
+def test_boxman_up_runs_the_preflight_and_the_driver_as_its_hooks(tmp_path, monkeypatch):
+    """A plain boxman up installs: preflight as pre_up, the driver as post_up."""
+    monkeypatch.setenv("BOXMAN_CONF_FILE", str(tmp_path / "conf.yml"))
+    monkeypatch.setenv("BOXMAN_CONF_DIR", str(tmp_path))
+    for name in ("conf.yml", "versions.env"):
+        (tmp_path / name).write_text(open(os.path.join(BOX, name)).read())
+    mgr = BoxmanManager.__new__(BoxmanManager)
+    mgr.logger = logging.getLogger(__name__)
+    mgr.config = mgr.load_config(str(tmp_path / "conf.yml"))
+    mgr.validate_hooks_config()
+    assert mgr.config["hooks"] == {"pre_up": ["talos-preflight"], "post_up": ["talos-install"]}
+    tasks = mgr.config["tasks"]
+    assert tasks["talos-preflight"]["command"] == '"$BOXMAN_CONF_DIR/scripts/install.sh" --pre-up'
+    assert tasks["talos-install"]["command"] == '"$BOXMAN_CONF_DIR/scripts/install.sh" --post-up'
+
+
 def _template_userdata(monkeypatch, **env) -> dict:
     return yaml.safe_load(_render(monkeypatch, **env)["templates"]["control-base"]["cloudinit"])
 

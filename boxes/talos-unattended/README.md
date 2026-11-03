@@ -5,10 +5,11 @@ interactive prompt: three control planes, three workers and one Ubuntu
 control VM. Boxman creates the VMs; the Talos side is configured through the
 Talos API from the control VM.
 
-> **Status: work in progress.** `make install` (scripts/install.sh) takes
-> the lab from nothing to a healthy cluster and can be rerun safely; Flux
-> is opt-in. `boxman up` on its own only creates and starts the VMs: the
-> driver runs it, then configures the cluster from the control VM.
+> **Status: work in progress.** A plain `boxman up` takes the lab from
+> nothing to a healthy cluster and can be rerun safely: conf.yml runs the
+> preflight as its `pre_up` hook and the install driver as its `post_up`
+> hook (doc/hooks.md). `make install` is the same `boxman up`. Flux is
+> opt-in.
 
 ## Topology
 
@@ -94,21 +95,31 @@ sources in the comments, then repeat the real-`talosctl` checks described in
 
 ```sh
 cp inputs.env.example inputs.env && chmod 600 inputs.env   # fill it in
-make preflight      # checks only; changes nothing
-make install        # boxman up, then configure, bootstrap and check
+set -a; . ./inputs.env; set +a
+boxman up           # preflight, the VMs, then configure, bootstrap and check
 make status         # read-only report
 ```
 
-`make install` runs `scripts/install.sh`, a serial driver on the host. It
-stops at the first failed stage with a message naming it; fix the cause and
-run it again. A rerun checks what the earlier run built and changes nothing
-that is already right: it never regenerates the cluster identity, re-sends
-a node's initial config or bootstraps etcd a second time.
+`make install` (`scripts/install.sh`) is the same `boxman up`, with an
+inputs file of your choice (`make install INPUTS=...`); `make preflight`
+runs the checks alone and changes nothing.
+
+`boxman up` runs `scripts/install.sh --pre-up` first, which is
+`scripts/preflight.sh`: if it fails, boxman changes nothing. After boxman
+created or started the VMs, it writes a record of the domains and network
+it created in this run and runs `scripts/install.sh --post-up`, the serial
+install driver. The driver stops at the first failed stage with a message
+naming it, and `boxman up` exits non-zero; fix the cause and run `boxman up`
+again. A rerun checks what the earlier run built and changes nothing that
+is already right: it never regenerates the cluster identity, re-sends a
+node's initial config or bootstraps etcd a second time. `boxman up --force`
+is refused by the pre_up hook: it would recreate the VMs while the cluster
+identity lives on in the backup.
 
 | stage | what it does, and what it refuses |
 | --- | --- |
 | preflight | `scripts/preflight.sh`, before any side effect: inputs and pins, libvirt with the local runtime, exactly one control VM and 3+3 nodes (or 1+1 with `TALOS_PROFILE=smoke`), memory and disk for what is not yet running or created, the fabric subnet against every other libvirt network, host address and route, the operator key, the backup location, and Flux's inputs when it is on. Every reading is checked; a failed or partial one stops the run. A domain or network of the project may exist only if this driver recorded creating it: a first run, or one after an `up` that never finished, refuses any that exist (matching names prove nothing); a later run finds exactly the domains and network it recorded, by UUID. `TALOS_INSTALL_DISK` must be `/dev/vda`, the one boot disk boxman creates |
-| up | one project-wide `boxman up` (`BOXMAN` overrides the command). Only once it succeeded on the run that created them are every VM's UUID, the network's UUID and each node's boot disk (path and allocation) recorded, together; a later run stops if any was recreated or swapped |
+| up, ownership | boxman's own `up`. The driver then reads boxman's record of that run (`BOXMAN_UP_RECORD`, checked against `BOXMAN_UP_RUN_ID`): on a first run every VM and the network must be ones this `up` created, and their UUIDs are recorded from boxman's record (with each node's boot disk path and allocation), never from whatever has the project's names; on a later run none may have been created, and all must have the recorded UUIDs. A partly recreated project, a record of another run, or a failed `up` stops it |
 | control | `scripts/control-exec.sh verify`: the control domain's UUID, its one lease on the fabric, and its ssh host key read from inside the guest through the libvirt guest agent. ssh then uses only the operator key, `BatchMode` and that pinned host key, nothing from `~/.ssh/config`. The control VM's `talosctl`, `kubectl` and `flux` must be the pinned versions |
 | nodes | per Talos node, from libvirt: one NIC on this project's fabric with the reserved MAC, exactly one disk (`vda`, the recorded one, in the workspace, of the declared size), and a DHCP lease for the MAC that is the reserved address. A disk with no byte allocated since its creation was recorded counts as evidence it is still empty |
 | ship | the control-side scripts, `versions.env`, the node and disk tables and the control-side inputs (never a credential) to `~/talos-unattended` on the control VM |
@@ -282,6 +293,9 @@ TALOS_UNATTENDED_TALOSCTL=$PWD/talosctl pytest tests/test_talos_unattended_box.p
   sent: a node where it does not stops the run.
 - v0 does not update an installed node, replace one, or change the profile
   of a built lab: those stop as drift.
+- The hooks run with boxman's environment and call `python3` (or
+  `TALOS_PYTHON`) for `scripts/box-facts.py` and `nodes-from-conf.py`, which
+  import boxman: that interpreter must have boxman installed.
 - Use a dedicated key for `TALOS_OPERATOR_KEY`. boxman treats the
   management group's `admin_key_name` as its own: `boxman deprovision
   --cleanup` deletes that key, and boxman generates a new one there if it is

@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
 # The install driver: from nothing to a healthy Talos cluster, unattended.
 #
-#   install.sh [--inputs FILE]        (or: make install)
+#   install.sh [--inputs FILE]          make install: runs `boxman up`
+#   install.sh --pre-up  [--inputs FILE]   boxman up's pre_up hook
+#   install.sh --post-up [--inputs FILE]   boxman up's post_up hook
 #
-# Runs on the host, serially, and is safe to run again: a second run checks
-# what the first one built and changes nothing that is already right. It
-# never regenerates the cluster identity, re-sends a node's initial config or
-# bootstraps etcd twice. Stages:
+# conf.yml names the two hook modes in `hooks:` (doc/hooks.md), so a plain
+# `boxman up` does the whole install: the pre_up hook checks everything
+# before boxman changes anything, boxman creates or starts the VMs, and the
+# post_up hook configures, bootstraps and checks the cluster. Without a mode
+# this script is that `boxman up` (BOXMAN, default boxman), with the inputs
+# file exported for the hooks (TALOS_INPUTS). Safe to run again: a second
+# run checks what the first one built and changes nothing that is already
+# right. It never regenerates the cluster identity, re-sends a node's
+# initial config or bootstraps etcd twice.
 #
-#   preflight   scripts/preflight.sh; nothing before it has side effects
-#   up          one project-wide `boxman up` (BOXMAN, default boxman); each
-#               VM's UUID is recorded on the first run and must match after
+# --pre-up: scripts/preflight.sh, before boxman changes anything. boxman up
+#   --force (BOXMAN_UP_FORCE=1) is refused: it would recreate the VMs while
+#   the cluster identity lives on in the backup.
+#
+# --post-up stages, after boxman up succeeded:
+#   ownership   from boxman's up record (BOXMAN_UP_RECORD), which must be
+#               this run's (BOXMAN_UP_RUN_ID): on a first run, every VM and
+#               the network must be ones this up created, and their UUIDs
+#               are recorded from the record, not from whatever has the
+#               project's names; on a later run, none may have been created
+#               and all must have the recorded UUIDs. Anything else stops.
 #   control     scripts/control-exec.sh verify: the control VM's identity,
 #               address and pinned ssh host key; then its talosctl, kubectl
 #               and flux must be exactly the pinned versions
@@ -42,15 +57,18 @@ PROG=install
 # shellcheck source=lib.sh
 . "$(dirname -- "$0")/lib.sh"
 
-INPUTS=""
+INPUTS="" MODE=up
 while [ $# -gt 0 ]; do
     case "$1" in
-        --inputs) INPUTS=${2:?--inputs needs a file}; shift ;;
+        --inputs)  INPUTS=${2:?--inputs needs a file}; shift ;;
+        --pre-up)  MODE=pre_up ;;
+        --post-up) MODE=post_up ;;
         -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2 ;;
         *) die "unknown argument: $1" ;;
     esac
     shift
 done
+[ -n "$INPUTS" ] || INPUTS=${TALOS_INPUTS:-}
 [ -z "$INPUTS" ] || INPUTS=$(cd -P -- "$(dirname -- "$INPUTS")" && pwd -P)/$(basename -- "$INPUTS")
 
 stage() { log "== $*"; }
@@ -59,12 +77,31 @@ stage() { log "== $*"; }
 step() {
     local name=$1 rc=0; shift
     "$@" || rc=$?
-    [ $rc -eq 0 ] || DIE_STATUS=$rc die "stage $name failed (exit $rc); fix the cause above and run install.sh again"
+    [ $rc -eq 0 ] || DIE_STATUS=$rc die "stage $name failed (exit $rc); fix the cause above and run boxman up again"
 }
 cexec() { "$SCRIPTS/control-exec.sh" ${INPUTS:+--inputs "$INPUTS"} "$@"; }
 
-stage preflight
-step preflight "$SCRIPTS/preflight.sh" ${INPUTS:+--inputs "$INPUTS"}
+case "$MODE" in
+    up)
+        # make install: boxman up, which runs the hooks below; the inputs go
+        # to boxman (conf.yml reads them) and to the hooks
+        load_inputs "$INPUTS"
+        [ -z "$INPUTS" ] || export TALOS_INPUTS=$INPUTS
+        read -ra BOXMAN_CMD <<< "${BOXMAN:-boxman}"
+        log "boxman up; its pre_up and post_up hooks run this script (conf.yml hooks:)"
+        exec "${BOXMAN_CMD[@]}" --conf "$BOX_DIR/conf.yml" up ;;
+    pre_up)
+        [ "${BOXMAN_HOOK:-}" = pre_up ] \
+            || die "--pre-up runs as boxman up's pre_up hook; run boxman up (or make install), or scripts/preflight.sh on its own"
+        [ "${BOXMAN_UP_FORCE:-0}" = 0 ] \
+            || die "boxman up --force is not supported for this box: it would deprovision and recreate the VMs while the cluster identity lives on in TALOS_BACKUP_DIR. For a new cluster: boxman destroy, move TALOS_BACKUP_DIR away, then boxman up"
+        stage preflight
+        exec "$SCRIPTS/preflight.sh" ${INPUTS:+--inputs "$INPUTS"} ;;
+esac
+
+# ---- post_up: everything after boxman up -------------------------------------------
+[ "${BOXMAN_HOOK:-}" = post_up ] && [ -n "${BOXMAN_UP_RECORD:-}" ] && [ -n "${BOXMAN_UP_RUN_ID:-}" ] \
+    || die "--post-up runs as boxman up's post_up hook, with its up record; run boxman up (or make install)"
 load_inputs "$INPUTS"
 read_facts
 PROFILE=${TALOS_PROFILE:-full}
@@ -82,22 +119,8 @@ private_dir "$BACKUP"
 [ "$(cd -P -- "$BACKUP" && pwd -P)" = "$BACKUP" ] \
     || die "TALOS_BACKUP_DIR $BACKUP changed under us (a component was swapped for a link); refusing to write the identity there"
 
-if [ ! -e "$RECORD" ]; then
-    record_set project "$PROJECT"
-    record_set profile "$PROFILE"
-    record_set started "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-fi
-[ "$(record_get profile)" = "$PROFILE" ] \
-    || drift "this lab was built with the $(record_get profile) profile, not $PROFILE; v0 does not change a cluster's size"
-
-# ---- up -----------------------------------------------------------------------
-stage "up: boxman up, project $PROJECT"
-read -ra BOXMAN_CMD <<< "${BOXMAN:-boxman}"
-step up "${BOXMAN_CMD[@]}" --conf "$BOX_DIR/conf.yml" up
-# what this run's up created: every UUID, the network's and each node's boot
-# disk, recorded together and only after up succeeded on a run that started
-# with none of them present (preflight), then created=yes. A later run
-# touches only what matches.
+# ---- ownership, from boxman's record of this up ------------------------------------
+stage "ownership: from boxman's up record"
 boot_disk() {   # boot_disk DOMAIN: "<source> <allocation>" of its one disk, vda
     local disks src alloc
     disks=$(vsh domblklist "$1" --details | awk 'NR > 2 && $2 == "disk" {print $3, $4}') \
@@ -109,13 +132,29 @@ boot_disk() {   # boot_disk DOMAIN: "<source> <allocation>" of its one disk, vda
     [[ $alloc =~ ^[0-9]+$ ]] || die "$1: cannot read its disk allocation"
     echo "$src $alloc"
 }
-if [ "$(record_get created)" != yes ]; then
-    entries=()
+rc=0
+handoff=$("$PYTHON" "$SCRIPTS/up-record.py" "$BOXMAN_UP_RECORD" "$BOXMAN_UP_RUN_ID" "$PROJECT" \
+    "$NETWORK" "${VM_DOMAIN[@]}") || rc=$?
+case $rc in
+    0) ;;
+    3) drift "boxman's up record shows a partly recreated project (see above)" ;;
+    *) die "cannot take ownership from boxman's up record (see above)" ;;
+esac
+up_mode=$(awk '$1 == "mode" {print $2}' <<< "$handoff")
+# handed_uuid NAME: the uuid boxman recorded for NAME in this up
+handed_uuid() { awk -v n="$1" '$1 == "uuid" && $2 == n {print $3}' <<< "$handoff"; }
+if [ "$up_mode" = created ]; then
+    # every VM and the network are this up's own: record them from boxman's
+    # record; libvirt must agree, and the record must start fresh
+    [ "$(record_get created)" != yes ] \
+        || drift "boxman up created this project's VMs and network anew while this driver holds a cluster on earlier ones ($RECORD); its identity in $BACKUP cannot be reused. Destroy the project, move TALOS_BACKUP_DIR away, then boxman up"
+    entries=("project=$PROJECT" "profile=$PROFILE" "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+             "up_run=$BOXMAN_UP_RUN_ID")
     for i in "${!VM_DOMAIN[@]}"; do
         dom=${VM_DOMAIN[$i]} name=${VM_NAME[$i]}
-        [ "$(domain_state "$dom")" != absent ] || die "boxman up finished but $dom does not exist"
-        uuid=$(domain_uuid "$dom")
-        [ -n "$uuid" ] || die "cannot read the uuid of $dom"
+        uuid=$(handed_uuid "$dom")
+        [ -n "$uuid" ] && [ "$(domain_uuid "$dom")" = "$uuid" ] \
+            || drift "$dom is not the domain boxman's up record says this up created (uuid ${uuid:-?})"
         entries+=("uuid.$name=$uuid")
         if [ "${VM_ROLE[$i]}" != control ]; then
             bd=$(boot_disk "$dom") || exit $?
@@ -123,20 +162,30 @@ if [ "$(record_get created)" != yes ]; then
             entries+=("disk.$name=$src" "alloc.$name=$alloc")
         fi
     done
-    net_uuid=$(vsh net-uuid "$NETWORK" | sed -n '1{s/[[:space:]]*$//;p}') && [ -n "$net_uuid" ] \
-        || die "boxman up finished but the uuid of $NETWORK cannot be read"
+    net_uuid=$(handed_uuid "$NETWORK")
+    [ -n "$net_uuid" ] && [ "$(vsh net-uuid "$NETWORK" | sed -n '1{s/[[:space:]]*$//;p}')" = "$net_uuid" ] \
+        || drift "$NETWORK is not the network boxman's up record says this up created"
     entries+=("net.uuid=$net_uuid")
+    rm -f "$RECORD"
     for entry in "${entries[@]}"; do record_set "${entry%%=*}" "${entry#*=}"; done
     record_set created yes
-    log "up: recorded the ${#VM_DOMAIN[@]} VMs and the network this run created, by uuid"
+    log "ownership: boxman created the ${#VM_DOMAIN[@]} VMs and the network in this up (run $BOXMAN_UP_RUN_ID); recorded by uuid"
 else
+    # nothing new: everything must be what this driver recorded before
+    [ "$(record_get created)" = yes ] \
+        || drift "boxman up found this project's VMs in place, but this driver never recorded creating them; a run never takes over what it cannot prove it created -- destroy them and start again"
+    [ "$(record_get profile)" = "$PROFILE" ] \
+        || drift "this lab was built with the $(record_get profile) profile, not $PROFILE; v0 does not change a cluster's size"
     for i in "${!VM_DOMAIN[@]}"; do
         dom=${VM_DOMAIN[$i]} want=$(record_get "uuid.${VM_NAME[$i]}")
-        [ "$(domain_uuid "$dom")" = "$want" ] || drift "$dom is not the domain this driver created (uuid $want)"
+        [ "$(handed_uuid "$dom")" = "$want" ] && [ "$(domain_uuid "$dom")" = "$want" ] \
+            || drift "$dom is not the domain this driver created (uuid $want)"
     done
-    [ "$(vsh net-uuid "$NETWORK" | sed -n '1{s/[[:space:]]*$//;p}')" = "$(record_get net.uuid)" ] \
+    want=$(record_get net.uuid)
+    [ "$(handed_uuid "$NETWORK")" = "$want" ] \
+        && [ "$(vsh net-uuid "$NETWORK" | sed -n '1{s/[[:space:]]*$//;p}')" = "$want" ] \
         || drift "$NETWORK is not the network this driver created"
-    log "up: ${#VM_DOMAIN[@]} VMs and the network, each the one this driver created"
+    log "ownership: the ${#VM_DOMAIN[@]} VMs and the network are the ones this driver recorded"
 fi
 
 # ---- control --------------------------------------------------------------------
@@ -313,13 +362,13 @@ stage "apply: deliver the configs"
 apply_rc=0
 cexec run -- "$REMOTE_BOX/scripts/apply-config.sh" "${REMOTE[@]}" --disks "$REMOTE_BOX/disks.txt" || apply_rc=$?
 backup apply
-[ $apply_rc -eq 0 ] || DIE_STATUS=$apply_rc die "stage apply failed (exit $apply_rc); fix the cause above and run install.sh again"
+[ $apply_rc -eq 0 ] || DIE_STATUS=$apply_rc die "stage apply failed (exit $apply_rc); fix the cause above and run boxman up again"
 
 stage "bootstrap: etcd once, then health"
 boot_rc=0
 cexec run -- "$REMOTE_BOX/scripts/bootstrap.sh" "${REMOTE[@]}" || boot_rc=$?
 backup bootstrap
-[ $boot_rc -eq 0 ] || DIE_STATUS=$boot_rc die "stage bootstrap failed (exit $boot_rc); fix the cause above and run install.sh again"
+[ $boot_rc -eq 0 ] || DIE_STATUS=$boot_rc die "stage bootstrap failed (exit $boot_rc); fix the cause above and run boxman up again"
 
 if [ "$FLUX" = on ]; then
     stage "flux: bootstrap to $GITLAB_HOST/$GITLAB_OWNER/$GITOPS_REPOSITORY"

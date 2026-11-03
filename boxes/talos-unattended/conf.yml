@@ -254,3 +254,20 @@ clusters:
           - name: management::fabric
             mac: '{{ n.mac }}'
 {% endfor %}
+
+# A plain `boxman up` installs the cluster (doc/hooks.md): the preflight runs
+# as its pre_up hook, before boxman changes anything, and the install driver
+# as its post_up hook, taking ownership of the VMs and the network from
+# boxman's record of what that up created. `boxman run talos-preflight` runs
+# the checks on their own; talos-install only runs inside boxman up.
+tasks:
+  talos-preflight:
+    description: "check inputs, versions, capacity, network and ownership; changes nothing"
+    command: '"$BOXMAN_CONF_DIR/scripts/install.sh" --pre-up'
+  talos-install:
+    description: "configure, bootstrap and check the Talos cluster (boxman up's post_up hook)"
+    command: '"$BOXMAN_CONF_DIR/scripts/install.sh" --post-up'
+
+hooks:
+  pre_up: [talos-preflight]
+  post_up: [talos-install]

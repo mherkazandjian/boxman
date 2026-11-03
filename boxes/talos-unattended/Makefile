@@ -1,6 +1,8 @@
-# Entry point for boxes/talos-unattended: `make install` brings the lab from
-# nothing to a healthy Talos cluster without a console, a browser or a
-# prompt, and is safe to run again. `make help` lists the targets.
+# Entry points for boxes/talos-unattended. A plain `boxman up` (with the
+# inputs exported) brings the lab from nothing to a healthy Talos cluster:
+# conf.yml runs the preflight and the install driver as its pre_up and
+# post_up hooks. `make install` is that `boxman up` with an inputs file.
+# `make help` lists the targets.
 #
 #   INPUTS   the private inputs file (default: inputs.env beside this file,
 #            see inputs.env.example)
@@ -22,7 +24,7 @@ help:
 preflight:   #@ check inputs, capacity, network and ownership; changes nothing
 	$(BOX_DIR)/scripts/preflight.sh --inputs $(INPUTS)
 
-install:   #@ boxman up, then configure, bootstrap and check the cluster (rerunnable)
+install:   #@ boxman up with INPUTS; its hooks check, configure and bootstrap (rerunnable)
 	$(BOX_DIR)/scripts/install.sh --inputs $(INPUTS)
 
 status:   #@ VMs, identity, nodes, etcd, Kubernetes and Flux, read-only

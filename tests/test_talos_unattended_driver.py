@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -175,6 +176,12 @@ def host(tmp_path):
             return subprocess.run(["bash", os.path.join(SCRIPTS, script), "--inputs", str(inputs), *args],
                                   capture_output=True, text=True, env=e, input=stdin, timeout=120,
                                   cwd=BOX)
+
+        def run_boxman(self, *args, extra=None):
+            """boxman itself (the fake), as an operator runs it."""
+            e = dict(env, **(extra or {}))
+            return subprocess.run([str(bin_dir / "boxman"), *args], capture_output=True, text=True,
+                                  env=e, timeout=180, cwd=BOX)
 
         def calls(self, tool=None) -> list[str]:
             lines = log.read_text().splitlines() if log.exists() else []
@@ -497,8 +504,21 @@ def _talos_calls(host, *words) -> list[str]:
     return [c for c in host.calls("talosctl") if all(w in c.split() for w in words)]
 
 
+HOOK_FAILED = re.compile(r"hook '[^']+' failed \(exit (\d+)\)")
+
+
 def _install(host, **env):
-    return host.run("install.sh", **env)
+    """make install: boxman up, whose pre_up/post_up hooks run the driver.
+
+    boxman reports a failed hook as its own exit status 2, naming the hook's
+    status in the message; the returned returncode is the hook's, so that
+    tests can tell a failure (1) from drift (3) as before.
+    """
+    proc = host.run("install.sh", **env)
+    match = HOOK_FAILED.search(proc.stderr)
+    if proc.returncode == 2 and match:
+        proc.returncode = int(match.group(1))
+    return proc
 
 
 def test_install_converges_from_nothing(lab):
@@ -507,8 +527,9 @@ def test_install_converges_from_nothing(lab):
     assert "install: converged: project lab353, smoke profile" in err
     # the order of the stages
     stages = [line.split("== ", 1)[1].split(":")[0] for line in err.splitlines() if "install: == " in line]
-    assert stages == ["preflight", "up", "control", "nodes", "ship", "restore", "generate",
+    assert stages == ["preflight", "ownership", "control", "nodes", "ship", "restore", "generate",
                       "apply", "bootstrap", "status"]
+    assert "ownership: boxman created the 3 VMs and the network in this up" in err
     world = lab.world()
     assert world["boxman"]["calls"] == 1
     # each node got its config once, through the maintenance API, then authenticated
@@ -565,20 +586,20 @@ def test_a_concurrent_install_is_refused(lab):
     with open(lab.driver / ".install.lock", "w") as fobj:
         fcntl.flock(fobj, fcntl.LOCK_EX)
         _refused(_install(lab), "another install.sh holds")
-    assert lab.world()["boxman"].get("calls", 0) == 0
+    assert not lab.calls("ssh") and not (lab.driver / "run.env").exists()
 
 
 # ---- preflight and up --------------------------------------------------------
 def test_a_failed_preflight_stops_before_boxman(lab):
     lab.meminfo(1 << 20)
-    _refused(_install(lab), "stage preflight failed")
+    _refused(_install(lab), "pre_up hook 'talos-preflight' failed")
     assert "calls" not in lab.world()["boxman"]
     assert not lab.backup.exists()
 
 
 def test_a_failed_boxman_up_stops_the_run(lab):
     lab.edit(lambda w: w["boxman"].update(rc=1))
-    _refused(_install(lab), "stage up failed")
+    _refused(_install(lab), "fake boxman: up failed")
     assert not lab.calls("ssh")
 
 
@@ -953,32 +974,35 @@ def test_flux_sh_refuses_to_run_unless_flux_is_on(lab):
 def test_a_failed_up_that_created_domains_blocks_every_later_run(lab):
     """B6: domains from an up that never finished are not provably ours."""
     lab.edit(lambda w: w["boxman"].update(fail_after_create=True))
-    _refused(_install(lab), "stage up failed")
-    assert "created" not in (lab.driver / "run.env").read_text()
+    _refused(_install(lab), "up failed after creating the domains")
+    assert not (lab.driver / "run.env").exists()     # no post_up hook ran
+    assert json.loads((lab.lab_dir / "boxman-up-record.json").read_text())["status"] == "failed"
     lab.edit(lambda w: w["boxman"].update(fail_after_create=False))
     before = len(lab.calls())
-    proc = _refused(_install(lab), "boxman up never finished on the run that recorded")
-    assert "stage preflight failed" in proc.stderr
+    proc = _refused(_install(lab), "this driver has no record of project lab353")
+    assert "pre_up hook 'talos-preflight' failed" in proc.stderr
     new = lab.calls()[before:]
-    assert not [c for c in new if c.split()[0] in ("boxman", "ssh", "talosctl")]
+    # boxman up is called, and its pre_up hook refuses before it changes
+    # anything: no second up body, nothing reaches a VM
+    assert not [c for c in new if c.split()[0] in ("ssh", "talosctl")]
     assert lab.world()["boxman"]["calls"] == 1
 
 
 def test_an_incomplete_record_never_adopts_a_replaced_domain(lab):
     lab.edit(lambda w: w["boxman"].update(fail_after_create=True))
-    _refused(_install(lab), "stage up failed")
+    _refused(_install(lab), "up failed after creating the domains")
     lab.edit(lambda w: (w["boxman"].update(fail_after_create=False),
                         w["domains"][W1].update(uuid="someone-elses")))
-    _refused(_install(lab), "boxman up never finished")
+    _refused(_install(lab), "this driver has no record of project lab353")
     assert lab.world()["boxman"]["calls"] == 1
 
 
 def test_an_up_that_created_nothing_may_be_retried(lab):
     lab.edit(lambda w: w["boxman"].update(rc=1))
-    _refused(_install(lab), "stage up failed")
+    _refused(_install(lab), "fake boxman: up failed")
     lab.edit(lambda w: w["boxman"].pop("rc"))
     proc = _ok(_install(lab))
-    assert "an earlier boxman up created nothing; starting again" in proc.stderr
+    assert "ok: ownership: new project lab353" in proc.stderr
 
 
 def test_a_recreated_network_is_never_adopted(lab):
@@ -1257,3 +1281,109 @@ def test_an_unexpected_list_output_is_unknown_and_never_bootstraps(lab, text):
     lab.set_world(garbage={"talosctl list /var/lib/etcd": text})
     _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "data-unknown", status=3)
     assert "bootstrap_calls" not in lab.world()["talos"]
+
+
+
+# ---- the plain boxman up of option 2: hooks and the up record --------------------
+def _sourced_inputs(host) -> dict:
+    """The TALOS_* variables of an operator who ran: set -a; . inputs.env"""
+    out = subprocess.run(["bash", "-c", f"set -a; . {host.inputs_file}; env -0"], env={},
+                         capture_output=True, text=True, check=True).stdout
+    pairs = (line.split("=", 1) for line in out.split("\0") if "=" in line)
+    return {k: v for k, v in pairs if k.startswith("TALOS_")}
+
+
+def test_a_plain_boxman_up_installs_the_cluster(lab):
+    """No make install, no TALOS_INPUTS: boxman up and its hooks only."""
+    inputs = _sourced_inputs(lab)
+    proc = _ok(lab.run_boxman("--conf", os.path.join(BOX, "conf.yml"), "up", extra=inputs))
+    assert "install: converged: project lab353" in proc.stderr
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+    again = _ok(lab.run_boxman("--conf", os.path.join(BOX, "conf.yml"), "up", extra=inputs))
+    assert "cp-01: recorded" in again.stdout and "bootstrapped earlier" in again.stderr
+    assert lab.world()["talos"]["bootstrap_calls"] == 1
+
+
+def test_make_install_is_a_wrapper_around_boxman_up(lab):
+    proc = _ok(_install(lab))
+    assert "boxman up; its pre_up and post_up hooks run this script" in proc.stderr
+    up = [c for c in lab.calls("boxman")]
+    assert up == [f"boxman --conf {BOX}/conf.yml up"]
+
+
+def test_a_failing_hook_is_boxman_ups_exit_status_2(lab):
+    lab.meminfo(1 << 20)
+    proc = lab.run("install.sh")
+    assert proc.returncode == 2
+    assert "pre_up hook 'talos-preflight' failed (exit 1)" in proc.stderr
+
+
+def test_boxman_up_force_is_refused_by_the_pre_up_hook(lab):
+    _refused(_install(lab, BOXMAN="boxman --force"), "boxman up --force is not supported for this box")
+    assert "calls" not in lab.world()["boxman"]
+
+
+def test_the_driver_takes_ownership_from_the_record_not_from_libvirt(lab):
+    """A record that names another uuid than libvirt's: nothing is recorded."""
+    lab.edit(lambda w: w["boxman"].update(record_tamper={W1: "uuid-not-in-libvirt"}))
+    _refused(_install(lab), "is not the domain boxman's up record says this up created", status=3)
+    assert not (lab.driver / "run.env").exists()
+    assert not lab.calls("ssh")
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"record_run_id": "an-earlier-up"}, "belongs to another boxman up"),
+    ({"record_project": "another-project"}, "is for project another-project"),
+])
+def test_a_record_of_another_up_is_refused(lab, change, message):
+    lab.edit(lambda w: w["boxman"].update(change))
+    _refused(_install(lab), message)
+    assert not (lab.driver / "run.env").exists()
+
+
+def _post_up(host, record: dict, run_id="run-1"):
+    """install.sh --post-up as boxman's hook, with a hand-made record."""
+    path = host.root / "record.json"
+    path.write_text(json.dumps(record))
+    return host.run("install.sh", "--post-up", BOXMAN_HOOK="post_up", BOXMAN_UP_RUN_ID=run_id,
+                    BOXMAN_UP_RECORD=str(path))
+
+
+def _record(created, present, **extra):
+    return dict({"boxman_up_record": 1, "project": PROJECT, "run_id": "run-1", "status": "succeeded",
+                 "force": False, "created": created, "present": present}, **extra)
+
+
+ALL = {"domains": {CONTROL: "uuid-control", CP1: "uuid-cp-01", W1: "uuid-worker-01"},
+       "networks": {NETWORK: "net-uuid-1"}}
+
+
+def test_the_post_up_hook_runs_only_inside_boxman_up(lab):
+    _refused(lab.run("install.sh", "--post-up"), "runs as boxman up's post_up hook")
+    _refused(lab.run("install.sh", "--pre-up"), "runs as boxman up's pre_up hook")
+
+
+@pytest.mark.parametrize("record,message,status", [
+    (_record(ALL, ALL, status="failed"), "did not succeed (failed)", 1),
+    (_record(ALL, ALL, boxman_up_record=2), "is not a boxman up record", 1),
+    (_record(ALL, {"domains": {}, "networks": {}}), "does not list", 1),
+    (_record({"domains": {CONTROL: "uuid-control"}, "networks": {}}, ALL), "partly recreated", 3),
+])
+def test_an_unusable_record_gets_no_ownership(lab, record, message, status):
+    _ok(_install(lab))
+    _refused(_post_up(lab, record), message, status=status)
+
+
+def test_a_project_created_anew_under_a_held_cluster_is_drift(lab):
+    """e.g. a forced recreation: the old identity cannot be reused."""
+    _ok(_install(lab))
+    _refused(_post_up(lab, _record(ALL, ALL)), "created this project's VMs and network anew", status=3)
+
+
+def test_an_existing_project_must_match_the_driver_record(lab):
+    _ok(_install(lab))
+    present = json.loads(json.dumps(ALL))
+    present["domains"][CP1] = "uuid-swapped"
+    lab.edit(lambda w: w["domains"][CP1].update(uuid="uuid-swapped"))
+    _refused(_post_up(lab, _record({"domains": {}, "networks": {}}, present)),
+             f"{CP1} is not the domain this driver created", status=3)
