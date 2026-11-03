@@ -90,8 +90,8 @@ for var in TALOSCTL_SHA256 KUBECTL_SHA256 FLUX_SHA256 TALOS_SCHEMATIC_ID; do
 done
 [[ ${TALOS_ISO_CHECKSUM:-} =~ ^sha256:[0-9a-f]{64}$ ]] || vproblem "TALOS_ISO_CHECKSUM must be sha256:<64 hex digits>"
 case "${TALOS_ISO_URI:-}" in
-    https://*/"${TALOS_SCHEMATIC_ID:-x}"/"${TALOS_VERSION:-x}"/*.iso) ;;
-    *) vproblem "TALOS_ISO_URI must be an https URL of the pinned schematic and Talos version" ;;
+    https://*/"${TALOS_VERSION:-x}"/*.iso) ;;
+    *) vproblem "TALOS_ISO_URI must be an https URL of the pinned Talos version's ISO" ;;
 esac
 [[ ${TALOS_INSTALLER_IMAGE:-} =~ ^[a-z0-9.-]+/[a-z0-9./-]*/${TALOS_SCHEMATIC_ID:-x}:${TALOS_VERSION:-x}@sha256:[0-9a-f]{64}$ ]] \
     || vproblem "TALOS_INSTALLER_IMAGE must be <registry>/<repo>/<schematic>:<version>@sha256:<digest> of the pinned set"

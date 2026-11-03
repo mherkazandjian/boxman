@@ -80,9 +80,9 @@ provider:
 workspace:
   path: {{ lab }}
 
-# The shared Talos metal boot ISO, from the pinned Image Factory schematic
-# with the qemu-guest-agent extension; TALOS_INSTALLER_IMAGE comes from the
-# same schematic so the extension survives the install (versions.env).
+# The shared Talos metal boot ISO of the pinned release, with its published
+# sha256; the installed system gets the qemu-guest-agent extension from
+# TALOS_INSTALLER_IMAGE, built from the pinned schematic (versions.env).
 isos:
   talos-install:
     uri: {{ pin.TALOS_ISO_URI }}

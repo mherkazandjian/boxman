@@ -69,19 +69,23 @@ version-related goes in `inputs.env`.
 | Talos | v1.14.5 | latest stable release |
 | `talosctl` | sha256 `ff432b68…` | the release's `sha256sum.txt` |
 | Image Factory schematic | `ce4c9805…` | `siderolabs/qemu-guest-agent` only |
-| boot ISO | `metal-amd64.iso`, sha256 `36723c65…` | hashed at download (the factory publishes none) |
+| boot ISO | the release's `metal-amd64.iso`, sha256 `1505108d…` | the release's `sha256sum.txt` |
 | installer image | `factory.talos.dev/metal-installer/<schematic>:v1.14.5@sha256:8a510984…` | the factory registry's digest for the tag |
 | Kubernetes | 1.37.1 | Talos v1.14.5's default; 1.14 supports 1.33-1.37 |
 | `kubectl` | v1.37.1, sha256 `65691ff7…` | `dl.k8s.io` `.sha256` |
 | `flux` | v2.10.0, sha256 `208dd701…` | the release's checksums file; supports Kubernetes 1.35-1.37 |
 
-The ISO and the installer image come from the same schematic: the guest
-agent extension in the boot ISO alone does not survive installation.
+The boot ISO is the release's own, not the Image Factory ISO of the
+schematic: the factory regenerates that asset from time to time with a new
+FAT volume serial, so a pinned hash of it goes stale. The boot ISO only runs
+maintenance mode; the installed system gets the guest agent extension from
+the installer image, which is built from the schematic and pinned by digest.
 
 The file is plain `KEY=value` lines (no quotes or expansion). An
 environment variable of the same name overrides a pin, and `gen-config.sh`
 logs each override. To move to a new set, change every related pin together
-(the ISO and installer image embed the schematic id and Talos version, and
+(the ISO and installer image embed the Talos version, the installer image
+also the schematic id, and
 `tests/test_talos_unattended_box.py` checks that they agree), record the
 sources in the comments, then repeat the real-`talosctl` checks described in
 [Testing](#testing).

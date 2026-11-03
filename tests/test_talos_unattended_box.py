@@ -137,9 +137,11 @@ def test_the_pins_form_one_consistent_tested_set():
     talos, schematic = pins["TALOS_VERSION"], pins["TALOS_SCHEMATIC_ID"]
     assert re.fullmatch(r"v\d+\.\d+\.\d+", talos)
     assert re.fullmatch(r"[0-9a-f]{64}", schematic)
-    # boot ISO and installer image from the same schematic and release
+    # the release's own boot ISO (its published checksum is stable, the
+    # factory's regenerated ISO is not); the installer image from the
+    # schematic and release
     assert pins["TALOS_ISO_URI"] == (
-        f"https://factory.talos.dev/image/{schematic}/{talos}/metal-amd64.iso")
+        f"https://github.com/siderolabs/talos/releases/download/{talos}/metal-amd64.iso")
     image, digest = pins["TALOS_INSTALLER_IMAGE"].split("@")
     assert image == f"factory.talos.dev/metal-installer/{schematic}:{talos}"
     assert re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
