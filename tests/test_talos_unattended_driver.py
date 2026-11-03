@@ -806,7 +806,9 @@ def test_an_existing_etcd_is_never_bootstrapped(lab):
 
 def test_bootstrap_waits_for_time_sync_and_records_nothing_before(lab):
     _edit_node(lab, "192.168.53.11", synced=False)
-    _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "cp-01's time is not synchronised")
+    # one pre-bootstrap observation suffices here, so the 1 s bound is spent
+    # on the time-sync wait this test is about
+    _refused(_install(lab, TALOS_AUTH_TIMEOUT="1", TALOS_PREBOOT_CHECKS="1"), "cp-01's time is not synchronised")
     assert not (lab.root / STATE / "journal" / "bootstrap.intent").exists()
     assert "bootstrap_calls" not in lab.world()["talos"]
 
@@ -1131,7 +1133,7 @@ def test_an_absent_etcd_data_directory_counts_as_empty(lab):
 def _stop_before_bootstrap(lab):
     """A first run that applies the configs, then stops before bootstrapping."""
     _edit_node(lab, "192.168.53.11", synced=False)
-    _refused(_install(lab, TALOS_AUTH_TIMEOUT="1"), "time is not synchronised")
+    _refused(_install(lab, TALOS_AUTH_TIMEOUT="1", TALOS_PREBOOT_CHECKS="1"), "time is not synchronised")
     _edit_node(lab, "192.168.53.11", synced=True)
     return lab.root / STATE / "journal"
 
@@ -1168,7 +1170,8 @@ def test_a_hung_request_cannot_outlive_its_stage(lab, world, message):
             w.setdefault(key, {}).update(value)
     lab.edit(hang)
     start = time.monotonic()
-    _refused(_install(lab, TALOS_CALL_TIMEOUT="2", TALOS_KUBE_TIMEOUT="3", TALOS_AUTH_TIMEOUT="3"), message)
+    _refused(_install(lab, TALOS_CALL_TIMEOUT="2", TALOS_KUBE_TIMEOUT="3", TALOS_AUTH_TIMEOUT="3",
+                      TALOS_PREBOOT_CHECKS="1"), message)
     assert time.monotonic() - start < 100
     # the bound reached the control VM in its shipped inputs, not through a
     # leaked host environment (the fake ssh passes none)
