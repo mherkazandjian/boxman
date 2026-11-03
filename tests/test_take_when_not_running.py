@@ -659,8 +659,9 @@ class _Reverting:
             return _result(stdout="Name: x\nState: shutoff\n")
         if verb == "snapshot-list":
             return _result(stdout="".join(f"{n}\n" for n in self.names) + "\n")
-        if verb == "snapshot-dumpxml":
-            name = args[2]
+        if verb in ("snapshot-dumpxml", "snapshot-current"):
+            # the newest is current: nothing here was restored before
+            name = args[2] if verb == "snapshot-dumpxml" else self.names[-1]
             i = self.names.index(name)
             return _result(stdout=_disk_only_xml(
                 name, self.overlays[name], self.names[i - 1] if i else None))

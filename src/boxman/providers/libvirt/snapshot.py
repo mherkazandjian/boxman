@@ -2017,10 +2017,12 @@ class SnapshotManager:
     def _overlays_from_snapshot_xml(root,
                                     name: str,
                                     vm_name: str,
-                                    refusal: str) -> list[str]:
+                                    refusal: str,
+                                    section: str = "disks") -> list[str]:
         """
-        The external overlay files a snapshot's metadata declares — or a
-        refusal, when the metadata cannot be read as a complete answer.
+        The external overlay files a snapshot's metadata declares in
+        *section* — ``<disks>``, or ``<revertDisks>`` — or a refusal, when
+        the metadata cannot be read as a complete answer.
 
         Well-formed XML is not the same as usable metadata. A document with
         no ``<disks>``, an external disk with no ``<source>``, a disk that
@@ -2040,6 +2042,7 @@ class SnapshotManager:
             name: the snapshot name that was asked for.
             vm_name: the domain, for the message.
             refusal: the shared tail explaining why a gap refuses.
+            section: the element whose disks are read.
 
         Returns:
             list: the external overlay paths, possibly empty for a snapshot
@@ -2061,11 +2064,11 @@ class SnapshotManager:
                 f"asked libvirt for snapshot '{name}' of {vm_name} and got "
                 f"metadata naming '{reported}'; {refusal}")
 
-        disks = root.find("disks")
+        disks = root.find(section)
         if disks is None:
             raise SnapshotError(
                 f"the metadata of snapshot '{name}' on {vm_name} has no "
-                f"<disks> element, so there is no telling which disks it "
+                f"<{section}> element, so there is no telling which disks it "
                 f"owns overlays for; {refusal}")
 
         entries = disks.findall("disk")
@@ -2107,6 +2110,73 @@ class SnapshotManager:
                     f"which this cannot resolve to a file; {refusal}")
             files.append(path)
         return files
+
+    def _overlays_the_revert_deletes(self, vm_name: str,
+                                     names: list[str]) -> list[str]:
+        """
+        The overlays ``snapshot-revert`` of *vm_name* deletes, whichever
+        snapshot it goes to: the external ones its *current* snapshot
+        records — its ``<revertDisks>`` when it has any, else its
+        ``<disks>`` (``qemuSnapshotRevertExternalFinish``, libvirt 10.10;
+        the revert of a disk-only snapshot ends the same way).
+
+        The current snapshot is not always the target or newer than it in
+        chain order (#287):
+
+        - libvirt's own delete of the current snapshot makes its parent
+          current (``qemuSnapshotDiscardMetadata``). A take after a restore
+          of that parent has cleared its ``<revertDisks>``
+          (``qemuSnapshotClearRevertdisks`` in ``qemuSnapshotCreate``), so
+          its ``<disks>`` name its take-time overlays, which its other
+          children are built on. ``snapshot take --force`` deletes first,
+          and a delete boxman carries out by collapsing ends in libvirt's
+          metadata delete, which does the same.
+        - deleting a child of the current snapshot, restored and not taken
+          since, moves its ``<revertDisks>`` into its ``<disks>``
+          (``qemuSnapshotDeleteUpdateParent``): it then records the
+          overlays the guest runs on.
+        - ``snapshot-list`` lists the snapshots by name, so a current one in
+          another branch can come before the target.
+
+        The XML comes from ``snapshot-current`` itself, so the name is
+        libvirt's own, not one parsed back out of a line of text.
+
+        Args:
+            vm_name: the domain about to be reverted.
+            names: every snapshot of it, as the strict inventory listed them.
+
+        Returns:
+            list: the overlay paths; empty when it has no snapshots.
+
+        Raises:
+            SnapshotError: which snapshot is current cannot be told, or its
+                metadata does not say completely what it records.
+        """
+        if not names:
+            return []
+        refusal = ("refusing to revert: the revert deletes the overlays the "
+                   "current snapshot records, and a backup that does not "
+                   "know them cannot cover them")
+        result = self.virsh.execute("snapshot-current", vm_name, warn=True)
+        if not result.ok:
+            raise SnapshotError(
+                f"cannot tell which snapshot of {vm_name} is current "
+                f"({(result.stderr or '').strip()}); {refusal}")
+        try:
+            root = ET.fromstring(result.stdout)
+        except ET.ParseError as exc:
+            raise SnapshotError(
+                f"the metadata of the current snapshot of {vm_name} does "
+                f"not parse ({exc}); {refusal}") from exc
+        current = root.findtext("name")
+        if current not in names:
+            raise SnapshotError(
+                f"libvirt gives '{current}' as the current snapshot of "
+                f"{vm_name}, which is not one it listed; {refusal}")
+        section = ("revertDisks" if root.find("revertDisks") is not None
+                   else "disks")
+        return self._overlays_from_snapshot_xml(root, current, vm_name,
+                                                refusal, section=section)
 
     def _pause_for_backup(self, vm_name: str) -> bool:
         """
@@ -2242,13 +2312,16 @@ class SnapshotManager:
         *snapshot_name* can delete, so they can be restored afterwards
         and every snapshot stays reachable.
 
-        Reverting recreates the target snapshot's own overlay (and may
-        drop overlays newer than it in the chain), so only those are at
-        risk -- overlays of snapshots *older* than the target are backing
-        files the target depends on and are never touched.  Backing up
-        just the target-and-newer overlays avoids full-copying the whole
-        chain on every restore (e.g. restoring the latest snapshot copies
-        one overlay per disk instead of one per disk per snapshot).
+        Two sets. The overlays of the target and of every snapshot newer
+        than it in the chain; older ones are not copied, which avoids
+        full-copying the whole chain on every restore (restoring the latest
+        snapshot copies one overlay per disk instead of one per disk per
+        snapshot). And what the revert itself deletes, wherever it sits in
+        the chain: the overlays the *current* snapshot records
+        (:meth:`_overlays_the_revert_deletes`). That one is usually the
+        target or newer, but after libvirt's own delete of the current
+        snapshot has made its parent current, a revert to another child
+        deletes the parent's overlay, which that child is built on (#287).
 
         The inventory it works from is the strict one, so "the target is
         not in the chain" now means the target is not a snapshot of this
@@ -2270,14 +2343,13 @@ class SnapshotManager:
 
         Raises:
             SnapshotError: the backup could not be made, or could not be
-                shown to be complete. Either way the revert is refused
-                rather than run on a partial backup (#164 CL-D1).
+                shown to be complete — the current snapshot's records
+                included. Either way the revert is refused rather than run
+                on a partial backup (#164 CL-D1).
         """
         all_overlays, order = self._strict_overlay_inventory(vm_name)
 
-        # only overlays that revert can delete: the target and any newer
-        # snapshots in the (oldest-first) chain.  Older snapshots are
-        # backing files the target relies on and are left untouched.
+        # the target and any newer snapshots in the (oldest-first) chain
         if snapshot_name in order:
             at_risk = set(order[order.index(snapshot_name):])
         else:
@@ -2288,6 +2360,11 @@ class SnapshotManager:
         for snap, files in all_overlays.items():
             if snap in at_risk:
                 files_to_preserve.update(files)
+        # and what the revert deletes, though the current snapshot be older
+        # than the target: after a delete made it current, its overlays are
+        # what the target is built on (#287)
+        files_to_preserve.update(
+            self._overlays_the_revert_deletes(vm_name, order))
         # not even claimed: its .preserve would be written beside the ISO
         files_to_preserve.difference_update(skip)
 
@@ -2881,10 +2958,12 @@ class SnapshotManager:
 
         Before reverting, the overlay files that ``snapshot-revert`` can
         delete are backed up — the target snapshot's overlays and any newer
-        ones in the chain (see :meth:`_preserve_snapshot_overlays`, which
-        falls back to backing up every overlay if the target isn't found in
-        the chain). After the revert any overlays libvirt deleted are
-        restored so that every snapshot remains reachable.
+        ones in the chain, and the ones the current snapshot records, which
+        are what the revert deletes, though it be older than the target
+        (see :meth:`_preserve_snapshot_overlays`, which falls back to
+        backing up every overlay if the target isn't found in the chain).
+        After the revert any overlays libvirt deleted are restored so that
+        every snapshot remains reachable.
 
         That backup is a precondition, not a courtesy. If it cannot be made,
         :meth:`_preserve_snapshot_overlays` raises and no revert is
