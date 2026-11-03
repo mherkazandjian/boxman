@@ -257,6 +257,17 @@ class FlowsMixin:
 
     def up(self, cli_args):
         """
+        Bring up the infrastructure, between the project's ``hooks:``.
+
+        With no ``hooks:`` configured this is exactly :meth:`_up`. Otherwise
+        the ``pre_up`` hooks run before anything changes, and the ``post_up``
+        hooks after an ``up`` that succeeded, with a record of what it
+        created (:meth:`~boxman.manager_parts.hooks.HooksMixin.up_with_hooks`).
+        """
+        return self.up_with_hooks(cli_args, self._up)
+
+    def _up(self, cli_args):
+        """
         Bring up the infrastructure.
 
         - If no project VMs exist, run a full provision.

@@ -201,6 +201,10 @@ class TaskRunner:
         task_name: str,
         extra_args: list[str] | None = None,
         task_flags: dict[str, str] | None = None,
+        *,
+        extra_env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        workspace_env: bool = True,
     ) -> int:
         """
         Execute a named task.
@@ -209,6 +213,13 @@ class TaskRunner:
             task_name: The task key from the ``tasks`` section.
             extra_args: Additional arguments appended to the command.
             task_flags: Values for ``{placeholder}`` markers in the command.
+            extra_env: Variables set for this run on top of the task
+                environment (``boxman up`` hooks pass ``BOXMAN_HOOK`` etc.).
+            cwd: The directory to run in when the task sets no ``workdir``
+                of its own; None keeps the usual workspace default.
+            workspace_env: False runs with the process environment only,
+                without sourcing the workspace env file (a ``pre_up`` hook
+                runs before the workspace exists).
 
         Returns:
             The exit code of the task process.
@@ -247,22 +258,31 @@ class TaskRunner:
             else:
                 command = command + " " + " ".join(extra_args)
 
-        # Resolve workdir: task-level > workspace.workdir > workspace.path > cluster workdir > cwd
-        workdir = task.get(
-            "workdir",
-            self.workspace_config.get(
+        # Resolve workdir: task-level > the caller's cwd > workspace.workdir
+        # > workspace.path > cluster workdir > cwd
+        if "workdir" in task:
+            workdir = task["workdir"]
+        elif cwd is not None:
+            workdir = cwd
+        else:
+            workdir = self.workspace_config.get(
                 "workdir",
                 self.workspace_config.get(
                     "path",
                     self.cluster_config.get("workdir", None),
                 ),
-            ),
-        )
+            )
         if workdir:
             workdir = os.path.expanduser(workdir)
 
         log.info(f"running task '{task_name}'")
-        self._log_env()
+        if workspace_env:
+            self._log_env()
+            env = self.env
+        else:
+            env = os.environ.copy()
+        if extra_env:
+            env = {**env, **extra_env}
         log.info(f"workdir: {workdir or os.getcwd()}")
         log.info(f"command: {command}")
 
@@ -270,7 +290,7 @@ class TaskRunner:
             result = subprocess.run(
                 command,
                 shell=True,
-                env=self.env,
+                env=env,
                 cwd=workdir,
             )
 

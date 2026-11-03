@@ -1,0 +1,354 @@
+"""
+``hooks:`` for ``boxman up``: pre_up/post_up tasks and the up record.
+
+The hooks run for real (TaskRunner, shell commands writing to a log); the
+infrastructure side of ``up`` and libvirt are stubbed, so nothing here
+touches a hypervisor.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import stat
+from types import SimpleNamespace
+
+import pytest
+
+from boxman.exceptions import ConfigError, HookError, ProvisionError
+from boxman.manager import BoxmanManager
+from boxman.manager_parts.hooks import UP_RECORD_NAME
+
+pytestmark = pytest.mark.unit
+
+PROJECT = "hooked"
+D1 = f"bprj__{PROJECT}__bprj_c1_vm1"
+D2 = f"bprj__{PROJECT}__bprj_c1_vm2"
+N1 = f"bprj__{PROJECT}__bprj__clstr__c1__clstr__net1"
+EMPTY = {"domains": {}, "networks": {}}
+CREATED = {"domains": {D1: "uuid-1", D2: "uuid-2"}, "networks": {N1: "net-uuid-1"}}
+
+# every hook appends "<task> <BOXMAN_HOOK> <run id> <force> <record or ->" to the log
+LOG_LINE = 'echo "{name} $BOXMAN_HOOK $BOXMAN_UP_RUN_ID $BOXMAN_UP_FORCE ${{BOXMAN_UP_RECORD:--}}" >> "$HOOK_LOG"'
+
+
+def _config(tmp_path, hooks=None, tasks=None):
+    tasks = tasks if tasks is not None else {
+        name: {"command": LOG_LINE.format(name=name)} for name in ("a", "b", "c", "d")}
+    config = {
+        "version": "1.0",
+        "project": PROJECT,
+        "provider": {"libvirt": {"uri": "qemu:///system"}},
+        "workspace": {"path": str(tmp_path / "workspace")},
+        "clusters": {"c1": {"workdir": str(tmp_path / "workspace" / "c1"),
+                            "networks": {"net1": {"mode": "nat"}},
+                            "vms": {"vm1": {}, "vm2": {}}}},
+        "tasks": tasks,
+    }
+    if hooks is not None:
+        config["hooks"] = hooks
+    return config
+
+
+@pytest.fixture
+def mgr(tmp_path, monkeypatch):
+    """A manager on a synthetic config whose up body and libvirt are stubs."""
+    conf_dir = tmp_path / "project"
+    conf_dir.mkdir()
+    log = tmp_path / "hooks.log"
+    monkeypatch.setenv("HOOK_LOG", str(log))
+
+    def make(hooks=None, tasks=None, inventories=(EMPTY, CREATED), up_error=None):
+        m = BoxmanManager.__new__(BoxmanManager)
+        m.config = _config(tmp_path, hooks, tasks)
+        m.config_path = str(conf_dir / "conf.yml")
+        m.logger = logging.getLogger("test-up-hooks")
+        m.events = []
+        reads = list(inventories)
+
+        def inventory():
+            m.events.append("inventory")
+            return reads.pop(0) if reads else CREATED
+        m.project_inventory = inventory
+
+        def body(cli_args):
+            m.events.append("up")
+            (tmp_path / "workspace").mkdir(exist_ok=True)
+            if up_error:
+                raise up_error
+        m._up = body
+        m.log = log
+        m.record = tmp_path / "workspace" / UP_RECORD_NAME
+        return m
+    return make
+
+
+def _args(force=False):
+    return SimpleNamespace(force=force)
+
+
+def _hook_lines(m):
+    return m.log.read_text().splitlines() if m.log.exists() else []
+
+
+# ---- no hooks: up is unchanged ------------------------------------------------
+def test_without_hooks_up_is_exactly_the_old_up(mgr):
+    m = mgr()
+    m.project_inventory = lambda: pytest.fail("no hooks: libvirt must not be read")
+    m.up(_args())
+    assert m.events == ["up"]
+    assert not m.record.exists()
+    assert not m.log.exists()
+
+
+def test_empty_hook_lists_are_no_hooks(mgr):
+    m = mgr(hooks={"pre_up": [], "post_up": None})
+    m.up(_args())
+    assert m.events == ["up"] and not m.record.exists()
+
+
+# ---- fresh: order, environment and the record ----------------------------------
+def test_a_fresh_up_runs_the_hooks_in_order_around_up_and_records_what_it_created(mgr):
+    m = mgr(hooks={"pre_up": ["a", "b"], "post_up": ["c", "d"]})
+    m.up(_args())
+    lines = [line.split() for line in _hook_lines(m)]
+    assert [(line[0], line[1]) for line in lines] == [
+        ("a", "pre_up"), ("b", "pre_up"), ("c", "post_up"), ("d", "post_up")]
+    # pre_up before the inventory and up, post_up after
+    assert m.events == ["inventory", "up", "inventory"]
+    run_ids = {line[2] for line in lines}
+    assert len(run_ids) == 1 and len(run_ids.pop()) == 32
+    assert {line[3] for line in lines} == {"0"}
+    # only post_up gets the record
+    assert [line[4] for line in lines[:2]] == ["-", "-"]
+    assert {line[4] for line in lines[2:]} == {str(m.record)}
+
+    record = json.loads(m.record.read_text())
+    assert record["boxman_up_record"] == 1
+    assert record["project"] == PROJECT
+    assert record["run_id"] == lines[0][2]
+    assert record["status"] == "succeeded"
+    assert record["force"] is False
+    assert record["created"] == CREATED
+    assert record["present"] == CREATED
+    assert record["finished_at"].endswith("Z")
+    assert stat.S_IMODE(os.stat(m.record).st_mode) == 0o600
+
+
+def test_only_pre_up_reads_nothing_and_writes_no_record(mgr):
+    m = mgr(hooks={"pre_up": ["a"]})
+    m.up(_args())
+    assert m.events == ["up"] and not m.record.exists()
+    assert [line.split()[:2] for line in _hook_lines(m)] == [["a", "pre_up"]]
+
+
+# ---- rerun: nothing created ---------------------------------------------------------
+def test_a_rerun_records_nothing_created_and_everything_present(mgr):
+    m = mgr(hooks={"post_up": ["c"]}, inventories=(CREATED, CREATED))
+    m.up(_args())
+    record = json.loads(m.record.read_text())
+    assert record["created"] == EMPTY
+    assert record["present"] == CREATED
+    assert [line.split()[:2] for line in _hook_lines(m)] == [["c", "post_up"]]
+
+
+def test_each_up_has_its_own_run_id(mgr):
+    m = mgr(hooks={"post_up": ["c"]}, inventories=(EMPTY, CREATED, CREATED, CREATED))
+    m.up(_args())
+    first = json.loads(m.record.read_text())["run_id"]
+    m.up(_args())
+    second = json.loads(m.record.read_text())["run_id"]
+    assert first != second
+    assert [line.split()[2] for line in _hook_lines(m)] == [first, second]
+
+
+# ---- --force: recreated resources are created --------------------------------------
+def test_force_reaches_the_hooks_and_recreated_resources_count_as_created(mgr):
+    old = {"domains": {D1: "old-1", D2: "uuid-2"}, "networks": {N1: "net-uuid-1"}}
+    new = {"domains": {D1: "new-1", D2: "uuid-2"}, "networks": {N1: "net-uuid-1"}}
+    m = mgr(hooks={"pre_up": ["a"], "post_up": ["c"]}, inventories=(old, new))
+    m.up(_args(force=True))
+    assert {line.split()[3] for line in _hook_lines(m)} == {"1"}
+    record = json.loads(m.record.read_text())
+    assert record["force"] is True
+    assert record["created"] == {"domains": {D1: "new-1"}, "networks": {}}
+    assert record["present"] == new
+
+
+# ---- failures -------------------------------------------------------------------------
+def test_a_failing_pre_up_hook_stops_before_anything_changes(mgr):
+    tasks = {"a": {"command": 'echo a >> "$HOOK_LOG"; exit 3'},
+             "b": {"command": 'echo b >> "$HOOK_LOG"'},
+             "c": {"command": 'echo c >> "$HOOK_LOG"'}}
+    m = mgr(hooks={"pre_up": ["a", "b"], "post_up": ["c"]}, tasks=tasks)
+    with pytest.raises(HookError, match="pre_up hook 'a' failed .exit 3.*before boxman up changed anything"):
+        m.up(_args())
+    assert m.events == []
+    assert _hook_lines(m) == ["a"]
+    assert not m.record.exists()
+
+
+def test_a_failing_post_up_hook_fails_up_and_stops_the_rest(mgr):
+    tasks = {"c": {"command": 'echo c >> "$HOOK_LOG"; exit 1'},
+             "d": {"command": 'echo d >> "$HOOK_LOG"'}}
+    m = mgr(hooks={"post_up": ["c", "d"]}, tasks=tasks)
+    with pytest.raises(HookError, match="post_up hook 'c' failed .exit 1.*next boxman up runs the post_up hooks again"):
+        m.up(_args())
+    assert _hook_lines(m) == ["c"]
+    assert json.loads(m.record.read_text())["status"] == "succeeded"
+
+
+def test_a_failed_up_runs_no_post_up_hook_and_records_the_failure(mgr):
+    partial = {"domains": {D1: "uuid-1"}, "networks": {N1: "net-uuid-1"}}
+    m = mgr(hooks={"pre_up": ["a"], "post_up": ["c"]}, inventories=(EMPTY, partial),
+            up_error=ProvisionError("provision finished, but 1 VM(s) never started"))
+    with pytest.raises(ProvisionError, match="never started"):
+        m.up(_args())
+    assert [line.split()[0] for line in _hook_lines(m)] == ["a"]
+    record = json.loads(m.record.read_text())
+    assert record["status"] == "failed"
+    assert record["created"] == partial and record["present"] == partial
+
+
+def test_an_unreadable_inventory_never_hides_why_up_failed(mgr):
+    m = mgr(hooks={"post_up": ["c"]}, up_error=ProvisionError("the real failure"))
+    calls = []
+
+    def inventory():
+        calls.append(1)
+        if len(calls) > 1:
+            raise ProvisionError("libvirt unreadable")
+        return EMPTY
+    m.project_inventory = inventory
+    with pytest.raises(ProvisionError, match="the real failure"):
+        m.up(_args())
+    assert not m.record.exists()
+
+
+def test_a_failed_up_before_the_workspace_exists_writes_no_record(mgr, tmp_path):
+    m = mgr(hooks={"post_up": ["c"]}, up_error=ProvisionError("early"))
+
+    def body(cli_args):
+        raise ProvisionError("early")
+    m._up = body
+    with pytest.raises(ProvisionError, match="early"):
+        m.up(_args())
+    assert not (tmp_path / "workspace").exists()
+
+
+def test_the_partial_state_branch_of_the_real_up(mgr):
+    """Some VMs missing, no --force: the real _up refuses; no post_up."""
+    m = mgr(hooks={"pre_up": ["a"], "post_up": ["c"]})
+    del m._up      # the real one, with its provider calls stubbed
+    m.validate_snapshot_dirs = lambda: None
+    m._get_vm_states = lambda: {D1: "running"}
+    (m.record.parent).mkdir(parents=True)
+    with pytest.raises(ProvisionError, match="partial infrastructure state"):
+        m.up(_args())
+    assert [line.split()[0] for line in _hook_lines(m)] == ["a"]
+    assert json.loads(m.record.read_text())["status"] == "failed"
+
+
+def test_the_partial_state_branch_with_force_reprovisions_and_records_it(mgr):
+    before = {"domains": {D1: "old-1"}, "networks": {}}
+    m = mgr(hooks={"post_up": ["c"]}, inventories=(before, CREATED))
+    del m._up
+    m.validate_snapshot_dirs = lambda: None
+    m._get_vm_states = lambda: {D1: "running"}
+    m.provision = lambda cli_args: m.events.append("provision")
+    (m.record.parent).mkdir(parents=True)
+    m.up(_args(force=True))
+    assert "provision" in m.events
+    record = json.loads(m.record.read_text())
+    assert record["force"] is True and record["created"] == CREATED
+
+
+# ---- where and with what hooks run --------------------------------------------------
+def test_hooks_run_in_the_config_dir_unless_the_task_sets_a_workdir(mgr, tmp_path):
+    own = tmp_path / "own"
+    own.mkdir()
+    tasks = {"a": {"command": 'pwd >> "$HOOK_LOG"'},
+             "b": {"command": 'pwd >> "$HOOK_LOG"', "workdir": str(own)}}
+    m = mgr(hooks={"pre_up": ["a", "b"]}, tasks=tasks)
+    m.up(_args())
+    assert _hook_lines(m) == [os.path.realpath(tmp_path / "project"), os.path.realpath(own)]
+
+
+def test_post_up_gets_the_workspace_env_and_pre_up_does_not(mgr, tmp_path):
+    env_file = tmp_path / "ws.env"
+    env_file.write_text("WS_ONLY=from-the-workspace\n")
+    tasks = {name: {"command": f'echo "{name} ${{WS_ONLY:-unset}}" >> "$HOOK_LOG"'} for name in ("a", "c")}
+    m = mgr(hooks={"pre_up": ["a"], "post_up": ["c"]}, tasks=tasks)
+    m.config["workspace"]["env_file"] = str(env_file)
+    m.up(_args())
+    assert _hook_lines(m) == ["a unset", "c from-the-workspace"]
+
+
+# ---- validation -----------------------------------------------------------------------
+@pytest.mark.parametrize("hooks,message", [
+    (["a"], "'hooks' must be a mapping"),
+    ({"post_down": ["a"]}, "unknown phase.*post_down"),
+    ({"pre_up": "a"}, "hooks.pre_up must be a list of task names"),
+    ({"pre_up": [""]}, "hooks.pre_up must be a list of task names"),
+    ({"post_up": ["nope"]}, "names task 'nope', which is not defined"),
+])
+def test_a_bad_hooks_key_is_refused_before_anything(mgr, hooks, message):
+    m = mgr(hooks=hooks)
+    with pytest.raises(ConfigError, match=message):
+        m.up(_args())
+    assert m.events == [] and not m.log.exists()
+
+
+def test_a_hook_task_without_a_command_is_refused(mgr):
+    m = mgr(hooks={"pre_up": ["a"]}, tasks={"a": {"description": "nothing to run"}})
+    with pytest.raises(ConfigError, match="task 'a' has no command"):
+        m.up(_args())
+
+
+# ---- the inventory behind the record ------------------------------------------------
+class _FakeVirsh:
+    def __init__(self, answers):
+        self.answers = answers
+        self.calls = []
+
+    def execute(self, *args, warn=False):
+        self.calls.append(args)
+        ok, out = self.answers.get(args[0], (True, ""))
+        if callable(out):
+            ok, out = out(args)
+        return SimpleNamespace(ok=ok, stdout=out, stderr="" if ok else "virsh failed")
+
+
+def _inventory_mgr(tmp_path, answers):
+    m = BoxmanManager.__new__(BoxmanManager)
+    m.config = _config(tmp_path)
+    m.logger = logging.getLogger("test-up-hooks")
+    fake = _FakeVirsh(answers)
+    m._virsh = lambda: fake
+    return m, fake
+
+
+def test_the_inventory_holds_only_the_projects_resources(tmp_path):
+    u1, ux = "0d381ade-3d0e-4868-92f9-acc00ca7595a", "8bcbdcb4-0679-4267-96ea-c08bcea48b06"
+    listing = f"{u1} {D1}\n{ux} bprj__other__bprj_c1_vm1\n"
+    m, fake = _inventory_mgr(tmp_path, {
+        "list": (True, listing),
+        "net-list": (True, f"default\n{N1}\nbprj__other__bprj__clstr__c1__clstr__net1\n"),
+        "net-uuid": (True, "net-uuid-1\n"),
+    })
+    assert m.project_inventory() == {"domains": {D1: u1}, "networks": {N1: "net-uuid-1"}}
+    assert ("net-uuid", N1) in fake.calls
+    assert not [c for c in fake.calls if c[0] == "net-uuid" and c[1] != N1]
+
+
+@pytest.mark.parametrize("answers,message", [
+    ({"list": (False, "")}, "domain list could not be read"),
+    ({"list": (True, "garbage line without a uuid\n")}, "domain list could not be read"),
+    ({"list": (True, ""), "net-list": (False, "")}, "network list could not be read"),
+    ({"list": (True, ""), "net-list": (True, f"{N1}\n"), "net-uuid": (False, "")}, f"uuid of network {N1}"),
+])
+def test_an_unreadable_inventory_is_an_error_not_an_empty_one(tmp_path, answers, message):
+    m, _ = _inventory_mgr(tmp_path, answers)
+    with pytest.raises(ProvisionError, match=message):
+        m.project_inventory()

@@ -12,6 +12,7 @@ from boxman.manager_parts.config import ConfigMixin
 from boxman.manager_parts.control import ControlMixin
 from boxman.manager_parts.flows import FlowsMixin
 from boxman.manager_parts.guest_os import GuestOSMixin
+from boxman.manager_parts.hooks import HooksMixin
 from boxman.manager_parts.images import ImagesMixin
 from boxman.manager_parts.misc import MiscMixin
 from boxman.manager_parts.naming import NamingMixin
@@ -81,7 +82,7 @@ class BoxmanManager(
     ConfigMixin, WorkspaceMixin, NamingMixin, SSHMixin,
     ImagesMixin, NetworksMixin, VMsMixin,
     SnapshotsMixin, FlowsMixin, ComposeMixin, ControlMixin, NetlabMixin,
-    MiscMixin, GuestOSMixin, StoragePoolsMixin, SnapshotPruneMixin,
+    MiscMixin, GuestOSMixin, StoragePoolsMixin, SnapshotPruneMixin, HooksMixin,
 ):
     def __init__(self,
                  config: dict[str, Any] | None = None):

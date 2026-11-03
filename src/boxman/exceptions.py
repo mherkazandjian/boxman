@@ -137,6 +137,11 @@ class TemplateError(ProvisionError):
     cloud-init seed ISO failure, or virt-install refusing the spec."""
 
 
+class HookError(BoxmanError):
+    """Raised when a ``hooks:`` task of ``boxman up`` exits non-zero, or the
+    record handed to the ``post_up`` hooks cannot be written."""
+
+
 class SnapshotError(BoxmanError):
     """Raised when snapshot take / restore / delete fails. Distinguishes
     between "snapshot doesn't exist" and "snapshot revert aborted" so
