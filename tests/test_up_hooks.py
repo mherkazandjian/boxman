@@ -59,12 +59,17 @@ def mgr(tmp_path, monkeypatch):
     log = tmp_path / "hooks.log"
     monkeypatch.setenv("HOOK_LOG", str(log))
 
-    def make(hooks=None, tasks=None, inventories=(EMPTY, CREATED), up_error=None):
+    def make(hooks=None, tasks=None, inventories=(EMPTY, CREATED), up_error=None, provisions=True):
         m = BoxmanManager.__new__(BoxmanManager)
         m.config = _config(tmp_path, hooks, tasks)
         m.config_path = str(conf_dir / "conf.yml")
         m.logger = logging.getLogger("test-up-hooks")
+        m.cache = SimpleNamespace(cache_dir=str(tmp_path / "cache"))
         m.events = []
+        # the real provision() (which marks that this up provisioned), with
+        # the provider work stubbed
+        m._provision = lambda cli_args: m.events.append("provision")
+        m.report_clone_degradations = lambda: None
         reads = list(inventories)
 
         def inventory():
@@ -75,6 +80,8 @@ def mgr(tmp_path, monkeypatch):
         def body(cli_args):
             m.events.append("up")
             (tmp_path / "workspace").mkdir(exist_ok=True)
+            if provisions:
+                m.provision(cli_args)
             if up_error:
                 raise up_error
         m._up = body
@@ -97,7 +104,7 @@ def test_without_hooks_up_is_exactly_the_old_up(mgr):
     m = mgr()
     m.project_inventory = lambda: pytest.fail("no hooks: libvirt must not be read")
     m.up(_args())
-    assert m.events == ["up"]
+    assert m.events == ["up", "provision"]
     assert not m.record.exists()
     assert not m.log.exists()
 
@@ -105,7 +112,7 @@ def test_without_hooks_up_is_exactly_the_old_up(mgr):
 def test_empty_hook_lists_are_no_hooks(mgr):
     m = mgr(hooks={"pre_up": [], "post_up": None})
     m.up(_args())
-    assert m.events == ["up"] and not m.record.exists()
+    assert m.events == ["up", "provision"] and not m.record.exists()
 
 
 # ---- fresh: order, environment and the record ----------------------------------
@@ -116,7 +123,7 @@ def test_a_fresh_up_runs_the_hooks_in_order_around_up_and_records_what_it_create
     assert [(line[0], line[1]) for line in lines] == [
         ("a", "pre_up"), ("b", "pre_up"), ("c", "post_up"), ("d", "post_up")]
     # pre_up before the inventory and up, post_up after
-    assert m.events == ["inventory", "up", "inventory"]
+    assert m.events == ["inventory", "up", "provision", "inventory"]
     run_ids = {line[2] for line in lines}
     assert len(run_ids) == 1 and len(run_ids.pop()) == 32
     assert {line[3] for line in lines} == {"0"}
@@ -139,13 +146,13 @@ def test_a_fresh_up_runs_the_hooks_in_order_around_up_and_records_what_it_create
 def test_only_pre_up_reads_nothing_and_writes_no_record(mgr):
     m = mgr(hooks={"pre_up": ["a"]})
     m.up(_args())
-    assert m.events == ["up"] and not m.record.exists()
+    assert m.events == ["up", "provision"] and not m.record.exists()
     assert [line.split()[:2] for line in _hook_lines(m)] == [["a", "pre_up"]]
 
 
 # ---- rerun: nothing created ---------------------------------------------------------
 def test_a_rerun_records_nothing_created_and_everything_present(mgr):
-    m = mgr(hooks={"post_up": ["c"]}, inventories=(CREATED, CREATED))
+    m = mgr(hooks={"post_up": ["c"]}, inventories=(CREATED, CREATED), provisions=False)
     m.up(_args())
     record = json.loads(m.record.read_text())
     assert record["created"] == EMPTY
@@ -256,7 +263,6 @@ def test_the_partial_state_branch_with_force_reprovisions_and_records_it(mgr):
     del m._up
     m.validate_snapshot_dirs = lambda: None
     m._get_vm_states = lambda: {D1: "running"}
-    m.provision = lambda cli_args: m.events.append("provision")
     (m.record.parent).mkdir(parents=True)
     m.up(_args(force=True))
     assert "provision" in m.events
@@ -300,9 +306,22 @@ def test_a_bad_hooks_key_is_refused_before_anything(mgr, hooks, message):
     assert m.events == [] and not m.log.exists()
 
 
-def test_a_hook_task_without_a_command_is_refused(mgr):
-    m = mgr(hooks={"pre_up": ["a"]}, tasks={"a": {"description": "nothing to run"}})
-    with pytest.raises(ConfigError, match="task 'a' has no command"):
+@pytest.mark.parametrize("task", [
+    {"description": "nothing to run"}, {"command": ""}, {"command": 123}, {"command": ["echo", "hi"]},
+    "echo not a mapping",
+])
+def test_a_hook_task_without_a_string_command_is_refused_before_anything(mgr, task):
+    """H4: caught before hooks, inventory or up, never after provisioning."""
+    m = mgr(hooks={"post_up": ["a"]}, tasks={"a": task})
+    with pytest.raises(ConfigError, match="task 'a' needs a command, a non-empty string"):
+        m.up(_args())
+    assert m.events == [] and not m.record.exists()
+
+
+def test_tasks_that_are_not_a_mapping_are_refused(mgr):
+    m = mgr(hooks={"pre_up": ["a"]})
+    m.config["tasks"] = ["a"]
+    with pytest.raises(ConfigError, match="'tasks' must be a mapping"):
         m.up(_args())
 
 
@@ -352,3 +371,78 @@ def test_an_unreadable_inventory_is_an_error_not_an_empty_one(tmp_path, answers,
     m, _ = _inventory_mgr(tmp_path, answers)
     with pytest.raises(ProvisionError, match=message):
         m.project_inventory()
+
+
+
+# ---- H1: one hooked up at a time, and only a provision creates ------------------------
+def test_a_second_hooked_up_of_the_project_changes_nothing(mgr):
+    import fcntl
+    m = mgr(hooks={"pre_up": ["a"], "post_up": ["c"]})
+    path = m.up_lock_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(HookError, match="another boxman up of project 'hooked' is running"):
+            m.up(_args())
+    assert m.events == [] and not m.log.exists() and not m.record.exists()
+    m.up(_args())      # released: the next one runs
+    assert "up" in m.events
+
+
+def test_the_lock_is_held_while_the_hooks_run(mgr, monkeypatch):
+    probe = ('python3 -c "import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDWR); '
+             'fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)" "$UP_LOCK" '
+             '&& echo "$BOXMAN_HOOK free" >> "$HOOK_LOG" || echo "$BOXMAN_HOOK held" >> "$HOOK_LOG"')
+    m = mgr(hooks={"pre_up": ["a"], "post_up": ["c"]}, tasks={"a": {"command": probe}, "c": {"command": probe}})
+    monkeypatch.setenv("UP_LOCK", m.up_lock_path())
+    m.up(_args())
+    assert _hook_lines(m) == ["pre_up held", "post_up held"]
+
+
+def test_resources_that_appear_while_an_up_finds_the_project_in_place_are_not_its_own(mgr):
+    """Another run creates them between the first inventory and this up's
+    decision; this up provisioned nothing, so it claims nothing."""
+    m = mgr(hooks={"post_up": ["c"]}, inventories=(EMPTY, CREATED), provisions=False)
+    m.up(_args())
+    record = json.loads(m.record.read_text())
+    assert record["created"] == EMPTY
+    assert record["present"] == CREATED
+
+
+# ---- H2: --force through the real up on a complete project -------------------------
+def test_force_on_a_complete_running_project_reconciles_and_creates_nothing(mgr):
+    """The real _up: --force deprovisions only a partial project; a complete,
+    running one takes the all-running path, and the record says so."""
+    m = mgr(hooks={"post_up": ["c"]}, inventories=(CREATED, CREATED))
+    del m._up
+    m.validate_snapshot_dirs = lambda: None
+    m._get_vm_states = lambda: {D1: "running", D2: "running"}
+    for name in ("ensure_shared_bridges", "report_network_results", "raise_on_network_failures",
+                 "ensure_netlab_up", "connect_info"):
+        setattr(m, name, lambda *a, **k: None)
+    m.reconcile_networks = lambda **k: {}
+    m._reconcile_compose_clusters = lambda: None
+    m.eject_install_media = lambda *a, **k: []
+    m._rewrite_ssh_config = lambda: []
+    (m.record.parent).mkdir(parents=True)
+    m.up(_args(force=True))
+    assert "provision" not in m.events
+    record = json.loads(m.record.read_text())
+    assert record["force"] is True and record["created"] == EMPTY and record["present"] == CREATED
+    assert {line.split()[3] for line in _hook_lines(m)} == {"1"}
+
+
+# ---- H3: an absolute record path, whatever the hook's working directory -----------
+def test_a_relative_workspace_gives_the_hooks_an_absolute_record_path(mgr, tmp_path, monkeypatch):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    operator = tmp_path / "operator"
+    (operator / "lab").mkdir(parents=True)
+    check = 'case "$BOXMAN_UP_RECORD" in /*) ;; *) exit 9 ;; esac; test -f "$BOXMAN_UP_RECORD" && pwd >> "$HOOK_LOG"'
+    m = mgr(hooks={"post_up": ["c", "d"]},
+            tasks={"c": {"command": check}, "d": {"command": check, "workdir": str(elsewhere)}})
+    m.config["workspace"]["path"] = "lab"
+    monkeypatch.chdir(operator)
+    m.up(_args())
+    assert _hook_lines(m) == [os.path.realpath(tmp_path / "project"), os.path.realpath(elsewhere)]
+    assert (operator / "lab" / UP_RECORD_NAME).exists()

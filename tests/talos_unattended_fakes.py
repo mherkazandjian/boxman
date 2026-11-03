@@ -224,6 +224,16 @@ def boxman(world: dict, argv: list[str]) -> None:
     conf = os.path.abspath(opt(argv, "--conf") or "conf.yml")
     cfg = _render_conf(conf)
     project = cfg["project"]
+    # the project's up lock, held to the end, as boxman holds it
+    import fcntl
+    lock = os.path.expanduser(f"~/.config/boxman/cache/locks/up-{project}.lock")
+    os.makedirs(os.path.dirname(lock), exist_ok=True)
+    lock_fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail(f"HookError: another boxman up of project '{project}' is running (it holds {lock}); "
+             "this one changed nothing", 2)
     run_id = world.get("boxman", {}).get("run_id_override") or uuid.uuid4().hex
     env = dict(os.environ, BOXMAN_UP_RUN_ID=run_id, BOXMAN_UP_FORCE="1" if "--force" in argv else "0")
     _run_hooks("pre_up", cfg, conf, env)

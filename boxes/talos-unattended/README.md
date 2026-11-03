@@ -113,8 +113,11 @@ naming it, and `boxman up` exits non-zero; fix the cause and run `boxman up`
 again. A rerun checks what the earlier run built and changes nothing that
 is already right: it never regenerates the cluster identity, re-sends a
 node's initial config or bootstraps etcd a second time. `boxman up --force`
-is refused by the pre_up hook: it would recreate the VMs while the cluster
-identity lives on in the backup.
+is refused by the pre_up hook: on a partly provisioned project it would
+deprovision and provision the VMs again while the cluster identity lives on
+in the backup, and this box never needs it. Two `boxman up` runs of the
+project never overlap: boxman holds the project's up lock from the first
+hook to the last.
 
 | stage | what it does, and what it refuses |
 | --- | --- |

@@ -24,15 +24,18 @@ no hook runs, libvirt is not read for a record, and no file is written.
 - `hooks` is a mapping with at most two keys, `pre_up` and `post_up`. Each
   is a list of task names, run in the order given. An empty list, or `null`,
   is the same as no entry.
-- Every name must be a task of the same config with a `command`. Anything
-  else -- another phase, a name that is not a task, a task without a
-  command -- stops `boxman up` with a configuration error before it does
-  anything.
+- Every name must be a task of the same config whose `command` is a
+  non-empty string. Anything else -- another phase, a name that is not a
+  task, a task without a string command -- stops `boxman up` with a
+  configuration error before it does anything.
 - Only `boxman up` runs hooks. `boxman provision`, `update` and the rest do
   not, and `boxman run <task>` still runs any of these tasks on its own.
 
 ## When the hooks run
 
+0. boxman takes the project's up lock (`~/.config/boxman/cache/locks/up-<project>.lock`)
+   and holds it until the last hook has finished. A second `boxman up` of the
+   same project with hooks fails at once, before any hook, changing nothing.
 1. The `pre_up` hooks run first, before `boxman up` changes anything: no
    template is built, no network defined, no VM created or started. A
    `pre_up` hook is the place for checks that must pass before anything
@@ -66,11 +69,15 @@ not run, and `boxman up` exits non-zero (2, like any boxman error).
 
 ## `--force`
 
-`boxman up --force` keeps its meaning (deprovision what exists, provision
-again). The hooks run as for any `up`, and get `BOXMAN_UP_FORCE=1`, so a
-`pre_up` hook can refuse a forced recreation it cannot support. Resources
-recreated under the same name have new UUIDs and are listed as `created`
-in the record.
+`--force` changes `boxman up` exactly as it does without hooks, and only on
+one path: when some of the project's VMs exist and others do not, `up
+--force` deprovisions the project and provisions it again (without
+`--force` it refuses). A project with no VMs is provisioned with or without
+it; a complete project is started, resumed or reconciled, never
+recreated, with or without it. The hooks run as for any `up` and get
+`BOXMAN_UP_FORCE=1`, so a `pre_up` hook can refuse a run it does not
+support. Resources recreated by that partial-state reprovision have new
+UUIDs and are listed as `created` in the record.
 
 ## Environment and working directory
 
@@ -94,7 +101,9 @@ workspace exists:
 ## The up record
 
 Before the `post_up` hooks run, boxman writes
-`<workspace.path>/boxman-up-record.json` (mode 0600, replaced atomically):
+`<workspace.path>/boxman-up-record.json` (mode 0600, replaced atomically;
+`BOXMAN_UP_RECORD` is its absolute path, a relative `workspace.path` being
+resolved against the directory boxman was run from):
 
 ```json
 {
@@ -115,9 +124,11 @@ Before the `post_up` hooks run, boxman writes
 }
 ```
 
-- `created`: the project's domains and networks that exist after this `up`
-  with a UUID they did not have before it, i.e. what this `up` created or
-  recreated. Empty on a rerun that found everything in place.
+- `created`: the project's domains and networks that a provision run by
+  this `up` created or recreated: present afterwards with a UUID they did
+  not have before it. An `up` that found the project in place (start,
+  resume or reconcile) provisions nothing and records nothing as created,
+  even if resources appeared meanwhile.
 - `present`: all of the project's domains and networks after this `up`.
 - `status`: `succeeded`, or `failed` for an `up` that raised (then no
   `post_up` hook runs; the record is for diagnosis).

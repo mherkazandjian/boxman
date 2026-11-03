@@ -580,7 +580,23 @@ def test_a_second_run_converges_without_touching_identity_configs_or_etcd(lab):
     assert "cp-01: unchanged" in proc.stdout
 
 
-def test_a_concurrent_install_is_refused(lab):
+def test_a_concurrent_install_is_refused_before_it_changes_anything(lab):
+    """A second boxman up of the project while one runs (it holds boxman's
+    up lock): no hook, no infrastructure change, nothing reaches a VM."""
+    import fcntl
+    lock = lab.root / ".config" / "boxman" / "cache" / "locks" / f"up-{PROJECT}.lock"
+    lock.parent.mkdir(parents=True)
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        proc = lab.run("install.sh")
+    assert proc.returncode == 2
+    assert f"another boxman up of project '{PROJECT}' is running" in proc.stderr
+    assert "preflight:" not in proc.stderr
+    assert "calls" not in lab.world()["boxman"]
+    assert not lab.calls("ssh") and not lab.calls("talosctl")
+
+
+def test_the_driver_lock_refuses_a_second_post_up(lab):
     import fcntl
     lab.driver.mkdir(parents=True)
     with open(lab.driver / ".install.lock", "w") as fobj:

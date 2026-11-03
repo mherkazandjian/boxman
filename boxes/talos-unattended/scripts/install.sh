@@ -16,8 +16,9 @@
 # initial config or bootstraps etcd twice.
 #
 # --pre-up: scripts/preflight.sh, before boxman changes anything. boxman up
-#   --force (BOXMAN_UP_FORCE=1) is refused: it would recreate the VMs while
-#   the cluster identity lives on in the backup.
+#   --force (BOXMAN_UP_FORCE=1) is refused: on a partly provisioned project
+#   it would deprovision and provision the VMs again, while the cluster
+#   identity lives on in the backup.
 #
 # --post-up stages, after boxman up succeeded:
 #   ownership   from boxman's up record (BOXMAN_UP_RECORD), which must be
@@ -94,7 +95,7 @@ case "$MODE" in
         [ "${BOXMAN_HOOK:-}" = pre_up ] \
             || die "--pre-up runs as boxman up's pre_up hook; run boxman up (or make install), or scripts/preflight.sh on its own"
         [ "${BOXMAN_UP_FORCE:-0}" = 0 ] \
-            || die "boxman up --force is not supported for this box: it would deprovision and recreate the VMs while the cluster identity lives on in TALOS_BACKUP_DIR. For a new cluster: boxman destroy, move TALOS_BACKUP_DIR away, then boxman up"
+            || die "boxman up --force is not supported for this box: on a partly provisioned project it deprovisions and provisions the VMs again, while the cluster identity lives on in TALOS_BACKUP_DIR. For a new cluster: boxman destroy, move TALOS_BACKUP_DIR away, then boxman up"
         stage preflight
         exec "$SCRIPTS/preflight.sh" ${INPUTS:+--inputs "$INPUTS"} ;;
 esac

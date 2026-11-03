@@ -42,6 +42,9 @@ class FlowsMixin:
         merely kept its template's identity raises out of the clone step, and
         the degraded clone would otherwise never reach the closing summary.
         """
+        # what a hooked `up` attributes to itself: only resources that a
+        # provision of this run created (manager_parts/hooks.py)
+        self._provision_ran = True
         try:
             self._provision(cli_args)
         finally:

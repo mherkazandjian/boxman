@@ -6,7 +6,9 @@ A project may declare, beside its ``tasks:``::
       pre_up: [check-inputs]       # before up changes anything
       post_up: [configure, smoke]  # after up brought everything up
 
-Each entry names a task of the same config. ``boxman up`` runs the
+Each entry names a task of the same config. A hooked ``boxman up`` holds an
+exclusive lock on its project from the first hook to the last, so two of
+them never interleave. ``boxman up`` runs the
 ``pre_up`` tasks, in order, before any side effect, and the ``post_up``
 tasks, in order, after an ``up`` that succeeded: a fresh provision, a start
 or resume of stopped VMs, or the "all VMs already running" path. A task that
@@ -16,16 +18,20 @@ not run. With no ``hooks:`` key, ``up`` behaves exactly as before.
 Before the ``post_up`` tasks run, boxman writes a record of this ``up`` to
 ``<workspace>/boxman-up-record.json`` (0600): the UUIDs of the project's
 libvirt domains and networks that this ``up`` created, and of all of them
-that are present afterwards. A hook can take ownership of what boxman
-created from that record instead of trusting whatever it finds under the
-project's names. The record carries this run's id, which the hooks receive
+that are present afterwards. Only a provision run by this ``up`` creates:
+an ``up`` that found the project in place records nothing as created, even
+if resources appeared while it ran. A hook can take ownership of what
+boxman created from that record instead of trusting whatever it finds under
+the project's names. The record carries this run's id, which the hooks receive
 in ``BOXMAN_UP_RUN_ID``, so a record left by an earlier ``up`` is never
 mistaken for this one's. See doc/hooks.md.
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import fcntl
 import json
 import os
 import tempfile
@@ -69,6 +75,8 @@ class HooksMixin:
                 f"hooks: unknown phase(s) {', '.join(map(str, unknown))}; "
                 f"supported: {', '.join(HOOK_PHASES)}")
         tasks = (self.config or {}).get('tasks') or {}
+        if not isinstance(tasks, dict):
+            raise ConfigError("'tasks' must be a mapping of task name to task")
         for phase in HOOK_PHASES:
             names = hooks.get(phase)
             if names is None:
@@ -84,9 +92,16 @@ class HooksMixin:
                     raise ConfigError(
                         f"hooks.{phase} names task '{name}', which is not "
                         f"defined under tasks: (available: {available})")
-                if not isinstance(task, dict) or not str(task.get('command') or '').strip():
+                command = task.get('command') if isinstance(task, dict) else None
+                if not isinstance(command, str) or not command.strip():
                     raise ConfigError(
-                        f"hooks.{phase}: task '{name}' has no command")
+                        f"hooks.{phase}: task '{name}' needs a command, a "
+                        f"non-empty string (got {type(command).__name__})")
+                workdir = task.get('workdir')
+                if workdir is not None and not isinstance(workdir, str):
+                    raise ConfigError(
+                        f"hooks.{phase}: task '{name}' has a workdir that is "
+                        "not a path")
 
     def _hook_tasks(self, phase: str) -> list[str]:
         """The task names configured for *phase* (validated), in order."""
@@ -209,11 +224,40 @@ class HooksMixin:
                 for kind in ('domains', 'networks')}
 
     def up_record_path(self) -> str:
-        """Where the up record goes: the workspace, else conf.yml's dir."""
+        """Where the up record goes, as an absolute path: the workspace
+        (relative to where boxman runs, as boxman resolves it), else conf.yml's
+        dir. Hooks run elsewhere, so they must get an absolute path."""
         workspace = ((self.config or {}).get('workspace') or {}).get('path')
         if workspace:
-            return os.path.join(os.path.expanduser(workspace), UP_RECORD_NAME)
-        return os.path.join(self._config_dir(), UP_RECORD_NAME)
+            return os.path.abspath(os.path.join(os.path.expanduser(workspace), UP_RECORD_NAME))
+        return os.path.abspath(os.path.join(self._config_dir(), UP_RECORD_NAME))
+
+    def up_lock_path(self) -> str:
+        """The per-project lock every hooked ``up`` holds, in boxman's
+        per-user cache: independent of the workspace, which may not exist."""
+        cache = getattr(getattr(self, 'cache', None), 'cache_dir', None) \
+            or os.path.expanduser('~/.config/boxman/cache')
+        project = str((self.config or {}).get('project') or 'unnamed')
+        safe = ''.join(c if c.isalnum() or c in '._-' else '_' for c in project)
+        return os.path.join(cache, 'locks', f'up-{safe}.lock')
+
+    @contextlib.contextmanager
+    def _up_lock(self):
+        """Hold the project's up lock, or fail at once if another has it."""
+        path = self.up_lock_path()
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise HookError(
+                    f"another boxman up of project "
+                    f"'{(self.config or {}).get('project')}' is running "
+                    f"(it holds {path}); this one changed nothing") from exc
+            yield
+        finally:
+            os.close(fd)
 
     def write_up_record(self, run_id: str, status: str, force: bool,
                         created: dict | None, present: dict | None) -> str | None:
@@ -259,11 +303,16 @@ class HooksMixin:
         """Run *up_body* (the hook-less ``up``) between the hooks.
 
         - no hooks configured: *up_body* alone, nothing else changes;
+        - otherwise the project's up lock is held from here to the end; a
+          second hooked ``up`` of the project fails at once, changing
+          nothing;
         - ``pre_up`` hooks, in order, before *up_body* changes anything; a
           failure stops here;
         - with ``post_up`` hooks, the project's domain and network UUIDs are
           read before and after *up_body*, and the difference -- what this
           ``up`` created -- is written to the up record, with what is present.
+          Only a provision run by *up_body* creates: on a start, resume or
+          reconcile nothing is recorded as created;
           If *up_body* fails, the record is written with status ``failed``
           (best effort, never hiding the original error) and no ``post_up``
           hook runs;
@@ -275,6 +324,18 @@ class HooksMixin:
         self.validate_hooks_config()
         if not self.has_hooks():
             return up_body(cli_args)
+        with self._up_lock():
+            return self._up_with_hooks_locked(cli_args, up_body)
+
+    def _created_by_this_up(self, before: dict, after: dict) -> dict[str, dict[str, str]]:
+        """What this ``up`` created: only a provision it ran creates. An
+        ``up`` that found the project in place (start, resume, reconcile)
+        created nothing, whatever appeared meanwhile."""
+        if not getattr(self, '_provision_ran', False):
+            return {'domains': {}, 'networks': {}}
+        return self._created_between(before, after)
+
+    def _up_with_hooks_locked(self, cli_args: Any, up_body) -> None:
         run_id = uuid.uuid4().hex
         force = bool(getattr(cli_args, 'force', False))
         env = {'BOXMAN_UP_RUN_ID': run_id, 'BOXMAN_UP_FORCE': '1' if force else '0'}
@@ -282,19 +343,20 @@ class HooksMixin:
         if not self._hook_tasks('post_up'):
             return up_body(cli_args)
         before = self.project_inventory()
+        self._provision_ran = False
         try:
             result = up_body(cli_args)
         except Exception:
             try:
                 after = self.project_inventory()
                 self.write_up_record(run_id, 'failed', force,
-                                     self._created_between(before, after), after)
+                                     self._created_by_this_up(before, after), after)
             except Exception as exc:   # never hide why up failed
                 self.logger.warning(f"could not write the up record of a failed up: {exc}")
             raise
         after = self.project_inventory()
         path = self.write_up_record(
-            run_id, 'succeeded', force, self._created_between(before, after), after)
+            run_id, 'succeeded', force, self._created_by_this_up(before, after), after)
         if path is None:
             raise HookError(
                 f"cannot hand the post_up hooks a record: {os.path.dirname(self.up_record_path())} "
