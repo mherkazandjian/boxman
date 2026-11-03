@@ -326,7 +326,7 @@ def test_bad_inputs_are_refused(host, var, value, message):
 def test_a_backup_inside_the_workspace_or_a_checkout_is_refused(host):
     with open(host.inputs_file, "a") as fobj:
         fobj.write(f"TALOS_BACKUP_DIR={host.lab_dir}/backup\n")
-    _refused(host.run("preflight.sh"), "TALOS_BACKUP_DIR must be outside the workspace")
+    _refused(host.run("preflight.sh"), "inside the workspace")
     repo = host.root / "repo"
     (repo / ".git").mkdir(parents=True)
     (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
@@ -381,3 +381,47 @@ def test_flux_on_with_everything_passes_and_never_prints_the_token(host):
 def test_flux_targets_are_checked(host, var, value):
     env = dict(FLUX_INPUTS, TALOS_FLUX="on", **{var: value})
     _refused(host.run("preflight.sh", **env), "flux:")
+
+
+def _set_inputs(host, **values) -> None:
+    with open(host.inputs_file, "a") as fobj:
+        for var, value in values.items():
+            fobj.write(f"{var}='{value}'\n")
+
+
+def test_a_backup_reached_through_a_symlink_into_the_workspace_is_refused(host):
+    """Review B2: the comparison is physical, not lexical."""
+    host.lab_dir.mkdir()
+    outside = host.root / "outside"
+    outside.mkdir()
+    (outside / "link").symlink_to(host.lab_dir)
+    _set_inputs(host, TALOS_BACKUP_DIR=f"{outside}/link/backup")
+    _refused(host.run("preflight.sh"), f"is {host.lab_dir}/backup, inside the workspace")
+
+
+def test_a_backup_path_with_dot_components_is_refused(host):
+    (host.root / "outside").mkdir()
+    _set_inputs(host, TALOS_BACKUP_DIR=f"{host.root}/outside/../lab/backup")
+    _refused(host.run("preflight.sh"), "has . or .. components")
+
+
+def test_a_workspace_reached_through_a_symlink_still_contains_its_backup(host):
+    real = host.root / "real-lab"
+    real.mkdir()
+    link = host.root / "lab-link"
+    link.symlink_to(real)
+    _set_inputs(host, TALOS_LAB_DIR=str(link), TALOS_BACKUP_DIR=f"{real}/backup")
+    _refused(host.run("preflight.sh"), f"is {real}/backup, inside the workspace ({real})")
+
+
+def test_a_workspace_inside_the_backup_is_refused(host):
+    _set_inputs(host, TALOS_BACKUP_DIR=str(host.root))
+    _refused(host.run("preflight.sh"), "lies inside TALOS_BACKUP_DIR")
+
+
+def test_a_backup_symlinked_to_a_place_outside_the_workspace_passes(host):
+    elsewhere = host.root / "vault"
+    elsewhere.mkdir()
+    (host.root / "backup-link").symlink_to(elsewhere)
+    _set_inputs(host, TALOS_BACKUP_DIR=f"{host.root}/backup-link/lab")
+    _ok(host.run("preflight.sh"))

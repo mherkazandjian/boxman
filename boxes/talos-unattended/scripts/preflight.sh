@@ -360,9 +360,18 @@ else
         problem "access: TALOS_OPERATOR_PUBKEY is not the public half of $key; the control template would authorize another key"
     fi
 fi
+# The backup must survive a destroy of the workspace: compare where the data
+# would physically land, symlinks resolved on both sides. install.sh writes
+# only to this checked physical path.
 if [ -n "${TALOS_BACKUP_DIR:-}" ]; then
-    if below "$TALOS_BACKUP_DIR" "$WORKSPACE" || below "$TALOS_BACKUP_DIR" "$BOX_DIR"; then
-        problem "access: TALOS_BACKUP_DIR must be outside the workspace and the box (a destroy must not take the backup)"
+    if ! backup_phys=$(physical_path "$TALOS_BACKUP_DIR" 2>&1); then
+        problem "access: TALOS_BACKUP_DIR: $backup_phys"
+    elif ! ws_phys=$(physical_path "$WORKSPACE" 2>&1); then
+        problem "access: the workspace: $ws_phys"
+    elif below "$backup_phys" "$ws_phys" || below "$backup_phys" "$BOX_DIR"; then
+        problem "access: TALOS_BACKUP_DIR $TALOS_BACKUP_DIR is $backup_phys, inside the workspace ($ws_phys) or the box; it must be outside both, so a destroy cannot take the backup"
+    elif below "$ws_phys" "$backup_phys"; then
+        problem "access: the workspace $ws_phys lies inside TALOS_BACKUP_DIR $backup_phys; keep them apart"
     else
         ( outside_checkouts "$TALOS_BACKUP_DIR" TALOS_BACKUP_DIR ) || problem "access: see above (TALOS_BACKUP_DIR)"
         probe=$TALOS_BACKUP_DIR

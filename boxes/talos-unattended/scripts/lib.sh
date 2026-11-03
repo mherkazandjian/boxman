@@ -130,7 +130,27 @@ outside_checkouts() {
     fi
 }
 
-# below PATH DIR: PATH is DIR or lies below it (both absolute, lexically)
+# physical_path PATH: PATH with every existing component resolved through
+# symlinks (cd -P) and the not-yet-existing tail appended. Refuses relative
+# paths and . or .. components: below a directory that does not exist yet
+# they would only be resolved by a later mkdir, after this check.
+physical_path() {
+    local path=$1 probe physical rest
+    case "$path" in /*) ;; *) echo "not an absolute path: $path" >&2; return 1 ;; esac
+    case "$path/" in */./*|*/../*) echo "$path has . or .. components" >&2; return 1 ;; esac
+    path=$(printf '%s' "$path" | tr -s /)
+    [ "$path" = / ] || path=${path%/}
+    probe=$path
+    while [ ! -e "$probe" ] && [ ! -L "$probe" ]; do probe=$(dirname -- "$probe"); done
+    [ -d "$probe" ] || { echo "$probe is not a directory" >&2; return 1; }
+    physical=$(cd -P -- "$probe" 2>/dev/null && pwd -P) || { echo "cannot resolve $probe" >&2; return 1; }
+    rest=${path:${#probe}}
+    rest=${rest#/}
+    if [ -n "$rest" ]; then printf '%s\n' "${physical%/}/$rest"; else printf '%s\n' "$physical"; fi
+}
+
+# below PATH DIR: PATH is DIR or lies below it (both absolute, lexically;
+# pass physical_path results to compare where the data actually lands)
 below() {
     local path=${1%/} dir=${2%/}
     [ "$path" = "$dir" ] || [ "${path#"$dir"/}" != "$path" ]
