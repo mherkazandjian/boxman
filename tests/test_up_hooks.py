@@ -325,6 +325,16 @@ def test_tasks_that_are_not_a_mapping_are_refused(mgr):
         m.up(_args())
 
 
+@pytest.mark.parametrize("hooks", [{}, {"pre_up": [], "post_up": None}])
+def test_empty_hooks_never_validate_unrelated_tasks(mgr, hooks):
+    """Empty hooks are no hooks: up behaves as before, even with a tasks:
+    section boxman run would reject."""
+    m = mgr(hooks=hooks)
+    m.config["tasks"] = ["not", "a", "mapping"]
+    m.up(_args())
+    assert m.events == ["up", "provision"] and not m.record.exists()
+
+
 # ---- the inventory behind the record ------------------------------------------------
 class _FakeVirsh:
     def __init__(self, answers):

@@ -75,8 +75,6 @@ class HooksMixin:
                 f"hooks: unknown phase(s) {', '.join(map(str, unknown))}; "
                 f"supported: {', '.join(HOOK_PHASES)}")
         tasks = (self.config or {}).get('tasks') or {}
-        if not isinstance(tasks, dict):
-            raise ConfigError("'tasks' must be a mapping of task name to task")
         for phase in HOOK_PHASES:
             names = hooks.get(phase)
             if names is None:
@@ -85,6 +83,10 @@ class HooksMixin:
                     isinstance(name, str) and name for name in names):
                 raise ConfigError(
                     f"hooks.{phase} must be a list of task names")
+            # tasks: is only checked when a hook names one: empty hooks are
+            # no hooks, and up must behave exactly as without the key
+            if names and not isinstance(tasks, dict):
+                raise ConfigError("'tasks' must be a mapping of task name to task")
             for name in names:
                 task = tasks.get(name)
                 if task is None:
