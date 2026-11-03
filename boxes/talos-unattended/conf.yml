@@ -64,12 +64,15 @@
      'worker':       {'vcpus': 4, 'memory': 6144, 'disk_size': '150G'},
    } %}
 version: '1.0'
-project: talos_unattended
+# TALOS_PROJECT names the project (and so its domains and networks), for a
+# second lab beside the first; TALOS_LIBVIRT_USE_SUDO=false for a user in
+# the libvirt group, who reaches qemu:///system without sudo.
+project: {{ env("TALOS_PROJECT", default="talos_unattended") }}
 
 provider:
   libvirt:
     uri: qemu:///system
-    use_sudo: true
+    use_sudo: {{ env("TALOS_LIBVIRT_USE_SUDO", default="true") }}
     virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
     virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
     virsh_cmd: '/usr/bin/virsh'
