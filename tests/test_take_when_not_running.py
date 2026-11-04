@@ -805,6 +805,9 @@ class _Offline:
                     else _result(ok=False, stderr="error: not found"))
         if verb == "snapshot-list":
             return _result(stdout="".join(f"{n}\n" for n in self.names) + "\n")
+        if verb == "snapshot-current":
+            # a line of takes: the newest is the one the VM runs on
+            return _result(stdout=f"{self.names[-1]}\n")
         if verb == "snapshot-dumpxml":
             name = args[2]
             i = self.names.index(name)

@@ -663,7 +663,8 @@ def parse_args():
         required=True,
         dest='target',
         help='oldest snapshot to keep revertable; everything between '
-             'this and the live head is merged into the head and dropped',
+             'this and the live head is merged into the head and dropped '
+             '(refused while another branch is built on it)',
     )
     parser_snap_collapse.add_argument(
         '--no-shutdown',

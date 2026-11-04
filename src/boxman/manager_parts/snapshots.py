@@ -1122,6 +1122,19 @@ class SnapshotsMixin:
                     f"'{target}' is not a usable collapse target")
             return
 
+        # told before the shutdown: a collapse it refuses -- a target that
+        # is not there, snapshots on another branch it would drop unmerged
+        # (#291) -- or one with nothing to drop leaves a running guest alone
+        drops = snapshot_mgr.collapse_drops(full_vm_name, target)
+        if drops is None:
+            raise SnapshotError(
+                f"collapse refused for {full_vm_name}: see the error above; "
+                f"its snapshots were left untouched")
+        if not drops:
+            log.info(f"collapse: nothing is built on '{target}' on "
+                     f"{full_vm_name}; nothing to collapse")
+            return
+
         was_running = storage.is_running(full_vm_name)
         if was_running:
             if no_shutdown:
@@ -1141,7 +1154,8 @@ class SnapshotsMixin:
         try:
             if snapshot_mgr.collapse_to(full_vm_name, target, dry_run=False):
                 log.info(
-                    f"collapse ok: {full_vm_name} — kept '{target}' and older")
+                    f"collapse ok: {full_vm_name} — runs on '{target}' now; "
+                    f"every other snapshot kept")
             else:
                 collapse_error = f"collapse failed: {full_vm_name}"
         finally:
@@ -1169,7 +1183,9 @@ class SnapshotsMixin:
         Auto-shuts down running VMs by default (qemu-img rebase is
         offline-only). Use ``--no-shutdown`` to skip running VMs instead.
         Snapshots older than the target remain revertable; everything
-        between target and head is merged into head and dropped.
+        between target and head is merged into head and dropped. Refused,
+        before any shutdown, while another branch is built on the target
+        (``SnapshotManager.collapse_drops``).
         """
         target = cli_args.target
         dry_run = getattr(cli_args, 'dry_run', False)

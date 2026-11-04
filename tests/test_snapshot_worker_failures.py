@@ -159,6 +159,46 @@ class TestCollapseWorkerRestartOrdering:
         storage.start.assert_not_called()
 
 
+class TestCollapseWorkerRefusesBeforeTheShutdown:
+    """A collapse that would drop a snapshot on another branch is refused
+    (#291): told before the shutdown, a running guest is left running
+    rather than powered down and booted again for nothing."""
+
+    def test_a_refused_collapse_never_shuts_the_vm_down(self, managers):
+        snapshot_mgr, storage = managers
+        storage.is_running.return_value = True
+        snapshot_mgr.collapse_drops.return_value = None
+
+        with pytest.raises(SnapshotError, match="collapse refused"):
+            _collapse()
+
+        storage.shutdown_and_wait.assert_not_called()
+        storage.start.assert_not_called()
+        snapshot_mgr.collapse_to.assert_not_called()
+
+    def test_nothing_to_drop_never_shuts_the_vm_down(self, managers):
+        snapshot_mgr, storage = managers
+        storage.is_running.return_value = True
+        snapshot_mgr.collapse_drops.return_value = []
+
+        _collapse()
+
+        storage.shutdown_and_wait.assert_not_called()
+        snapshot_mgr.collapse_to.assert_not_called()
+
+    def test_what_it_drops_is_told_for_the_vm_and_target(self, managers):
+        snapshot_mgr, storage = managers
+        storage.is_running.return_value = False
+        snapshot_mgr.collapse_drops.return_value = ["snap2"]
+        snapshot_mgr.collapse_to.return_value = True
+
+        _collapse()
+
+        snapshot_mgr.collapse_drops.assert_called_once_with("vm1", "snap1")
+        snapshot_mgr.collapse_to.assert_called_once_with(
+            "vm1", "snap1", dry_run=False)
+
+
 class TestCollapseWorkerDryRun:
 
     def test_invalid_target_is_a_failure(self, managers):
