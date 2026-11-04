@@ -1689,6 +1689,22 @@ class SnapshotManager:
         state = info.get('state')
         return state is not None and state not in ('running', 'paused')
 
+    @classmethod
+    def _definition_a_revert_builds_on(cls, root):
+        """
+        The definition the snapshot whose XML is *root* saved that
+        ``snapshot-revert`` lays its new overlays on: its ``<domain>`` when
+        it saved the guest's memory, else its ``<inactiveDomain>`` if it has
+        one (``qemuSnapshotRevertPrep``, then ``qemuSnapshotRevertInactive``
+        for one that saved none). None when it saved neither.
+        """
+        state = root.findtext("state")
+        if cls._holds_no_memory({'state': state.strip() if state else None}):
+            inactive = root.find("inactiveDomain")
+            if inactive is not None:
+                return inactive
+        return root.find("domain")
+
     def _snapshot_graph(self, vm_name: str) -> dict[str, dict]:
         """
         Return ``{name: info}`` for every snapshot of *vm_name*.
@@ -1776,7 +1792,11 @@ class SnapshotManager:
            compress-snapshots``), which :meth:`snapshot_restore`
            decompresses before the revert. libvirt keeps recording the
            ``.raw`` path either way.
-        3. All external disk overlay files referenced in the snapshot XML exist on disk.
+        3. For each disk it made an external overlay of, the image that
+           overlay was laid on exists: the disk's source in the definition
+           it saved (:meth:`_definition_a_revert_builds_on`), which a
+           revert lays a new overlay on. Not the overlay its take made,
+           which its ``<disks>`` record and no revert to it reads.
 
         Args:
             vm_name: Name of the VM
@@ -1813,15 +1833,32 @@ class SnapshotManager:
                     errors.append(
                         f"memory file missing: {mem_file} (nor {mem_file}.zst)")
 
-            # Check external disk overlay files
-            for disk in root.findall(".//disks/disk"):
+            # Check what a revert builds on: for each disk the snapshot made
+            # an external overlay of, the disk's source in the definition it
+            # saved, which the revert lays a new overlay on
+            # (qemuSnapshotRevertExternalPrepare). Not the overlay its take
+            # made, which its <disks> record: no revert to it reads that, nor
+            # libvirt's delete of it, which merges what its child was taken
+            # on (qemuSnapshotExternalGetSnapDiskSrc). And it can be gone:
+            # once a restore of this snapshot and a take have cleared its
+            # <revertDisks>, libvirt's delete of a child taken on it, a leaf
+            # that is not current, unlinks it and leaves the record
+            # (qemuSnapshotDiscardExternal, #289).
+            definition = self._definition_a_revert_builds_on(root)
+            saved = {}
+            for device in (definition.iter("disk")
+                           if definition is not None else ()):
+                target, source = device.find("target"), device.find("source")
+                if target is not None and source is not None:
+                    saved[target.get("dev")] = source.get("file")
+            for disk in root.findall("disks/disk"):
                 if disk.get("snapshot") != "external":
                     continue
-                source = disk.find("source")
-                if source is not None:
-                    src_file = source.get("file")
-                    if src_file and not os.path.isfile(src_file):
-                        errors.append(f"disk overlay missing: {src_file}")
+                name = disk.get("name")
+                src_file = saved.get(name)
+                if src_file and not os.path.isfile(src_file):
+                    errors.append(f"disk image missing: {src_file} "
+                                  f"(a revert builds {name} on it)")
 
         except ET.ParseError as exc:
             errors.append(f"failed to parse snapshot XML: {exc}")

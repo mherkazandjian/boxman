@@ -296,45 +296,89 @@ class TestValidateSnapshot:
         assert ok is False
         assert any("memory file missing" in e for e in errors)
 
-    def test_reports_missing_overlay(self, sm: SnapshotManager, tmp_path: Path):
-        missing_overlay = str(tmp_path / "missing.qcow2")
-        xml = (
-            "<domainsnapshot>"
-            f"<disks><disk name='vda' snapshot='external'>"
-            f"<source file='{missing_overlay}'/></disk></disks>"
-            "</domainsnapshot>"
-        )
-
+    @staticmethod
+    def _validate(sm: SnapshotManager, xml: str):
         def fake(*args, **_kwargs):
             if args[0] == "snapshot-info":
                 return _result(ok=True)
             return _result(stdout=xml)
 
         with patch.object(sm.virsh, "execute", side_effect=fake):
-            ok, errors = sm.validate_snapshot("vm01", "snap1")
+            return sm.validate_snapshot("vm01", "snap1")
+
+    @staticmethod
+    def _xml(overlays: dict, saved: dict, state: str = "running",
+             inactive: dict | None = None, memory: Path | None = None) -> str:
+        """A snapshot's XML: *overlays* the external ``<disks>`` it records,
+        *saved* the disks of its ``<domain>``, *inactive* those of its
+        ``<inactiveDomain>``."""
+        def domain(tag, disks):
+            return (f"<{tag}><devices>" + "".join(
+                f"<disk type='file' device='disk'><source file='{p}'/>"
+                f"<target dev='{t}' bus='virtio'/></disk>"
+                for t, p in disks.items()) + f"</devices></{tag}>")
+        return ("<domainsnapshot><name>snap1</name>"
+                f"<state>{state}</state>"
+                + (f"<memory file='{memory}'/>" if memory else "")
+                + "<disks>" + "".join(
+                    f"<disk name='{t}' snapshot='external'>"
+                    f"<source file='{p}'/></disk>"
+                    for t, p in overlays.items()) + "</disks>"
+                + domain("domain", saved)
+                + (domain("inactiveDomain", inactive) if inactive else "")
+                + "</domainsnapshot>")
+
+    @staticmethod
+    def _touch(path: Path) -> Path:
+        path.write_bytes(b"x")
+        return path
+
+    def test_reports_a_missing_image_a_revert_builds_on(
+            self, sm: SnapshotManager, tmp_path: Path):
+        """A revert lays a new overlay over each disk's source in the
+        definition the snapshot saved: with that gone it fails, whatever the
+        snapshot's own overlay (#287 left such a snapshot looking valid)."""
+        overlay = self._touch(tmp_path / "vm01.snap1")
+        base = tmp_path / "vm01.qcow2"
+        ok, errors = self._validate(
+            sm, self._xml({"vda": overlay}, {"vda": base}))
         assert ok is False
-        assert any("disk overlay missing" in e for e in errors)
+        assert errors == [f"disk image missing: {base} "
+                          f"(a revert builds vda on it)"]
+
+    def test_the_overlay_its_take_made_need_not_be_there(
+            self, sm: SnapshotManager, tmp_path: Path):
+        """No revert to it reads it. libvirt's delete of a child taken on it
+        that is not current deletes it and leaves this record (#289)."""
+        base = self._touch(tmp_path / "vm01.qcow2")
+        ok, errors = self._validate(sm, self._xml(
+            {"vda": tmp_path / "vm01.snap1"}, {"vda": base}))
+        assert (ok, errors) == (True, [])
+
+    def test_a_disk_only_snapshot_is_checked_against_its_inactive_definition(
+            self, sm: SnapshotManager, tmp_path: Path):
+        """libvirt reverts one that saved no memory from its
+        ``<inactiveDomain>`` when it has one (qemuSnapshotRevertInactive),
+        and one that did from its ``<domain>``."""
+        live = self._touch(tmp_path / "vm01.qcow2")
+        persistent = tmp_path / "vm01.other"
+        overlays = {"vda": self._touch(tmp_path / "vm01.snap1")}
+        disk_only = self._xml(overlays, {"vda": live}, state="disk-snapshot",
+                              inactive={"vda": persistent})
+        running = self._xml(overlays, {"vda": live},
+                            inactive={"vda": persistent})
+
+        assert self._validate(sm, disk_only) == (
+            False, [f"disk image missing: {persistent} "
+                    f"(a revert builds vda on it)"])
+        assert self._validate(sm, running) == (True, [])
 
     def test_all_present_is_valid(self, sm: SnapshotManager, tmp_path: Path):
-        mem = tmp_path / "m.raw"
-        mem.write_bytes(b"x")
-        overlay = tmp_path / "o.qcow2"
-        overlay.write_bytes(b"x")
-        xml = (
-            "<domainsnapshot>"
-            f"<memory file='{mem}'/>"
-            f"<disks><disk name='vda' snapshot='external'>"
-            f"<source file='{overlay}'/></disk></disks>"
-            "</domainsnapshot>"
-        )
-
-        def fake(*args, **_kwargs):
-            if args[0] == "snapshot-info":
-                return _result(ok=True)
-            return _result(stdout=xml)
-
-        with patch.object(sm.virsh, "execute", side_effect=fake):
-            ok, errors = sm.validate_snapshot("vm01", "snap1")
+        mem = self._touch(tmp_path / "m.raw")
+        overlay = self._touch(tmp_path / "o.qcow2")
+        base = self._touch(tmp_path / "vm01.qcow2")
+        ok, errors = self._validate(sm, self._xml(
+            {"vda": overlay}, {"vda": base}, memory=mem))
         assert ok is True
         assert errors == []
 
@@ -3570,12 +3614,27 @@ class _RevertingLibvirt:
       snapshot records into the image under it, which the domain then
       reads (``qemuSnapshotDeleteExternalPrepare``) -- and fails "failed to
       find parent disk source in backing chain" for one the domain no
-      longer reads. Of a leaf that is not current it merges nothing and
-      deletes the image the leaf's saved definition is built on, where an
-      older snapshot records that disk (``qemuSnapshotDiscardExternal``).
-      Either way the parent's ``<revertDisks>``, if it has any, become its
-      ``<disks>`` (``qemuSnapshotDeleteUpdateParent``), and a current one
-      leaves its parent current (``qemuSnapshotDiscardMetadata``). With
+      longer reads. Of one that is not current (#289):
+
+      - a leaf merges nothing and deletes the image its saved definition is
+        built on, where an older snapshot records that disk
+        (``qemuSnapshotDiscardExternal``), though that older one's
+        ``<disks>`` still name it;
+      - one with a child, in the active chain, merges the image the child
+        was taken on into the one it was taken on itself
+        (``qemuSnapshotExternalGetSnapDiskSrc``), never reading its own
+        ``<disks>``: the image above in the domain's chain, and the saved
+        disks of its descendants out of that chain that were built on it,
+        are rebased (``qemuSnapshotGetDisksWithBackingStore``), and the
+        saved definitions naming it name the image under it
+        (``qemuSnapshotDeleteUpdateDisks``);
+      - one with more children, or out of the active chain, is refused
+        (``qemuSnapshotDeleteValidate``).
+
+      Either way its children become its parent's, the parent's
+      ``<revertDisks>``, if it has any, become its ``<disks>``
+      (``qemuSnapshotDeleteUpdateParent``), and a current one leaves its
+      parent current (``qemuSnapshotDiscardMetadata``). With
       :attr:`native_delete` off it refuses external snapshots, as libvirt
       before 9.0 did, and ``blockcommit`` is run;
     * QMP ``query-block`` tells what qemu holds in the drive
@@ -3892,25 +3951,97 @@ class _RevertingLibvirt:
         self.commits.append((target, overlay, below))
         self.live[target] = self.config[target] = below
 
+    def _ancestors(self, name: str | None) -> list[str]:
+        """*name*'s parent, its parent's, and so on."""
+        found = []
+        while name is not None and self.snapshots[name]["parent"]:
+            name = self.snapshots[name]["parent"]
+            found.append(name)
+        return found
+
+    def _descendants(self, name: str) -> list[str]:
+        return [n for n in self.snapshots if name in self._ancestors(n)]
+
+    def _chain(self, path: str | None) -> list[str]:
+        """*path* and the images under it."""
+        chain = []
+        while path is not None:
+            chain.append(path)
+            path = self.backing.get(path, (None, None))[1]
+        return chain
+
     def _records_disk_above(self, name: str, target: str) -> bool:
         """Whether a snapshot older than *name* records *target* as
         external (``qemuSnapshotFindParentSnapForDisk``)."""
-        parent = self.snapshots[name]["parent"]
-        while parent is not None:
-            if self.snapshots[parent]["disks"].get(target):
-                return True
-            parent = self.snapshots[parent]["parent"]
-        return False
+        return any(self.snapshots[a]["disks"].get(target)
+                   for a in self._ancestors(name))
+
+    def _refusal(self, name: str, children: list[str]) -> str | None:
+        """Why libvirt refuses to delete the external snapshot *name*, if
+        it does (``qemuSnapshotDeleteValidate``)."""
+        if children and name == self.current:
+            return ("deletion of active external snapshot that is not a "
+                    "leaf snapshot is not supported")
+        if children and name not in self._ancestors(self.current):
+            return ("deletion of non-leaf external snapshot that is not in "
+                    "active chain is not supported")
+        if len(children) > 1:
+            return ("deletion of external disk snapshot with multiple "
+                    "children snapshots not supported")
+        return None
+
+    def _merge(self, name: str, target: str, top: str, below: str) -> None:
+        """Delete *name*, not current, by committing *top*, the image its
+        child was taken on, into *below*, the one it was taken on, and
+        deleting *top* (``qemuSnapshotDiscardExternal``)."""
+        self.commits.append((target, top, below))
+        chain = self._chain(self.disks_now()[target])
+        above = chain.index(top) - 1
+        rebased = {chain[above]} if above >= 0 else set()
+        active = {self.current, *self._ancestors(self.current)}
+        for other in self._descendants(name):
+            saved = self.snapshots[other]["domain"].get(target)
+            if other not in active and self.backing.get(
+                    saved, (None, None))[1] == top:
+                rebased.add(saved)
+        for image in rebased:
+            self.backing[image] = (self.backing[image][0], below)
+        for other in self._descendants(name):
+            if self.snapshots[other]["domain"].get(target) == top:
+                self.snapshots[other]["domain"][target] = below
+        Path(top).unlink(missing_ok=True)
 
     def _delete(self, name: str, metadata: bool):
         snap = self.snapshots[name]
-        assert not any(s["parent"] == name for s in self.snapshots.values())
+        children = [n for n, s in self.snapshots.items() if s["parent"] == name]
         records = {t: p for t, p in snap["disks"].items() if p}
         if not metadata and not self.native_delete:
             return _result(ok=False, stderr=(
                 "error: unsupported configuration: deletion of 1 "
                 "external disk snapshots not supported yet"))
-        if not metadata and name == self.current:
+        refusal = None if metadata else self._refusal(name, children)
+        if refusal:
+            return _result(ok=False, stderr=(
+                f"error: Failed to delete snapshot {name}\nerror: "
+                f"unsupported configuration: {refusal}"))
+        if not metadata and children:
+            # what its one child was taken on, not what it records
+            child = self.snapshots[children[0]]
+            merges = []
+            for target in records:
+                top, below = child["domain"][target], snap["domain"][target]
+                if top not in self._chain(self.disks_now()[target]):
+                    return _result(ok=False, stderr=(
+                        f"error: invalid argument: could not find image "
+                        f"'{top}' in chain for '{self.disks_now()[target]}'"))
+                if self.backing[top][1] != below:
+                    return _result(ok=False, stderr=(
+                        "error: operation failed: snapshot VM disk source "
+                        "and parent disk source are not the same"))
+                merges.append((target, top, below))
+            for target, top, below in merges:
+                self._merge(name, target, top, below)
+        elif not metadata and name == self.current:
             if any(self.disks_now()[t] != p for t, p in records.items()):
                 return _result(ok=False, stderr=(
                     f"error: Failed to delete snapshot {name}\nerror: "
@@ -3925,6 +4056,8 @@ class _RevertingLibvirt:
             for target in records:
                 if self._records_disk_above(name, target):
                     Path(snap["domain"][target]).unlink(missing_ok=True)
+        for child in children:
+            self.snapshots[child]["parent"] = snap["parent"]
         parent = self.snapshots.get(snap["parent"])
         if parent is not None and parent["revert_disks"]:
             parent["disks"], parent["revert_disks"] = (
@@ -4678,6 +4811,193 @@ class TestARestoreKeepsWhatTheCurrentSnapshotRecords:
         assert f"{ran_on} " in copies and f"{taken} " not in copies
         assert ran_on in " ".join(str(c.args[0])
                                   for c in warning.call_args_list)
+
+
+class TestDeletingASnapshotThatIsNotCurrent:
+    """#289: libvirt's delete of a leaf that is not current merges nothing
+    and deletes the image the leaf's saved definition is built on
+    (qemuSnapshotDiscardExternal) -- its parent's take-time overlay, when it
+    was taken on that. A take after a restore of the parent has cleared the
+    parent's ``<revertDisks>``, so nothing moves into its ``<disks>``
+    (qemuSnapshotDeleteUpdateParent), which still name the deleted file.
+
+    The parent was then refused as broken, though nothing needs that file:
+    a revert to the parent builds on the definition it saved
+    (qemuSnapshotRevertExternalPrepare), libvirt's delete of it merges what
+    its remaining child was taken on (qemuSnapshotExternalGetSnapDiskSrc),
+    and a child taken after a restore is built on the restore's overlay.
+    Every snapshot left stays valid and restorable."""
+
+    @staticmethod
+    def _delete(sm, vm, name: str) -> bool:
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            return sm.delete_snapshot(vm.VM, name)
+
+    _restores = staticmethod(
+        TestARestoreKeepsWhatTheCurrentSnapshotRecords._restores)
+
+    @staticmethod
+    def _all_valid(sm, vm) -> bool:
+        return _validity(sm, vm) == {name: (True, []) for name in vm.snapshots}
+
+    @staticmethod
+    def _branched(sm, vm) -> list[str]:
+        """take s1, take s2, restore s1, take s3: s2 is a leaf that is not
+        current, built on s1's take-time overlays, which are returned."""
+        vm.take("s1")
+        vm.take("s2")
+        assert _restore(sm, vm, "s1") is True
+        vm.take("s3")
+        taken = [p for p in vm.snapshots["s1"]["disks"].values() if p]
+        assert vm.snapshots["s1"]["revert_disks"] is None
+        assert vm.snapshots["s2"]["domain"]["vda"] in taken
+        return taken
+
+    def test_deleting_a_leaf_in_another_branch_keeps_its_parent_valid(
+            self, sm, tmp_path):
+        """The issue's sequence: take s1, take s2, restore s1, take s3,
+        delete s2. s1 failed validation for the overlay libvirt deleted, and
+        its restore was refused. A child taken after restoring it is built
+        on the restore's overlay."""
+        vm = _RevertingLibvirt(tmp_path)
+        taken = self._branched(sm, vm)
+
+        assert self._delete(sm, vm, "s2") is True
+
+        assert not any(os.path.exists(p) for p in taken)
+        assert vm.snapshots["s1"]["disks"]["vda"] in taken
+        assert self._all_valid(sm, vm)
+        self._restores(sm, vm, "s1", "s3", "s1")
+        vm.take("s4")
+        assert vm.snapshots["s4"]["domain"]["vda"] not in taken
+        self._restores(sm, vm, "s3", "s4", "s1")
+
+    def test_a_leaf_deeper_in_the_tree(self, sm, tmp_path):
+        """take s1, s2, s3, restore s2, take s4, delete s3: s2's take-time
+        overlay goes, with s1's still under s2's saved definition."""
+        vm = _RevertingLibvirt(tmp_path)
+        for name in ("s1", "s2", "s3"):
+            vm.take(name)
+        assert _restore(sm, vm, "s2") is True
+        vm.take("s4")
+        taken = vm.snapshots["s2"]["disks"]["vda"]
+
+        assert self._delete(sm, vm, "s3") is True
+
+        assert not os.path.exists(taken)
+        assert self._all_valid(sm, vm)
+        self._restores(sm, vm, "s2", "s4", "s1", "s2")
+
+    def test_the_parent_made_current_again_by_deleting_the_other_child(
+            self, sm, tmp_path):
+        """... delete s2, then delete s3, the current one: libvirt makes s1
+        current, still recording the overlay that is gone, which the next
+        revert then has nothing of to delete."""
+        vm = _RevertingLibvirt(tmp_path)
+        taken = self._branched(sm, vm)
+        assert self._delete(sm, vm, "s2") is True
+
+        assert self._delete(sm, vm, "s3") is True
+
+        assert vm.current == "s1"
+        assert vm.snapshots["s1"]["disks"]["vda"] in taken
+        assert self._all_valid(sm, vm)
+        self._restores(sm, vm, "s1", "s1")
+
+    def test_with_every_snapshot_disk_only(self, sm, tmp_path):
+        """Taken of the shut-off VM, every snapshot is disk-only: libvirt's
+        delete needs no running domain for a leaf, and a revert is its
+        inactive revert, which builds on the same saved definition."""
+        vm = _RevertingLibvirt(tmp_path, state="shutoff")
+        taken = self._branched(sm, vm)
+
+        assert self._delete(sm, vm, "s2") is True
+
+        assert not any(os.path.exists(p) for p in taken)
+        assert self._all_valid(sm, vm)
+        self._restores(sm, vm, "s1", "s3", "s1")
+        assert vm.active is False
+
+    def test_a_data_disk_with_its_overlays_in_a_disk_snapshot_dir(
+            self, sm, tmp_path):
+        fast = tmp_path / "fast"
+        vm = _RevertingLibvirt(tmp_path, data_disk=True, disk_dir=fast)
+        taken = self._branched(sm, vm)
+        assert len(taken) == 2
+        assert {os.path.dirname(p) for p in taken} == {str(fast)}
+
+        assert self._delete(sm, vm, "s2") is True
+
+        assert not any(os.path.exists(p) for p in taken)
+        assert self._all_valid(sm, vm)
+        self._restores(sm, vm, "s1", "s3", "s1")
+        assert not list(tmp_path.rglob("*.preserve*"))
+
+    def test_deleting_the_parent_afterwards_merges_what_its_child_was_taken_on(
+            self, sm, tmp_path):
+        """libvirt's delete of s1, left with one child, commits the image s3
+        was taken on -- the restore's overlay -- into the one s1 was taken
+        on, and never reads s1's take-time overlay."""
+        vm = _RevertingLibvirt(tmp_path)
+        self._branched(sm, vm)
+        assert self._delete(sm, vm, "s2") is True
+        ran_on = vm.snapshots["s3"]["domain"]["vda"]
+        base = vm.snapshots["s1"]["domain"]["vda"]
+
+        assert self._delete(sm, vm, "s1") is True
+
+        assert ("vda", ran_on, base) in vm.commits
+        assert not os.path.exists(ran_on)
+        assert vm.snapshots["s3"]["parent"] is None
+        assert vm.snapshots["s3"]["domain"]["vda"] == base
+        self._restores(sm, vm, "s3", "s3")
+
+    def test_a_buried_one_in_the_active_chain_is_merged_into_the_one_under(
+            self, sm, tmp_path):
+        """take s1, s2, s3, delete s2: the image s3 was taken on, s2's
+        overlay, is committed into s1's, which s3 is then built on. Nothing
+        is left recording a file that is gone."""
+        vm = _RevertingLibvirt(tmp_path)
+        for name in ("s1", "s2", "s3"):
+            vm.take(name)
+        s1, s2 = (vm.snapshots[n]["disks"]["vda"] for n in ("s1", "s2"))
+
+        assert self._delete(sm, vm, "s2") is True
+
+        assert vm.commits == [("vda", s2, s1)] and not os.path.exists(s2)
+        assert vm.snapshots["s3"]["parent"] == "s1"
+        assert vm.snapshots["s3"]["domain"]["vda"] == s1
+        self._restores(sm, vm, "s1", "s3")
+
+    def test_a_vm_whose_records_name_cdrom_overlays_keeps_its_iso(
+            self, sm, tmp_path):
+        """Restored before #286, with the CDROM put back on its ISO by hand,
+        s1 and s2 both record a CDROM overlay and s2's saved CDROM is the
+        ISO: libvirt's delete of s2, not current, would delete the ISO
+        itself. The records are rewritten first (#286), so it touches no
+        CDROM image, and s1 stays valid."""
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        execute, shell = _restoring(None, vm)
+        with execute, shell:
+            vm._revert("s1")
+            vm.live["sda"] = vm.config["sda"] = vm.medium = vm.iso
+            vm.take("s2")
+            vm._revert("s2")
+            vm._revert("s1")
+        vm.take("s3")
+        assert vm.snapshots["s1"]["disks"]["sda"]
+        assert vm.snapshots["s2"]["disks"]["sda"]
+        assert vm.snapshots["s2"]["domain"]["sda"] == vm.iso
+
+        assert self._delete(sm, vm, "s2") is True
+
+        assert Path(vm.iso).read_bytes() == b"the ISO"
+        assert not any(c[0] == "sda" for c in vm.commits)
+        assert self._all_valid(sm, vm)
+        self._restores(sm, vm, "s1", "s3")
+        assert Path(vm.iso).read_bytes() == b"the ISO"
 
 
 class TestFlattenCdromOverlays:
