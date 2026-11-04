@@ -1205,7 +1205,11 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   is the shortcut for "all VMs to latest".
 - **A restore backs up the overlays the revert deletes, and refuses if it
   cannot** (out of space, an unreadable snapshot chain, a stray
-  `<overlay>.preserve` already there). A running guest is paused while they
+  `<overlay>.preserve` already there). Those are the target's, every newer
+  snapshot's, and whatever the current snapshot records, wherever it is in
+  the chain: after `snapshot delete` of the current one its parent is
+  current, and a newer snapshot is built on its overlays (#287). A running
+  guest is paused while they
   are copied. If the revert itself fails the guest is deliberately left
   paused — check `virsh domstate` first. Do not name a snapshot
   `<something>.preserve`.

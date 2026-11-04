@@ -111,7 +111,9 @@ class TestSnapshotOverlayPreservation057eb7d:
             sm, "_strict_overlay_inventory",
             return_value=({"s1": [str(a)], "s2": [str(b)], "s3": [str(c)]},
                           ["s1", "s2", "s3"]),
-        ), patch.object(sm.virsh, "execute_shell", side_effect=copying):
+        ), patch.object(sm, "_overlays_the_revert_deletes",
+                        return_value=[str(c)]), \
+                patch.object(sm.virsh, "execute_shell", side_effect=copying):
             sm._preserve_snapshot_overlays("vm01", "s1")
 
         assert len(calls) == 1
