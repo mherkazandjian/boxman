@@ -7,7 +7,7 @@ CLI reads this directory, and the project's own tooling does not load it.
 | File | Audience | Covers |
 |---|---|---|
 | `boxman-user.md` | Operating boxman | The `conf.yml` schema, the CLI, libvirt resource naming, the networking model, templates and clone identity, ISO/PXE boot, OCI images, container clusters, snapshots and storage reclaim, and the failure modes that look like bugs but are not |
-| `boxman-developer.md` | Working on boxman | Repository layout, the runtime/provider abstractions, the manager mixins, the clone identity pass, error, sudo and destructive-operation conventions, build and test workflow (including the disposable test-runner VM), and the CI gate |
+| `boxman-developer.md` | Working on boxman | Repository layout, the runtime/provider abstractions, the manager mixins, the clone identity pass, error, sudo and destructive-operation conventions, the libvirt snapshot behaviour the code is built on, build and test workflow (including the disposable test-runner VM and the libvirt test doubles), and the CI gate |
 
 ## Installing
 
