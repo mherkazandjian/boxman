@@ -337,7 +337,7 @@ template time:
 | `boxman import-image --uri <file://\|http(s)://> [--name N] [--directory D] [--provider libvirt]` | Import a VM from a `manifest.json` package (XML + qcow2), local or remote. Strict schema validation; every failure exits 2. |
 | `boxman image push <ref> --qcow2 <path> [--metadata vmimage.json]` | Push a qcow2 to an OCI registry via `oras`. |
 | `boxman image inspect <ref>` | Print an OCI image's manifest, `kind`, and `vmimage.json` metadata without downloading the disk. |
-| `boxman snapshot take [--name N] [-m DESC] [--vms a,b] [--cluster c] [--compress-memory] [--force]` | Snapshot in parallel (default name = UTC timestamp). `--force` (aliases `--overwrite`/`--replace`) clears a colliding name and re-takes. |
+| `boxman snapshot take [--name N] [-m DESC] [--vms a,b] [--cluster c] [--compress-memory] [--force]` | Snapshot in parallel (default name = UTC timestamp). A running or paused VM's snapshot saves memory and disks; a shut-off VM's is disk-only; a VM `boxman down` saved is refused (run `boxman up` first). `--force` (aliases `--overwrite`/`--replace`) clears a colliding name and re-takes. |
 | `boxman snapshot {list\|log\|restore\|delete\|collapse}` | List / git-log-style graph / restore / delete / merge-newer-into-head. |
 | `boxman restore` | Shortcut: restore all VMs to their latest snapshot. |
 | `boxman storage {df\|trim\|compact\|optimize\|compress-snapshots}` | qcow2 space reclaim and snapshot-memory compression. |
@@ -1126,7 +1126,12 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
 - **`shared_folders`** (virtiofs): hot-attached with a persistent fallback to
   config-only on next boot. Hotplug needs QEMU 6.2+ / libvirt 8.6+; older hosts
   fall back gracefully.
-- **`cdroms`**: swapping the media of an existing drive works live. Adding or
+- **`cdroms`**: swapping the media of an existing drive works live (through
+  `update-device` with the ISO as a raw image, so a drive a snapshot restore
+  left on a qcow2 overlay of its ISO is never put behind the overlay's
+  driver type). A drive is compared by the image at the bottom of its
+  backing chain, so one reading a declared ISO through such an overlay is
+  the declared drive, not one to remove and attach anew. Adding or
   removing a drive on a running VM changes only the persistent definition
   (libvirt cannot hot-plug IDE/SATA): it appears at the next boot, or now with
   `--restart`. Without `target`, a new drive takes the first free target on a
@@ -1157,14 +1162,34 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
 ### Snapshots
 
 - `snapshot take` snapshots selected VMs in parallel (default name = UTC
-  timestamp); overlay disks are preserved. `--compress-memory` zstd-compresses
-  the memory `.raw` (~70% smaller, transparently decompressed on restore).
+  timestamp); overlay disks are preserved. What a snapshot holds follows the
+  VM's state: a running or paused VM's saves its memory with its disks (a
+  paused VM stays paused, and a restore brings it back paused); a shut-off
+  VM's is disk-only — there is no memory to save, and restoring it leaves
+  the VM shut off for `boxman up` to start. A VM holding a managed save
+  (after `boxman down`) is refused up front, before anything is taken or
+  `--force` removes anything: the snapshot would hold its disks but not
+  the saved memory, which the next start would restore against the disks
+  as they were before. Run `boxman up` first, or discard the saved memory
+  with `virsh managedsave-remove <domain>` and take a disk-only snapshot.
+  One VM in that state refuses the whole take, as does a VM whose state
+  cannot be read. `--compress-memory` zstd-compresses the memory `.raw`
+  (~70% smaller, transparently decompressed on restore); on a disk-only
+  snapshot it is noted, not failed.
   `--force` clears a colliding name or leftover files and re-takes; a
   leftover any domain uses, or another domain's snapshot records as its
-  memory image (matched by path or by identity), refuses it. A take never
+  memory image (matched by path or by identity), refuses it. The leftovers
+  are asked about *before* the colliding snapshot is deleted, so a refusal
+  leaves it as it was (a restore leaves exactly such a file: the overlay it
+  put back, under the name a retake writes). A take never
   writes its memory image over a file already there (a leftover, or another
   VM's image under the same name — VM `web`'s snapshot `replica_snapshot_s1`
   and VM `web_snapshot_replica`'s `s1` name one file): it refuses.
+- Before every take, each CD-ROM is put back on its ISO (see restore,
+  below): a snapshot taken with a CD-ROM on a qcow2 overlay of its ISO
+  saves it so, and every restore of it then stacks another overlay on
+  that one. A put-back that fails is warned about and does not stop the
+  take.
 - A cluster's memory images (`<vm>_snapshot_<name>.raw`, or `.raw.zst`)
   go to its `memory_snapshot_dir` when it sets one (an absolute path, or
   `~/…`; made `0700` on first use, but never by creating a missing cluster
@@ -1220,13 +1245,40 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   new overlays in its place) is put back all the same and named in a
   warning: nothing removes it, so remove it by hand once no other domain
   uses it.
+- Restoring a disk-only snapshot (one taken of a shut-off VM) leaves the VM
+  shut off; restoring one taken of a paused VM brings it back paused.
+- **CD-ROMs after a restore.** libvirt's revert builds a qcow2 overlay on
+  every drive with media, the CD-ROMs included, whatever the snapshot says
+  of them: `<ISO stem>.<epoch>` beside the ISO (in a directory that may not
+  be boxman's), the CD-ROM moved onto it, and the overlay recorded in the
+  restored snapshot. After a revert that worked boxman undoes it: each
+  CD-ROM reads its ISO again (live and persistent on a running VM, the
+  persistent definition alone on a shut-off one), no snapshot of the VM
+  records a CD-ROM overlay any more, and the overlays nothing needs are
+  removed, top first — never the ISO, never one another domain uses or a
+  snapshot still names. That is housekeeping: what it cannot do is warned
+  about, not failed, and the next `snapshot take` tries again. Left in
+  place, such a record makes libvirt's own delete block-commit the overlay
+  into the ISO, opened read-write, and a record of a file that is gone fails
+  validation. CD-ROM overlays are not copied by the overlay backup (they
+  hold nothing). A VM holding a managed save is left alone here: its next
+  start restores the definition saved with it. On a guest a revert started
+  from a memory image, libvirt may not know the drive has a tray
+  (`Tray of device '…' is not open`); the tray is opened through QMP with
+  the guest paused, and closed again if the change fails.
 - A VM holding a managed save (after `boxman down`) cannot be reverted to a
   snapshot that captured no memory; the restore refuses up front. Run `boxman
   up` first, or discard the saved memory with `virsh managedsave-remove`.
 - `snapshot list` is the raw libvirt list; `snapshot log [-n N] [--reverse]
   [--json] [--no-graph]` is a git-log-style aggregated view with an ASCII graph
-  and a `← current` marker. Prefer `log` for a human overview.
-- `snapshot delete --name N` deletes a named snapshot.
+  and a `← current` marker. Prefer `log` for a human overview. Both mark a
+  snapshot that saved no memory `(disk only)` — `log` as
+  `(disk only: vm1,vm2)` when only some VMs' are — since restoring it
+  leaves those VMs shut off; `log --json` lists them in `disk_only_for`.
+- `snapshot delete --name N` deletes a named snapshot. It first rewrites
+  every record of a CD-ROM overlay in the VM's snapshots (libvirt's own
+  delete would commit one into the ISO) and refuses when the snapshots
+  cannot be read, or the deleted snapshot's record cannot be rewritten.
 - `snapshot collapse --to N [--no-shutdown] [--dry-run] [-y]` merges every
   snapshot *newer* than `N` into the live disk head to reclaim space; `N` and
   older stay revertable. Offline-only: it auto-shuts running VMs down unless
@@ -1322,6 +1374,22 @@ A shut-off VM has a `<workdir>/<vm>.save` from an older boxman. Starting it
 would discard that memory image, and restoring it unasked could apply a stale
 image to a disk that has moved on. Use it with `boxman control start --restore
 --vms <vm>`, or delete the file, then `boxman up`.
+
+### `refusing to take snapshot '…': a VM that holds managed saved state …`
+
+One of the selected VMs was saved by `boxman down` (or `control save`). A
+snapshot of it would hold its disks but not the saved memory, and the next
+start would restore that memory against disks as they were before the
+snapshot. Nothing was taken for any VM. Run `boxman up` first and take the
+snapshot of the running VM, or `virsh managedsave-remove <domain>` and take
+a disk-only snapshot of the shut-off VM.
+
+### `memory state cannot be saved with offline or disk-only snapshot`
+
+libvirt refusing a memory spec for a shut-off VM. Current boxman never asks
+for one: a shut-off VM gets a disk-only snapshot. Seeing this means an older
+boxman, or a VM that shut down between the state check and the take; run
+`snapshot take` again.
 
 ### `refusing to create the disk image <path>: a file is already there`
 
