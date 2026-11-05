@@ -1698,6 +1698,31 @@ class SnapshotManager:
         state = info.get('state')
         return state is not None and state not in ('running', 'paused')
 
+    def state_and_creation_time(self, vm_name: str, snapshot_name: str
+                                ) -> tuple[str | None, int | None]:
+        """
+        The state snapshot *snapshot_name* of *vm_name* recorded its domain
+        in, and when it was taken, in Unix epoch seconds.
+
+        The state is the one a revert to it leaves the domain in, as boxman
+        reverts (no ``--running`` or ``--paused``): 'running' or 'paused'
+        for one that saved the guest's memory, 'shutoff' or 'disk-snapshot'
+        for one that did not (:meth:`_holds_no_memory`). Read after a
+        revert, to set the guest's clock (#275). Either is None where the
+        XML does not hold it, both where it cannot be read.
+        """
+        result = self.virsh.execute(
+            "snapshot-dumpxml", vm_name, snapshot_name, warn=True)
+        if not result.ok:
+            return None, None
+        try:
+            root = ET.fromstring(result.stdout)
+        except ET.ParseError:
+            return None, None
+        state = (root.findtext("state") or "").strip() or None
+        created = (root.findtext("creationTime") or "").strip()
+        return state, int(created) if created.isdigit() else None
+
     @classmethod
     def _definition_a_revert_builds_on(cls, root):
         """

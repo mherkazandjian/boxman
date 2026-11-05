@@ -24,6 +24,7 @@ from .destroy_vm import DestroyVM, shutdown_and_wait
 from .disk import DiskManager
 from .disk_cleanup import FilesInUse, remove_vm_disks
 from .disk_ownership import detach_disk, forget_disk
+from .guest_clock import set_guest_clock
 from .import_image import ImageImporter
 from .install_media import InstallMediaOutcome, eject_finished_install_media
 from .iso_boot_vm import IsoBootVM
@@ -1875,6 +1876,11 @@ class LibVirtSession(SessionConfigMixin):
                 self.logger.info(f"vm {vm_name} is already running")
                 return True
 
+            # a domain holding a managed save comes back from it on start,
+            # its clock behind by as long as it was saved (#275)
+            saved = self.has_managed_save(vm_name) is True
+            saved_at = self._managed_save_time(virsh, vm_name) if saved else None
+
             # try to start the VM
             result = virsh.execute("start", vm_name)
 
@@ -1887,6 +1893,10 @@ class LibVirtSession(SessionConfigMixin):
 
             if "running" in verify_result.stdout:
                 self.logger.status(f"vm {vm_name} started successfully")
+                if saved:
+                    set_guest_clock(virsh, vm_name, stopped_at=saved_at,
+                                    came_back_from="its managed save",
+                                    logger=self.logger)
                 return True
             else:
                 self.logger.error(
@@ -2621,8 +2631,60 @@ class LibVirtSession(SessionConfigMixin):
             self.logger.info(f"restoring latest snapshot '{snapshot_name}' for vm {vm_name}")
         else:
             self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
-        return snapshot_mgr.snapshot_restore(
+        restored = snapshot_mgr.snapshot_restore(
             vm_name, snapshot_name, paths_in_use=self.disk_paths_in_use)
+        if restored:
+            self._set_clock_after_revert(snapshot_mgr, vm_name, snapshot_name)
+        return restored
+
+    def _set_clock_after_revert(self, snapshot_mgr: SnapshotManager,
+                                vm_name: str, snapshot_name: str) -> None:
+        """
+        Set the guest's clock from the host's after a revert to a snapshot
+        that saved its memory (#275).
+
+        The guest carries on from the instant the snapshot was taken, so
+        its clock is behind by the snapshot's age. A snapshot that saved no
+        memory leaves the VM shut off, and its guest reads the time when it
+        boots: nothing to do. One taken while paused comes back paused, and
+        its clock is set when boxman resumes it (:meth:`resume_vm`).
+        Housekeeping: nothing here fails the restore.
+        """
+        try:
+            state, taken_at = snapshot_mgr.state_and_creation_time(
+                vm_name, snapshot_name)
+            if state == 'paused':
+                self.logger.info(
+                    f"vm {vm_name} came back paused, as snapshot "
+                    f"'{snapshot_name}' was taken; boxman sets its clock "
+                    f"when it resumes it (boxman control resume, boxman up)")
+                return
+            if state is not None and state != 'running':
+                return
+            virsh = VirshCommand(provider_config=self.provider_config)
+            if state is None and not self._is_running(virsh, vm_name):
+                # the snapshot could not be read: only a running guest says
+                # it came back from memory
+                return
+        except Exception as exc:
+            self.logger.warning(
+                f"could not tell whether vm {vm_name} came back from saved "
+                f"memory, so its clock was not set from the host's "
+                f"({type(exc).__name__}: {exc})")
+            return
+        set_guest_clock(virsh, vm_name, stopped_at=taken_at,
+                        came_back_from=f"snapshot '{snapshot_name}'",
+                        logger=self.logger)
+
+    @staticmethod
+    def _is_running(virsh, vm_name: str) -> bool:
+        """
+        Whether *vm_name* is running, asked by name: ``domstate`` prints a
+        translated state name, domain names are not translated (see
+        ``SnapshotManager._pause_for_backup``).
+        """
+        listed = virsh.execute("list", "--state-running", "--name", warn=True)
+        return listed.ok and vm_name in listed.stdout.split('\n')
 
     def eject_cdrom(self, vm_name: str) -> None:
         """
@@ -2813,6 +2875,11 @@ class LibVirtSession(SessionConfigMixin):
             verify_result = virsh.execute("domstate", vm_name)
             if "running" in verify_result.stdout:
                 self.logger.info(f"the vm {vm_name} resumed successfully")
+                # its clock stood still while it was paused (#275). The
+                # agent's channel stays open through a pause, so an agent
+                # that does not answer at once is not coming: ask once.
+                set_guest_clock(virsh, vm_name, came_back_from="a pause",
+                                wait=0, logger=self.logger)
                 return True
             else:
                 self.logger.error(
@@ -2881,6 +2948,32 @@ class LibVirtSession(SessionConfigMixin):
                 f"could not remove the consumed save image {quarantined}: "
                 f"{exc}. It is out of the restore path and cannot be applied "
                 f"again; remove it by hand to reclaim the space.")
+
+    #: where libvirt's system instance keeps managed save images
+    _MANAGED_SAVE_DIR = "/var/lib/libvirt/qemu/save"
+
+    def _managed_save_time(self, virsh, vm_name: str) -> float | None:
+        """
+        When *vm_name*'s managed save was written, in Unix epoch seconds:
+        its image's mtime, read before the start that consumes it, for the
+        warning when its clock cannot be set (#275).
+
+        None when that cannot be read: under any URI but
+        ``qemu:///system``, whose images alone are kept where this looks,
+        or when ``stat`` fails there. Its directories are installed 0751,
+        searchable by anyone, so the ``stat`` needs no root even under
+        ``use_sudo: false``.
+        """
+        if self.provider_config.get('uri', 'qemu:///system') != 'qemu:///system':
+            return None
+        path = f"{self._MANAGED_SAVE_DIR}/{vm_name}.save"
+        try:
+            result = virsh.execute_shell(f"stat -c %Y {shlex.quote(path)}",
+                                         warn=True)
+        except Exception:
+            return None
+        stamp = str(result.stdout).strip() if result.ok else ''
+        return float(stamp) if stamp.isdigit() else None
 
     def _confirm_running(self, virsh, vm_name: str) -> bool:
         """Confirm *vm_name* actually reached the running state."""
@@ -3020,6 +3113,7 @@ class LibVirtSession(SessionConfigMixin):
                 return False
 
             if saved:
+                saved_at = self._managed_save_time(virsh, vm_name)
                 self.logger.info(
                     f"restoring the vm {vm_name} from managed save")
                 result = virsh.execute("start", vm_name, warn=True)
@@ -3028,7 +3122,12 @@ class LibVirtSession(SessionConfigMixin):
                         f"failed to restore the vm {vm_name}: "
                         f"{(result.stderr or '').strip()}")
                     return False
-                return self._confirm_running(virsh, vm_name)
+                if not self._confirm_running(virsh, vm_name):
+                    return False
+                set_guest_clock(virsh, vm_name, stopped_at=saved_at,
+                                came_back_from="its managed save",
+                                logger=self.logger)
+                return True
 
             save_path = os.path.join(
                 os.path.expanduser(workdir), f"{vm_name}.save")
@@ -3068,6 +3167,10 @@ class LibVirtSession(SessionConfigMixin):
             # has written to in the meantime. Consumption has to be recorded
             # durably, and the only durable record available here is the
             # file's absence from the path the restore looks at (#164 FB-3).
+            try:
+                saved_at = os.path.getmtime(save_path)
+            except OSError:
+                saved_at = None
             consuming_path = self._quarantine_save_file(save_path)
             if consuming_path is None:
                 return False
@@ -3093,7 +3196,12 @@ class LibVirtSession(SessionConfigMixin):
                 return False
 
             self._discard_quarantined_save(consuming_path)
-            return self._confirm_running(virsh, vm_name)
+            if not self._confirm_running(virsh, vm_name):
+                return False
+            set_guest_clock(virsh, vm_name, stopped_at=saved_at,
+                            came_back_from=f"the save file {save_path}",
+                            logger=self.logger)
+            return True
 
         except Exception as exc:
             self.logger.error(f"error restoring the vm {vm_name}: {exc}")

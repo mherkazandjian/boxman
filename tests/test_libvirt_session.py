@@ -412,40 +412,51 @@ class TestStartVM:
         first_call = mock_virsh.execute.call_args_list[0]
         assert first_call.args[0] == "domstate"
 
+    #: what the managed-save probe answers for a domain holding none: a
+    #: start that restores one sets the guest's clock after it (#275)
+    NO_MANAGED_SAVE = _result(stdout="\n")
+
     def test_starts_when_shut_off_and_verifies(self):
         s = _session({})
         mock_virsh = MagicMock()
         mock_virsh.execute.side_effect = [
             _result(stdout="shut off\n"),   # first domstate
+            self.NO_MANAGED_SAVE,           # list --with-managed-save
             _result(ok=True),               # start
             _result(stdout="running\n"),    # verify
         ]
         with patch("boxman.providers.libvirt.session.VirshCommand",
                    return_value=mock_virsh):
             assert s.start_vm("vm01") is True
+        assert [c.args[0] for c in mock_virsh.execute.call_args_list] == [
+            "domstate", "list", "start", "domstate"]
 
     def test_start_failure_returns_false(self):
         s = _session({})
         mock_virsh = MagicMock()
         mock_virsh.execute.side_effect = [
             _result(stdout="shut off\n"),
+            self.NO_MANAGED_SAVE,
             _result(ok=False, stderr="nope"),
         ]
         with patch("boxman.providers.libvirt.session.VirshCommand",
                    return_value=mock_virsh):
             assert s.start_vm("vm01") is False
+        assert mock_virsh.execute.call_args.args[0] == "start"
 
     def test_still_not_running_after_start_returns_false(self):
         s = _session({})
         mock_virsh = MagicMock()
         mock_virsh.execute.side_effect = [
             _result(stdout="shut off\n"),
+            self.NO_MANAGED_SAVE,
             _result(ok=True),
             _result(stdout="shut off\n"),  # verify still shut off
         ]
         with patch("boxman.providers.libvirt.session.VirshCommand",
                    return_value=mock_virsh):
             assert s.start_vm("vm01") is False
+        assert mock_virsh.execute.call_count == 4
 
     def test_exception_returns_false(self):
         s = _session({})
