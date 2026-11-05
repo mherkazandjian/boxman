@@ -314,6 +314,22 @@ fails must read as "stop", never as "nothing there".
   a symlink; an occupied path raises `DiskPathOccupiedError`.
 - A recursive delete of a configured path is vetted by `_safe_delete_target()`
   (`manager_parts/flows.py`).
+- A snapshot verb refuses *before* it removes anything. `snapshot take` reads
+  the VM's state (`_take_state()`) and, with `--force`, asks about the
+  leftovers at its names before it deletes the snapshot it replaces; a
+  refusal leaves that snapshot as it was. The manager asks every selected VM
+  about managed saved state (`has_managed_save()`) before the provider takes
+  the first snapshot.
+- A revert runs only after the overlays it will delete are backed up
+  (`_preserve_snapshot_overlays()`): the target's, every newer snapshot's,
+  and what `snapshot-current` records, read as strictly as the inventory;
+  one that cannot be told refuses the revert. A CD-ROM overlay is the one
+  exception, since it holds nothing and lives beside the ISO.
+- libvirt's own `snapshot-delete` block-commits whatever a snapshot records
+  into the image under it, so no snapshot may record an overlay of a
+  CD-ROM: `delete_snapshot()` rewrites those records first
+  (`_unrecord_cdrom_overlays()`) and refuses when it cannot. Never commit
+  into an ISO.
 
 ### Logging
 
@@ -417,6 +433,14 @@ Never fire one off silently; ask, or run it in the background and say so.
   asserting on the composed `virsh` / `virt-install` command strings and on
   parsed output fixtures; go through the same helpers rather than inventing a
   new mocking style.
+- Where the code depends on what libvirt *does* (snapshot revert, delete,
+  media changes), drive it through a double that does the same:
+  `_RevertingLibvirt` and `_Libvirt` in `tests/test_libvirt_snapshot.py`,
+  `_Domain` in `tests/test_take_when_not_running.py`, `FakeDomain` in
+  `tests/test_cdrom_running_vm.py`. Each one's docstring names the libvirt
+  function it imitates and the version it was measured on. Extend the double
+  when you rely on a new libvirt behaviour; do not assert on a command string
+  that a real libvirt would answer differently.
 - `tests/conftest.py` has the shared pieces: `make_bare_manager()` builds a
   `BoxmanManager` without loading config files, for unit-testing mixin
   methods, and an autouse fixture points boxman's per-user cache dir at a
@@ -479,6 +503,43 @@ python -m pytest tests
   touch `config_cache.py`.
 - **`make loc` (runs cloc in docker) / `make loc-detailed` (plain Python)**
   report lines of code by category if you need to size a change.
+
+### libvirt behaviour the snapshot code is built on
+
+Measured on libvirt 10.10 (the test doubles reproduce it). The function
+names are libvirt's, for reading its source, not boxman's.
+
+- `snapshot-create-as --memspec` is refused for a shut-off domain ("memory
+  state cannot be saved with offline or disk-only snapshot"); a shut-off
+  domain gets `--disk-only`. A domain holding managed saved state takes a
+  disk-only snapshot all the same, and its next start restores the saved
+  memory against the disks as they were before the snapshot, writing into
+  the snapshot's backing files — hence the refusal.
+- Reverting to an external snapshot builds a new qcow2 overlay on *every*
+  disk with media, CD-ROMs included, whatever `snapshot='no'` says
+  (`qemuSnapshotRevertExternalPrepare`): `<source stem>.<epoch>` beside the
+  source as the snapshot's saved definition names it, never in a
+  `disk_snapshot_dir`. Both definitions are moved onto them.
+- The revert deletes the overlays the *current* snapshot records — its
+  `<revertDisks>` when it has any, else its `<disks>` — and records the new
+  ones as the reverted-to snapshot's: `<disks>` when it has no children,
+  `<revertDisks>` otherwise (`qemuSnapshotRevertExternalFinish`). The current
+  snapshot is not always the target or newer than it (#287): a take clears
+  the current snapshot's `<revertDisks>` (`qemuSnapshotClearRevertdisks`),
+  deleting a child of the current one moves its `<revertDisks>` into its
+  `<disks>` (`qemuSnapshotDeleteUpdateParent`), and `snapshot-list` sorts by
+  name, not chain order.
+- A domain the revert started from a memory image does not know its CD-ROM
+  has a tray: a live media change fails "Tray of device '…' is not open"
+  until the tray is opened through QMP (`CDROMManager.move_tray()`).
+- `change-media` replaces the `<source>` alone and keeps the driver type, so
+  it puts a raw ISO behind `type='qcow2'` on a drive a revert left on an
+  overlay; `change_media()` uses `update-device` with the whole element
+  instead. The persistent definition records no backing chain; the live one
+  does, so read it first and ask `qemu-img info --backing-chain` only when
+  there is none (a root-owned `0600` overlay is unreadable without sudo).
+- A paused domain's memory snapshot leaves it paused, and a revert brings it
+  back paused.
 
 ---
 
