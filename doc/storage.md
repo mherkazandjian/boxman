@@ -300,9 +300,10 @@ What survives:
 What is permanently lost:
 
 - **Every snapshot between `<name>` and the current one** — their qcow2
-  overlay files are unlinked, their `.raw` / `.raw.zst` memory dumps are
-  unlinked, and their libvirt metadata is cleared with
-  `virsh snapshot-delete --metadata`.
+  overlay files are unlinked, their libvirt metadata is cleared with
+  `virsh snapshot-delete --metadata`, and then their `.raw` / `.raw.zst`
+  memory dumps are unlinked — but for one another snapshot, of this VM or
+  another, still records, which is kept and named in a warning.
 - The ability to revert to a mid-chain state above `<name>`.
 
 Snapshots form a tree, not a line: `take s1`, `take s2`, `restore s1`,
@@ -472,6 +473,18 @@ boxman storage compress-snapshots --level 10
 # Reverse: decompress .raw.zst back to .raw
 boxman storage compress-snapshots --decompress
 ```
+
+### Deleting a compressed snapshot
+
+`boxman snapshot delete`, `snapshot take --force` (which deletes the
+snapshot it replaces) and a collapse that drops a snapshot all remove its
+memory dump in both forms, `.raw` and `.raw.zst`, from wherever the snapshot
+recorded it — a `memory_snapshot_dir` included. libvirt's own delete
+unlinks only the `.raw` its record names, so the `.raw.zst` is boxman's to
+remove. A dump another snapshot still records — of this VM or another, whose
+image shares the name in a directory two clusters share — is kept, and so is
+one whose records cannot be read; a warning names it. A delete that fails
+removes nothing.
 
 ### Restore is transparent
 

@@ -2440,10 +2440,14 @@ class LibVirtSession(SessionConfigMixin):
         """
         Collapse snapshots newer than *target* into the live head; *target*
         and older snapshots remain revertable. VM must be offline (the
-        BoxmanManager orchestrator handles shutdown/restart).
+        BoxmanManager orchestrator handles shutdown/restart). A dropped
+        snapshot's memory image stays where another snapshot records it
+        (:meth:`memory_images_recorded`).
         """
         snapshot_mgr = SnapshotManager(self.provider_config)
-        return snapshot_mgr.collapse_to(vm_name, target, dry_run=dry_run)
+        return snapshot_mgr.collapse_to(
+            vm_name, target, dry_run=dry_run,
+            recorded_in_use=self.memory_images_recorded)
 
     def compress_snapshots_memory(self,
                                   vm_name: str,
@@ -2704,12 +2708,27 @@ class LibVirtSession(SessionConfigMixin):
             vm_name (str): Name of the VM
             snapshot_name (str): Name of the snapshot to delete
 
+        Its memory image, ``.raw`` and ``.raw.zst``, goes with it, unless
+        another snapshot records it (:meth:`memory_images_recorded`).
+
         Returns:
             bool: True if successful, False otherwise
         """
         self.logger.info(f"deleting the snapshot {snapshot_name} from vm {vm_name}")
         snapshot_mgr = SnapshotManager(self.provider_config)
-        return snapshot_mgr.delete_snapshot(vm_name, snapshot_name)
+        return snapshot_mgr.delete_snapshot(
+            vm_name, snapshot_name,
+            recorded_in_use=self.memory_images_recorded)
+
+    def memory_images_recorded(self) -> FilesInUse | None:
+        """
+        The memory images every domain's snapshots record, each with the
+        ``.raw.zst`` compression leaves beside it
+        (:meth:`snapshot_files_in_use`, overlays left out): what a delete or
+        a collapse asks once its snapshots are gone, before it removes their
+        memory images (#253, #274). ``None`` when that cannot be told.
+        """
+        return self.snapshot_files_in_use(overlays_too=False)
     # end snapshots
 
     @property
