@@ -15,7 +15,7 @@ section has the quick-start.
 | `boxman storage optimize` | orchestrator: `trim` → `compact` → restart | manages itself | yes |
 | `boxman storage compress-snapshots` | zstd-compress (or `--decompress`) snapshot memory `.raw` files retroactively | any | yes |
 | `boxman storage pools` | list libvirt's storage pools; `--prune` removes the ones left on directories that are gone | any | only `--prune` |
-| `boxman snapshot collapse --to <name>` | merge snapshots newer than `<name>` into the live head; `<name>` and older remain revertable | off — auto-shutdown by default | yes |
+| `boxman snapshot collapse --to <name>` | merge the snapshots between `<name>` and the live head into the head; every other snapshot remains revertable, and it refuses while another branch is built on `<name>` | off — auto-shutdown by default | yes |
 
 `boxman snapshot take --compress-memory` is the *primary* surface for
 memory compression — it runs at snapshot creation time so no `.raw` is
@@ -283,25 +283,38 @@ long-lived snapshots taken while a daemon was writing continuously.
 
 `qemu-img rebase` walks the chain and merges every cluster from the
 snapshots between `<name>` and the live head into a new active overlay
-whose backing is `<name>`'s overlay. Where intermediates wrote zero
+whose backing is `<name>`'s overlay — or, when the live disk was built
+after a restore of `<name>`, the disk `<name>` was taken on, which is
+what the live disk stands on then. Where intermediates wrote zero
 clusters (RAID5 sync, mkfs, etc.), rebase writes sparse holes — so the
 reclaim is often dramatic with little wall time.
 
 What survives:
 
 - **`<name>` and older snapshots remain revertable** — their overlays
-  are untouched, and the rebased head still has `<name>`'s overlay as
-  its backing.
+  are untouched, and the rebased head has `<name>`'s overlay, or the
+  disk `<name>` was taken on, as its backing.
 - **The live state of the VM** — semantically unchanged, just stored in
   a different file layout.
 
 What is permanently lost:
 
-- **Every snapshot strictly newer than `<name>`** — their qcow2 overlay
-  files are unlinked, their `.raw` / `.raw.zst` memory dumps are
+- **Every snapshot between `<name>` and the current one** — their qcow2
+  overlay files are unlinked, their `.raw` / `.raw.zst` memory dumps are
   unlinked, and their libvirt metadata is cleared with
   `virsh snapshot-delete --metadata`.
 - The ability to revert to a mid-chain state above `<name>`.
+
+Snapshots form a tree, not a line: `take s1`, `take s2`, `restore s1`,
+`take s3` leaves s2 and s3 both built on s1, with the VM running on s3
+(`boxman snapshot log` draws it). The live disk is built on s3 alone, so
+a collapse can merge s3 into it but not s2. `collapse --to s1` therefore
+refuses, naming s2, and so does `collapse --to s2`, which the VM does not
+run on: either would drop a snapshot without merging it into anything.
+Delete the other branch first (`boxman snapshot delete --name s2`), or
+collapse to a later snapshot of the VM's own line (`collapse --to s3`,
+once s4 is taken after it). `--dry-run` says the same before anything
+is touched, and the refusal leaves a running VM running.
 
 ### Usage
 
@@ -323,7 +336,7 @@ boxman snapshot collapse --to before-slurm --no-shutdown
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--to <name>` | required | The oldest snapshot to keep revertable |
+| `--to <name>` | required | The snapshot to collapse to: it and every snapshot not between it and the live head stay revertable |
 | `--vms` | `all` | VM scope |
 | `--no-shutdown` | off | Refuse if running (default = auto-shutdown via `virsh shutdown`, fall back to `destroy` after 120 s) |
 | `--dry-run` | off | List what would be merged per VM; no writes |
@@ -346,13 +359,19 @@ work — `<backingStore>` elements nest.
 - If `<X>` is the only snapshot → online deletion via
   `virsh blockcommit --active --pivot --wait` (no shutdown, sub-second
   per disk).
-- If `<X>` is the most-recent and there are older snapshots →
-  `collapse_to(parent_of_X)` — drops just `<X>` while keeping the
-  parent and older revertable.
-- If `<X>` is non-current with newer snapshots above it → refused
-  with a pointer to `snapshot collapse`. Single-snapshot rebase in the
-  middle of a chain is out of v1 scope; the user should drop the
-  newer snapshots first or use `collapse` to take them all in one step.
+- If `<X>` is the current snapshot, with nothing built on it, and has a
+  parent → `collapse_to(parent_of_X)` — drops just `<X>` while keeping
+  the parent and older revertable. Like any collapse it refuses when
+  another branch is built on that parent.
+- Otherwise (snapshots built on `<X>`, or `<X>` not the one the VM runs
+  on) → refused, with a pointer to `snapshot collapse --to
+  <parent_of_X>` where that collapse would drop `<X>`. Single-snapshot
+  rebase in the middle of a chain is out of v1 scope; the user should
+  drop the newer snapshots first or use `collapse` to take them all in
+  one step.
+
+This is only the path boxman takes when libvirt refuses the delete
+itself, as every libvirt before 9.0 does for external snapshots.
 
 ---
 

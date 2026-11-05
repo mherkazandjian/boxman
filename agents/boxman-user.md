@@ -1228,8 +1228,10 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   and a `← current` marker. Prefer `log` for a human overview.
 - `snapshot delete --name N` deletes a named snapshot.
 - `snapshot collapse --to N [--no-shutdown] [--dry-run] [-y]` merges every
-  snapshot *newer* than `N` into the live disk head to reclaim space; `N` and
-  older stay revertable. Offline-only: it auto-shuts running VMs down unless
+  snapshot between `N` and the live disk head into the head to reclaim space;
+  `N` and older stay revertable. After a restore and a take the snapshots
+  branch; a collapse refuses while another branch is built on `N` (it would
+  drop it unmerged): delete that branch first. Offline-only: it auto-shuts running VMs down unless
   `--no-shutdown`, which skips them instead.
 
 ### `boxman storage`

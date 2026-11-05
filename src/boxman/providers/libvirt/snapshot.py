@@ -1942,11 +1942,11 @@ class SnapshotManager:
         The permissive helpers behind the display verbs skip whatever they
         cannot read: :meth:`_snapshot_graph` returns ``{}`` when the list
         command fails and records ``xml=None`` for a dumpxml that failed,
-        and :meth:`_get_snapshot_overlay_files` and :meth:`_chain_order`
-        then ``continue`` past those entries and past XML that will not
-        parse. That is the right shape for drawing a table and the wrong one
-        for deciding what a revert is about to delete: a snapshot missing
-        from the inventory is a snapshot whose overlay nothing backs up, and
+        and :meth:`_get_snapshot_overlay_files` then ``continue``s past
+        those entries and past XML that will not parse. That is the right
+        shape for drawing a table and the wrong one for deciding what a
+        revert is about to delete: a snapshot missing from the inventory
+        is a snapshot whose overlay nothing backs up, and
         ``snapshot-revert`` deletes it all the same.
 
         Args:
@@ -2026,10 +2026,11 @@ class SnapshotManager:
                              if parent_elem is not None and parent_elem.text
                              else None)
 
-        # the same walk as _chain_order, but its result has to account for
-        # every snapshot: one whose parent is missing is never reached from
-        # the root and drops out of the ordering without saying so, which
-        # then puts it outside the at-risk set the revert will delete from
+        # a breadth-first walk from the roots, but its result has to
+        # account for every snapshot: one whose parent is missing is never
+        # reached from the root and drops out of the ordering without
+        # saying so, which then puts it outside the at-risk set the revert
+        # will delete from
         children: dict[str | None, list[str]] = {}
         for name, parent in parents.items():
             children.setdefault(parent, []).append(name)
@@ -3190,13 +3191,20 @@ class SnapshotManager:
           per disk merges the overlay back into base while online; then
           we remove the overlay/memory files and clear the libvirt
           metadata with ``--metadata``.
-        - **Most-recent external snapshot with older snapshots above**:
-          equivalent to :meth:`collapse_to` against the parent — the VM
-          is shut down, ``qemu-img rebase`` rewires the chain, and the
-          dropped snapshot's files + metadata are cleaned up.
-        - **Non-current external snapshot**: refused with a clear
-          pointer to ``boxman snapshot collapse --to <name>``; rebasing
-          a middle layer while preserving both ends is out of v1 scope.
+        - **The current snapshot, built on another**: equivalent to
+          :meth:`collapse_to` against its parent, which refuses when
+          another branch is built on that parent too — the VM is shut
+          down, ``qemu-img rebase`` rewires the chain, and the dropped
+          snapshot's files + metadata are cleaned up.
+        - **Any other external snapshot** (one with snapshots built on it,
+          or one the VM does not run on): refused, with a pointer to
+          ``boxman snapshot collapse --to <parent>`` where that collapse
+          would drop it; rebasing a middle layer while preserving both
+          ends is out of v1 scope.
+
+        Which snapshot is which is read from the snapshot tree and from
+        libvirt's current snapshot, not from an order of the snapshots:
+        after a restore and a take they branch (see :meth:`collapse_drops`).
 
         First, no snapshot of the VM may record an overlay of a CDROM
         (:meth:`_unrecord_cdrom_overlays`): libvirt's own delete would
@@ -3252,33 +3260,71 @@ class SnapshotManager:
     def _delete_external_snapshot(self,
                                   vm_name: str,
                                   snapshot_name: str) -> bool:
-        chain = self._chain_order(vm_name)
-        if snapshot_name not in chain:
+        """
+        Delete an external snapshot libvirt refused to delete itself:
+        before 9.0 it refuses every one, and later ones refuse a snapshot
+        with children in some places, or while a block job runs.
+
+        boxman drops only the current snapshot this way, and only one
+        nothing is built on: by collapsing onto its parent, or for the only
+        snapshot by committing it back into the base online. Parent and
+        children are read from the snapshot tree, not from chain order:
+        after a restore and a take two snapshots can share a parent, and
+        the snapshot before this one in that order can be its sibling, the
+        snapshot after it one on another branch (#291).
+        """
+        parents = self._snapshot_tree(vm_name)
+        if parents is None:
+            return False
+        if snapshot_name not in parents:
             self.logger.error(
                 f"snapshot {snapshot_name} not in chain for vm {vm_name}")
             return False
 
-        idx = chain.index(snapshot_name)
-
-        # v1: only the most-recent external snapshot is directly deletable.
-        if idx != len(chain) - 1:
-            newer = chain[idx + 1:]
+        current = self.get_latest_snapshot(vm_name)
+        parent = parents[snapshot_name]
+        built_on = self._descendants(parents, snapshot_name)
+        if built_on:
+            # a collapse onto the parent drops this one with what is built
+            # on it, so it is named only where it would: where all of that
+            # is the line up to the snapshot the VM runs on
+            line = (self._line_between(parents, parent, current)
+                    if parent is not None and current else None)
+            hint = (f" use `boxman snapshot collapse --to {parent}` to drop "
+                    f"it (and the snapshots above it) in one step."
+                    if line is not None and sorted(line) == sorted(
+                        self._descendants(parents, parent)) else "")
             self.logger.error(
                 f"cannot delete external snapshot '{snapshot_name}' from "
-                f"{vm_name}: it has newer snapshots above it ({newer}). "
-                f"use `boxman snapshot collapse --to "
-                f"{chain[idx - 1] if idx > 0 else snapshot_name}` to drop "
-                f"it (and the snapshots above it) in one step.")
+                f"{vm_name}: it has newer snapshots built on it "
+                f"({built_on}).{hint}")
             return False
 
-        if idx == 0:
+        if snapshot_name != current:
+            self.logger.error(
+                f"cannot delete external snapshot '{snapshot_name}' from "
+                f"{vm_name}: libvirt refused to, and boxman deletes one "
+                f"itself only when it is the current snapshot, the one the "
+                f"VM runs on "
+                f"({f'{current!r} is' if current else 'it has none'})")
+            return False
+
+        if parent is None:
+            others = sorted(n for n in parents if n != snapshot_name)
+            if others:
+                # blockcommit would merge it into the base those are built on
+                self.logger.error(
+                    f"cannot delete external snapshot '{snapshot_name}' from "
+                    f"{vm_name}: it is built on no other snapshot, and the "
+                    f"commit into the base that would drop it changes what "
+                    f"{others} are built on")
+                return False
             # Only snapshot in the chain — collapse it back to base online.
             return self._collapse_only_external_snapshot_online(
                 vm_name, snapshot_name)
 
-        # Most-recent with older snapshots above base — collapse_to(parent)
-        # drops just this one snapshot while keeping older ones revertable.
-        parent = chain[idx - 1]
+        # the current leaf, built on another: collapse_to(parent) drops just
+        # this one, and refuses where another branch is built on the parent
         return self.collapse_to(vm_name, parent, dry_run=False)
 
     def _collapse_only_external_snapshot_online(self,
@@ -3329,47 +3375,140 @@ class SnapshotManager:
 
     # ── snapshot collapse (qemu-img rebase) ─────────────────────────────
     #
-    # collapse_to(target) merges every snapshot strictly newer than
-    # *target* into the live head, dropping their overlays and metadata.
-    # *target* and older snapshots remain revertable. The VM must be off
+    # collapse_to(target) merges the snapshots between *target* and the
+    # current one into the live head, dropping their overlays and metadata,
+    # and refuses when anything else is built on *target* (collapse_drops).
+    # Every other snapshot remains revertable. The VM must be off
     # because qemu-img rebase is offline-only — the BoxmanManager
     # orchestrator handles shutdown/start.
 
-    def _chain_order(self, vm_name: str) -> list[str]:
+    def _snapshot_tree(self, vm_name: str) -> dict[str, str | None] | None:
         """
-        Return all snapshot names for *vm_name* in chain order, oldest
-        first. Built from each snapshot's ``<parent>`` element so it
-        works for any tree topology, but boxman only takes linear chains.
+        ``{snapshot: parent}`` for every snapshot of *vm_name*, None as the
+        parent of one built on none -- or None, said why, when a snapshot
+        cannot be read. A collapse or a delete decides from it what it
+        drops, and one left out of it could be built on one of those.
         """
-        graph = self._snapshot_graph(vm_name)
-        if not graph:
-            return []
-
         parents: dict[str, str | None] = {}
-        for name, info in graph.items():
-            xml_text = info['xml']
-            if xml_text is None:
-                continue
+        for name, info in self._snapshot_graph(vm_name).items():
             try:
-                # keep the historical behavior of excluding snapshots
-                # whose dumpxml does not parse at all
-                ET.fromstring(xml_text)
-            except ET.ParseError:
-                continue
+                if info['xml'] is None:
+                    raise ET.ParseError("its snapshot-dumpxml failed")
+                ET.fromstring(info['xml'])
+            except ET.ParseError as exc:
+                self.logger.error(
+                    f"cannot read snapshot '{name}' of {vm_name} ({exc}), so "
+                    f"nothing shows what is built on it; refusing to drop "
+                    f"any snapshot")
+                return None
             parents[name] = info.get('parent')
+        return parents
 
+    @staticmethod
+    def _descendants(parents: dict[str, str | None],
+                     name: str) -> list[str]:
+        """Every snapshot built on *name*, nearest first, in *parents*'
+        order (see :meth:`_snapshot_tree`)."""
         children: dict[str | None, list[str]] = {}
-        for name, parent in parents.items():
-            children.setdefault(parent, []).append(name)
-
-        ordered: list[str] = []
-        queue: list[str | None] = [None]
+        for child, parent in parents.items():
+            children.setdefault(parent, []).append(child)
+        found: list[str] = []
+        queue = [name]
         while queue:
-            current = queue.pop(0)
-            for child in children.get(current, []):
-                ordered.append(child)
-                queue.append(child)
-        return ordered
+            for child in children.get(queue.pop(0), []):
+                # metadata in a loop would otherwise walk it forever
+                if child != name and child not in found:
+                    found.append(child)
+                    queue.append(child)
+        return found
+
+    @staticmethod
+    def _line_between(parents: dict[str, str | None], ancestor: str,
+                      current: str | None) -> list[str] | None:
+        """
+        The snapshots after *ancestor* up to and including *current*,
+        oldest first: empty when they are one snapshot, None when *current*
+        is not built on *ancestor* (or is None).
+        """
+        line: list[str] = []
+        node = current
+        while node is not None and node != ancestor and node not in line:
+            line.append(node)
+            node = parents.get(node)
+        return line[::-1] if node == ancestor else None
+
+    def _collapse_plan(self, vm_name: str,
+                       target_name: str) -> tuple[list, list] | None:
+        """
+        ``(drop, keep)`` for :meth:`collapse_drops`: what it returns, and
+        every other snapshot.
+        """
+        parents = self._snapshot_tree(vm_name)
+        if parents is None:
+            return None
+        if target_name not in parents:
+            self.logger.error(
+                f"snapshot '{target_name}' not in chain for vm {vm_name}")
+            return None
+        after = self._descendants(parents, target_name)
+        refusal = f"cannot collapse {vm_name} to '{target_name}'"
+        current = self.get_latest_snapshot(vm_name)
+        line = self._line_between(parents, target_name, current)
+        if line is None and not current:
+            if not after:
+                return [], list(parents)
+            self.logger.error(
+                f"{refusal}: libvirt names no current snapshot, so nothing "
+                f"shows that {after} are the line the VM runs on, which is "
+                f"all a collapse can merge into its disk")
+            return None
+        if line is None:
+            self.logger.error(
+                f"{refusal}: the VM runs on '{current}', which is not built "
+                f"on '{target_name}', so there is nothing between them to "
+                f"merge into its disk"
+                + (f"; {after} would only be dropped" if after else ""))
+            return None
+        off_line = [n for n in after if n not in line]
+        if off_line:
+            path = " -> ".join([target_name, *line])
+            self.logger.error(
+                f"{refusal}: {off_line} are built on '{target_name}' on "
+                f"another branch, not on the line the VM runs on ({path}), "
+                f"so the collapse would drop them without merging them into "
+                f"its disk. Delete them first (`boxman snapshot delete "
+                f"--name <name>`, newest first), or collapse to a later "
+                f"snapshot of that line.")
+            return None
+        return line, [n for n in parents if n not in line]
+
+    def collapse_drops(self, vm_name: str,
+                       target_name: str) -> list[str] | None:
+        """
+        The snapshots ``collapse --to target_name`` merges into the live
+        disk and drops, oldest first: those between *target_name* and the
+        current snapshot, the one the VM runs on. Empty when nothing is
+        built on the target.
+
+        The snapshots form a tree, not a line: take s1, take s2, restore s1,
+        take s3, and s2 and s3 are both built on s1, s3 current (#291). The
+        live disk is built on s3 alone, so a collapse to s1 can merge s3
+        into it but not s2: dropping s2 would lose it, and the restore its
+        overlays and memory serve. So this refuses -- None, logged -- when
+        anything built on the target is off that line, and when the current
+        snapshot is not built on the target at all. Keeping such a branch
+        while dropping the line would mean working out which overlays of a
+        dropped snapshot the branch is built on, and the rebase would put
+        the live disk on the target's overlay, which a branch taken right
+        after the target is built on too -- the image libvirt's own delete
+        of that branch unlinks (#289). Refusing loses nothing, and the
+        error names what to delete first.
+
+        Also None when the target is not there or a snapshot cannot be read
+        (:meth:`_snapshot_tree`).
+        """
+        plan = self._collapse_plan(vm_name, target_name)
+        return None if plan is None else plan[0]
 
     def _data_disk_targets(self, vm_name: str) -> list[tuple[str, str]]:
         """
@@ -3527,9 +3666,13 @@ class SnapshotManager:
                         disks: list[tuple[str, str]]) -> list[tuple] | None:
         """
         The files :meth:`collapse_to` must not remove, each with the reason:
-        every disk's head, and every overlay the *kept* snapshots record --
+        every disk's head, the disk each *kept* snapshot was taken on, which
+        a revert to it builds on (what :meth:`validate_snapshot` checks),
+        and every overlay the *kept* snapshots record --
         the target's among them, which is what each head stands on once it
-        is rebased. That covers each disk's live chain after the rebase.
+        is rebased, on a line of takes (else it stands on the disk the
+        target was taken on, :meth:`_collapse_base`). That covers each
+        disk's live chain after the rebase.
 
         The head needs saying. An external snapshot records the overlay it
         created, and that overlay became the active disk, so until a revert
@@ -3541,7 +3684,9 @@ class SnapshotManager:
             be stat'ed -- not even when it seems missing, since the removal
             may run where it is there (a container). Then no comparison can
             show that a dropped overlay is not that file under another name,
-            so none may be removed.
+            so none may be removed. One missing where qemu-img runs as well
+            is no file at all, and is left out: libvirt's delete of a
+            branch unlinks the overlay its parent's take made (#289).
         """
         keeps = []
         for disk_target, head in disks:
@@ -3553,12 +3698,102 @@ class SnapshotManager:
                 if path:
                     keeps.append(
                         (path, f"kept snapshot '{snap}' still records it"))
-        for path, _reason in keeps:
+                path = self._source_in_snapshot_domain(
+                    vm_name, snap, disk_target)
+                if path:
+                    keeps.append(
+                        (path, f"a revert to kept snapshot '{snap}' "
+                               f"builds on it"))
+        examined = []
+        for path, reason in keeps:
             try:
                 os.stat(path)
+            except FileNotFoundError:
+                if not self._gone_where_qemu_runs(path):
+                    return None
+                continue
             except OSError:
                 return None
-        return keeps
+            examined.append((path, reason))
+        return examined
+
+    def _gone_where_qemu_runs(self, path: str) -> bool:
+        """Whether nothing is at *path* where qemu-img runs (see
+        :meth:`_one_file_where_qemu_runs`): False when that cannot be
+        asked."""
+        quoted = shlex.quote(path)
+        # one command, so that a sudo prefix takes all of it
+        script = (f"if test -e {quoted} || test -L {quoted}; then "
+                  f"echo present; else echo absent; fi")
+        result = self.virsh.execute_shell(
+            f"sh -c {shlex.quote(script)}", warn=True, hide=True)
+        return bool(result.ok) and (result.stdout or "").strip() == "absent"
+
+    def _collapse_base(self, vm_name: str, target_name: str,
+                       disk_target: str, head: str) -> tuple:
+        """
+        ``(base, same, why)``: the image a collapse to *target_name*
+        rebases *disk_target*'s *head* onto, and whether the head is that
+        image (None when that cannot be told where qemu-img runs) -- or
+        ``(None, None, why)`` when the target records no overlay for it.
+
+        On a line of takes that is the overlay the target's take made, its
+        ``<disks>``: the head is built on it. After a restore of the target
+        and a take, the head is built instead on the disk the target was
+        taken on (:meth:`_source_in_snapshot_domain`), under the overlay of
+        the revert, and the overlay the take
+        made is under another branch -- or gone with it, which libvirt's
+        delete of that branch unlinks (#289). Where the head's chain shows
+        that, it is that disk (#291); otherwise the overlay, as before.
+        """
+        recorded = self._overlay_path_for_snapshot(
+            vm_name, target_name, disk_target)
+        if not recorded:
+            return None, None, (f"cannot find overlay for disk "
+                                f"'{disk_target}' in snapshot "
+                                f"'{target_name}' of vm {vm_name}")
+        same = self._one_file_where_qemu_runs(head, recorded)
+        if same:
+            return recorded, True, None
+        layers = CDROMManager(
+            vm_name, provider_config=self.provider_config).image_layers(head)
+        if layers is None:
+            return recorded, same, None
+        under = [path for path, _format in layers[1:]]
+
+        def is_under(path: str | None) -> bool:
+            return bool(path) and (
+                os.path.normpath(path) in map(os.path.normpath, under)
+                or any(self._one_file_where_qemu_runs(path, layer)
+                       for layer in under))
+        taken_on = self._source_in_snapshot_domain(
+            vm_name, target_name, disk_target)
+        if not is_under(recorded) and is_under(taken_on):
+            return taken_on, False, None
+        return recorded, same, None
+
+    def _source_in_snapshot_domain(self, vm_name: str, snapshot_name: str,
+                                   disk_target: str) -> str | None:
+        """*disk_target*'s source in the definition *snapshot_name* saved
+        that a revert to it builds on
+        (:meth:`_definition_a_revert_builds_on`): the disk it was taken on,
+        which :meth:`validate_snapshot` checks."""
+        result = self.virsh.execute(
+            "snapshot-dumpxml", vm_name, snapshot_name, warn=True)
+        if not result.ok:
+            return None
+        try:
+            root = ET.fromstring(result.stdout)
+        except ET.ParseError:
+            return None
+        definition = self._definition_a_revert_builds_on(root)
+        for disk in (definition.iter("disk")
+                     if definition is not None else ()):
+            target, source = disk.find("target"), disk.find("source")
+            if (target is not None and target.get("dev") == disk_target
+                    and source is not None):
+                return source.get("file")
+        return None
 
     def _collapse_keep_reason(self,
                               path: str,
@@ -3578,8 +3813,10 @@ class SnapshotManager:
                     target_name: str,
                     dry_run: bool = False) -> bool:
         """
-        Collapse all snapshots strictly newer than *target_name* into the
-        live head. *target_name* and older snapshots remain revertable.
+        Collapse the snapshots between *target_name* and the current one
+        into the live head (:meth:`collapse_drops`, which refuses when
+        another branch is built on *target_name*). *target_name* and every
+        other snapshot remain revertable.
 
         Workflow per disk: ``qemu-img rebase`` the head onto the target
         snapshot's overlay so the rebased head's read-alone view equals
@@ -3601,19 +3838,15 @@ class SnapshotManager:
                 f"{vm_name}: {info.stderr.strip()}")
             return False
 
-        chain = self._chain_order(vm_name)
-        if target_name not in chain:
-            self.logger.error(
-                f"snapshot '{target_name}' not in chain for vm {vm_name}")
+        plan = self._collapse_plan(vm_name, target_name)
+        if plan is None:
             return False
-
-        target_idx = chain.index(target_name)
-        drop_set = chain[target_idx + 1:]
+        drop_set, kept = plan
 
         if not drop_set:
             self.logger.info(
-                f"snapshot '{target_name}' is already the most-recent on "
-                f"vm {vm_name}; nothing to collapse")
+                f"no snapshot is built on '{target_name}' on vm {vm_name}; "
+                f"nothing to collapse")
             return True
 
         disks = self._data_disk_targets(vm_name)
@@ -3623,29 +3856,37 @@ class SnapshotManager:
 
         # the heads do not move in the rebase, so this is already the
         # set the cleanup below has to leave alone
-        keeps = self._collapse_keeps(vm_name, chain[:target_idx + 1], disks)
+        keeps = self._collapse_keeps(vm_name, kept, disks)
 
         if dry_run:
             self.logger.info(
                 f"[dry-run] {vm_name}: would drop {len(drop_set)} snapshot(s) "
-                f"({drop_set}); kept '{target_name}' and older")
+                f"({drop_set}), the line from '{target_name}' to the one the "
+                f"VM runs on; would keep {kept}")
+            stops = False
             for disk_target, source in disks:
-                new_base = self._overlay_path_for_snapshot(
-                    vm_name, target_name, disk_target)
-                same = (None if not new_base
-                        else self._one_file_where_qemu_runs(source, new_base))
+                new_base, same, why = self._collapse_base(
+                    vm_name, target_name, disk_target, source)
                 if same:
                     self.logger.info(
                         f"[dry-run]   {source} is the overlay of "
                         f"'{target_name}' itself; nothing to rebase")
+                elif new_base is None:
+                    stops = True
+                    self.logger.error(
+                        f"[dry-run]   {why}; the collapse would stop here")
                 elif same is None:
-                    self.logger.info(
+                    stops = True
+                    self.logger.error(
                         f"[dry-run]   whether {source} is {new_base} cannot "
                         f"be told where qemu-img runs; the collapse would "
                         f"stop here")
                 else:
                     self.logger.info(
                         f"[dry-run]   would rebase {source} onto {new_base}")
+            if stops:
+                # before anything is rebased or removed
+                return False
             for snap in drop_set:
                 for disk_target, _ in disks:
                     overlay = self._overlay_path_for_snapshot(
@@ -3665,14 +3906,11 @@ class SnapshotManager:
         # disk that cannot be told stops the collapse before any is rebased.
         rebases = []
         for disk_target, head_path in disks:
-            new_base = self._overlay_path_for_snapshot(
-                vm_name, target_name, disk_target)
-            if not new_base:
-                self.logger.error(
-                    f"cannot find overlay for disk '{disk_target}' in "
-                    f"snapshot '{target_name}' of vm {vm_name}")
+            new_base, same, why = self._collapse_base(
+                vm_name, target_name, disk_target, head_path)
+            if new_base is None:
+                self.logger.error(f"{why}; not collapsing vm {vm_name}")
                 return False
-            same = self._one_file_where_qemu_runs(head_path, new_base)
             if same is None:
                 self.logger.error(
                     f"cannot tell whether {head_path} is {new_base} where "
@@ -3733,5 +3971,5 @@ class SnapshotManager:
 
         self.logger.info(
             f"collapsed {len(drop_set)} snapshot(s) on vm {vm_name}; "
-            f"'{target_name}' preserved as new oldest revertable point")
+            f"'{target_name}' is its current snapshot now")
         return True

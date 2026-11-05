@@ -539,7 +539,9 @@ The right ops, in order, for the snapshot lifecycle and disk hygiene:
   - `boxman snapshot collapse --to <stable-snap>` — merges every snapshot
     between `<stable-snap>` and the live head into the head; `<stable-snap>`
     and older snapshots remain revertable. Auto-shuts down the VM
-    (`qemu-img rebase` is offline-only) and restarts it after.
+    (`qemu-img rebase` is offline-only) and restarts it after. Refused
+    while a snapshot on another branch (after a restore and a take) is
+    built on `<stable-snap>`.
 
 The "promote stable, drop pre-stable" pattern: take `pre-step-N` and
 `post-step-N` while iterating; once step N is validated, run `snapshot
@@ -832,8 +834,9 @@ This project is licensed under the [MIT License](LICENSE).
   - `snapshot delete` — delete a snapshot (handles external snapshots via
     `virsh blockcommit` for the simple case; non-current external snapshots
     must be dropped via `snapshot collapse`)
-  - `snapshot collapse --to <name>` — merge every snapshot newer than
-    `<name>` into the live head; `<name>` and older remain revertable.
+  - `snapshot collapse --to <name>` — merge every snapshot between
+    `<name>` and the live head into the head; `<name>` and older remain
+    revertable. Refused while another branch is built on `<name>`.
     Auto-shuts down the VM and restarts after (`qemu-img rebase` is
     offline). The big-reclaim hammer when older overlays have grown.
 - `storage` — inspect and reclaim qcow2 disk space
