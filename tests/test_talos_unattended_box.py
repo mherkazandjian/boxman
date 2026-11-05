@@ -237,7 +237,7 @@ def test_control_template_is_a_non_secret_recipe(monkeypatch):
 
 
 def test_only_the_fail_fast_script_can_mark_the_template_ready(monkeypatch):
-    # review B1: runcmd runs under /bin/sh without errexit, so a marker
+    # runcmd runs under /bin/sh without errexit, so a marker
     # written by its own entry published a template whose tools had failed
     template = _render(monkeypatch)["templates"]["control-base"]
     data = yaml.safe_load(template["cloudinit"])
@@ -824,7 +824,7 @@ def test_no_secret_reaches_the_output(lab):
         assert SECRET_MARK not in proc.stdout + proc.stderr
 
 
-# ---- B4: the repository guard fails closed -------------------------------- #
+# ---- the repository guard fails closed ------------------------------------ #
 def _without_git(lab, tmp_path) -> str:
     """A PATH with the fake bin and every system tool except git."""
     sysbin = tmp_path / "sysbin-no-git"
@@ -904,7 +904,7 @@ def _nested_checkout(tmp_path):
 
 @pytest.mark.parametrize("with_git", [False, True], ids=["no-git", "git"])
 def test_a_symlink_into_a_nested_checkout_directory_is_refused(lab, tmp_path, with_git):
-    # review B4b: the parent walk followed the path as written, so with no
+    # the parent walk once followed the path as written, so with no
     # git OUT/link -> REPO/sub/dir let OUT/link/state land inside REPO
     repo, link = _nested_checkout(tmp_path)
     path = None if with_git else _without_git(lab, tmp_path)
@@ -967,7 +967,7 @@ def test_an_empty_dot_git_directory_is_not_a_checkout(lab, tmp_path):
     _ok(lab.run(TALOS_STATE_DIR=str(tmp_path / "plain" / "state")))
 
 
-# ---- B2: partial state never becomes a fresh identity ---------------------- #
+# ---- partial state never becomes a fresh identity -------------------------- #
 def test_lost_secrets_stop_the_run_instead_of_a_new_identity(lab):
     _ok(lab.run())
     (lab.state / "secrets.yaml").unlink()
@@ -1007,7 +1007,7 @@ def test_a_state_dir_with_only_run_leftovers_is_fresh(lab):
     assert (lab.state / "secrets.yaml").exists()
 
 
-# ---- B3: patches cannot replace identity, role or node identity ----------- #
+# ---- patches cannot replace identity, role or node identity --------------- #
 OTHER_CLUSTER = "FOREIGN-VALUE"
 #: the same as certificate material: talosctl decodes v1alpha1 CA fields as
 #: base64 while patching, before any check could see them

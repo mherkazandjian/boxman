@@ -311,7 +311,7 @@ def test_a_bad_hooks_key_is_refused_before_anything(mgr, hooks, message):
     "echo not a mapping",
 ])
 def test_a_hook_task_without_a_string_command_is_refused_before_anything(mgr, task):
-    """H4: caught before hooks, inventory or up, never after provisioning."""
+    """Caught before hooks, inventory or up, never after provisioning."""
     m = mgr(hooks={"post_up": ["a"]}, tasks={"a": task})
     with pytest.raises(ConfigError, match="task 'a' needs a command, a non-empty string"):
         m.up(_args())
@@ -384,7 +384,7 @@ def test_an_unreadable_inventory_is_an_error_not_an_empty_one(tmp_path, answers,
 
 
 
-# ---- H1: one hooked up at a time, and only a provision creates ------------------------
+# ---- one hooked up at a time, and only a provision creates ----------------------------
 def test_a_second_hooked_up_of_the_project_changes_nothing(mgr):
     import fcntl
     m = mgr(hooks={"pre_up": ["a"], "post_up": ["c"]})
@@ -419,7 +419,7 @@ def test_resources_that_appear_while_an_up_finds_the_project_in_place_are_not_it
     assert record["present"] == CREATED
 
 
-# ---- H2: --force through the real up on a complete project -------------------------
+# ---- --force through the real up on a complete project -----------------------------
 def test_force_on_a_complete_running_project_reconciles_and_creates_nothing(mgr):
     """The real _up: --force deprovisions only a partial project; a complete,
     running one takes the all-running path, and the record says so."""
@@ -442,7 +442,7 @@ def test_force_on_a_complete_running_project_reconciles_and_creates_nothing(mgr)
     assert {line.split()[3] for line in _hook_lines(m)} == {"1"}
 
 
-# ---- H3: an absolute record path, whatever the hook's working directory -----------
+# ---- an absolute record path, whatever the hook's working directory ---------------
 def test_a_relative_workspace_gives_the_hooks_an_absolute_record_path(mgr, tmp_path, monkeypatch):
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
@@ -479,7 +479,7 @@ def _running_project(m, plan_action, define_outcome="created"):
 
 @pytest.mark.parametrize("outcome", ["created"])
 def test_a_network_this_up_defined_on_the_running_path_is_recorded_as_created(mgr, outcome):
-    """H1 follow-up: reconcile_networks created it, so this up made it."""
+    """reconcile_networks created it, so this up made it."""
     before = {"domains": {D1: "uuid-1", D2: "uuid-2"}, "networks": {}}
     after = {"domains": {D1: "uuid-1", D2: "uuid-2"}, "networks": {N1: "net-uuid-new"}}
     m = mgr(hooks={"post_up": ["c"]}, inventories=(before, after), provisions=False)

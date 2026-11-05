@@ -54,7 +54,7 @@ TALOS_VERSION = PINS["TALOS_VERSION"]
 
 
 def _gen_fake() -> str:
-    """The config-generation fake talosctl of the v0-a tests."""
+    """The fake talosctl of the config-generation tests (test_talos_unattended_box.py)."""
     spec = importlib.util.spec_from_file_location(
         "talos_box_tests", os.path.join(REPO, "tests", "test_talos_unattended_box.py"))
     module = importlib.util.module_from_spec(spec)
@@ -230,7 +230,7 @@ def test_preflight_passes_on_a_free_host_and_changes_nothing(host):
     ("ip route", "cannot list the host's IPv4 routes"),
 ])
 def test_a_failed_observation_stops_preflight(host, failing, message):
-    """Review B1: a listing that failed must never read as "no overlap"."""
+    """A listing that failed must never read as "no overlap"."""
     host.set_world(fail=[failing])
     proc = _refused(host.run("preflight.sh"), message)
     assert "ready:" not in proc.stderr
@@ -249,7 +249,7 @@ def test_a_failed_observation_stops_preflight(host, failing, message):
     ("ip route", "garbage-route dev eth0\n", "cannot parse the host route"),
 ])
 def test_an_unreadable_observation_stops_preflight(host, entry, text, message):
-    """Review B1: a partial or unparseable inventory is a refusal too."""
+    """A partial or unparseable inventory is a refusal too."""
     host.set_world(garbage={entry: text})
     proc = _refused(host.run("preflight.sh"), message)
     assert "ready:" not in proc.stderr
@@ -406,7 +406,7 @@ def _set_inputs(host, **values) -> None:
 
 
 def test_a_backup_reached_through_a_symlink_into_the_workspace_is_refused(host):
-    """Review B2: the comparison is physical, not lexical."""
+    """The comparison is physical, not lexical."""
     host.lab_dir.mkdir()
     outside = host.root / "outside"
     outside.mkdir()
@@ -722,7 +722,7 @@ def test_a_node_whose_link_or_disk_is_not_the_expected_one_gets_nothing(lab, cha
 
 
 def test_without_a_volume_listing_the_hosts_creation_evidence_is_required(lab):
-    """Review B4: no listing and no host evidence means no install."""
+    """No listing and no host evidence means no install."""
     _edit_node(lab, "192.168.53.11", volumes_forbidden=True)
     proc = _ok(_install(lab))
     assert "the host saw nothing written to it since boxman created it" in proc.stderr
@@ -986,9 +986,9 @@ def test_flux_sh_refuses_to_run_unless_flux_is_on(lab):
 
 
 
-# ---- review regressions: ownership (B6) ----------------------------------------
+# ---- ownership after an incomplete up -------------------------------------------
 def test_a_failed_up_that_created_domains_blocks_every_later_run(lab):
-    """B6: domains from an up that never finished are not provably ours."""
+    """Domains from an up that never finished are not provably ours."""
     lab.edit(lambda w: w["boxman"].update(fail_after_create=True))
     _refused(_install(lab), "up failed after creating the domains")
     assert not (lab.driver / "run.env").exists()     # no post_up hook ran
@@ -1047,7 +1047,7 @@ def test_only_the_boot_disk_may_be_the_install_disk(host):
     _refused(host.run("preflight.sh"), "TALOS_INSTALL_DISK must be /dev/vda")
 
 
-# ---- review regressions: credential destinations (B7) ------------------------
+# ---- credential destinations ---------------------------------------------------
 def _checkout(path):
     (path / ".git").mkdir(parents=True)
     (path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
@@ -1082,7 +1082,7 @@ def test_a_restore_never_writes_into_a_checkout_on_the_control_vm(lab):
     assert not (repo / "state").exists()
 
 
-# ---- review regressions: bootstrap exactly once (B3) -------------------------
+# ---- bootstrap exactly once ----------------------------------------------------
 def _drop_bootstrap_journal(lab):
     for name in ("bootstrap.done", "bootstrap.intent"):
         for root in (lab.root / STATE, lab.backup / "state"):
@@ -1129,7 +1129,7 @@ def test_an_unreadable_journal_entry_stops_the_run(lab):
 
 
 def test_a_journal_lost_on_the_control_vm_only_is_drift_and_the_backup_is_kept(lab):
-    """B3: the backup never rotates away a journal entry the control VM lost."""
+    """The backup never rotates away a journal entry the control VM lost."""
     _ok(_install(lab))
     lab.edit(lambda w: w["talos"].update(etcd_down=True))
     (lab.root / STATE / "journal" / "bootstrap.done").unlink()
@@ -1143,7 +1143,7 @@ def test_a_journal_lost_on_the_control_vm_only_is_drift_and_the_backup_is_kept(l
 
 
 def test_existing_etcd_data_is_not_mistaken_for_a_fresh_node(lab):
-    """B3: Preparing and no members, but the data directory is not empty."""
+    """Preparing and no members, but the data directory is not empty."""
     _ok(_install(lab))
     _drop_bootstrap_journal(lab)
     lab.edit(lambda w: (w["talos"].update(etcd_down=True),
@@ -1197,7 +1197,7 @@ def test_a_failed_intent_write_sends_no_bootstrap(lab):
     assert "bootstrap_calls" not in lab.world()["talos"]
 
 
-# ---- review regressions: bounded calls (B9) ------------------------------------
+# ---- every call is bounded -----------------------------------------------------
 @pytest.mark.parametrize("world,message", [
     ({"kube": {"hang": ["get nodes"]}}, "nodes registered after"),
     ({"kube": {"hang": ["--raw=/readyz"]}}, "does not answer within"),
@@ -1219,7 +1219,7 @@ def test_a_hung_request_cannot_outlive_its_stage(lab, world, message):
     assert "TALOS_CALL_TIMEOUT=2\n" in shipped
 
 
-# ---- review regressions: Flux absence and destination (B5) -----------------------
+# ---- Flux absence and destination ----------------------------------------------
 @pytest.mark.parametrize("failing,message", [
     ("kubectl get crd", "cannot tell whether Flux is installed"),
     ("kubectl get gitrepository", "cannot read the flux-system GitRepository"),
@@ -1266,7 +1266,7 @@ def test_an_unclear_flux_destination_stops_before_bootstrap(lab, gitlab, message
 @pytest.mark.parametrize("var", ["TALOS_CALL_TIMEOUT", "TALOS_REQUEST_TIMEOUT", "TALOS_KUBE_TIMEOUT",
                                  "TALOS_PREBOOT_CHECKS"])
 def test_a_zero_bound_is_refused_before_anything_runs(lab, var):
-    """B9: timeout(1) and kubectl read 0 as "no bound"."""
+    """timeout(1) and kubectl read 0 as "no bound"."""
     _refused(_install(lab, **{var: "0"}), f"{var} must be a positive whole number")
     assert "calls" not in lab.world()["boxman"]
 
