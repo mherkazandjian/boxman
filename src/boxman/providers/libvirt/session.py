@@ -1351,37 +1351,43 @@ class LibVirtSession(SessionConfigMixin):
                     media.setdefault(row.source, domain)
         live: dict[str, ET.Element | None] = {}
         used = FilesInUse()
-        for source in sorted(sources):
-            chain = self._backing_chain_files(reads, source)
-            if chain is None:
-                if not self._source_absent(source):
-                    # not proved absent — which a source spelled otherwise
-                    # than normalised never is — so possibly there
-                    self._raise_if_gone(virsh, domain, uuid)
-                    return None
-                held = self._held_below(virsh, domain, uuid, source,
-                                        source in volumes, live)
-                if held is None:
-                    return None
-                for path in held:
-                    try:
-                        found = self._identify(path)
-                    except OSError as exc:
-                        self.logger.warning(
-                            f"could not read the identity of {path}, which "
-                            f"domain {domain} holds ({exc}): whether a file "
-                            f"a teardown would remove is that one cannot be "
-                            f"told, so each keeps everything — make it "
-                            f"accessible")
+        # the chains side by side too, a domain with many disks being as
+        # slow as many domains, and taken in the order they were read before
+        ordered = sorted(sources)
+        with InOrder(lambda source: self._backing_chain_files(reads, source),
+                     ordered, self._scan_workers()) as chains:
+            for source, outcome in zip(ordered, chains, strict=True):
+                chain = outcome.result()
+                if chain is None:
+                    if not self._source_absent(source):
+                        # not proved absent — which a source spelled
+                        # otherwise than normalised never is — so possibly
+                        # there
+                        self._raise_if_gone(virsh, domain, uuid)
                         return None
-                    if found is None:
-                        continue      # deleted too: nothing to protect
-                    name, identity = found
-                    used.setdefault(name, domain)
-                    used.identities.setdefault(identity, domain)
-                continue
-            if not self._record_in_use(used, domain, chain):
-                return None
+                    held = self._held_below(virsh, domain, uuid, source,
+                                            source in volumes, live)
+                    if held is None:
+                        return None
+                    for path in held:
+                        try:
+                            found = self._identify(path)
+                        except OSError as exc:
+                            self.logger.warning(
+                                f"could not read the identity of {path}, "
+                                f"which domain {domain} holds ({exc}): "
+                                f"whether a file a teardown would remove is "
+                                f"that one cannot be told, so each keeps "
+                                f"everything — make it accessible")
+                            return None
+                        if found is None:
+                            continue      # deleted too: nothing to protect
+                        name, identity = found
+                        used.setdefault(name, domain)
+                        used.identities.setdefault(identity, domain)
+                    continue
+                if not self._record_in_use(used, domain, chain):
+                    return None
         if active:
             jobs = self._block_job_files(virsh, reads, domain, uuid, live)
             if jobs is None:

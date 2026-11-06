@@ -100,7 +100,7 @@ def _host(*domains: tuple[str, list[str]]) -> Host:
         for i, path in enumerate(disks):
             if path not in host.files:
                 host.add(path, readable=True)
-            rows.append(("file", "disk", f"vd{'abcdefgh'[i]}", path))
+            rows.append(("file", "disk", f"vd{chr(ord('a') + i)}", path))
         host.define_domain(name, *rows)
     return host
 
@@ -195,6 +195,44 @@ class TestMergedInListingOrder:
         assert side_by_side == serial
         assert side_by_side.identities == serial.identities
         assert side_by_side["/ws/shared-0.qcow2"] == "vm-00"
+
+
+class TestADomainsDisksSideBySide:
+    """The backing chains of one domain's disks are read side by side too,
+    and taken in the order they were read before."""
+
+    def test_a_domain_with_many_disks_reads_their_chains_at_once(self):
+        disks = [f"/ws/data{i:02d}.qcow2" for i in range(12)]
+        host = _host(("vm-a", disks))
+        overlap = _Overlap(host, disks[0], then=disks[-1], command="qemu-img")
+
+        in_use = _scan(host)
+
+        assert overlap.overlapped
+        assert in_use == {disk: "vm-a" for disk in disks}
+        assert in_use == _scan(_host(("vm-a", disks)), workers=1)
+
+    def test_the_first_chain_that_cannot_be_read_still_fails_the_scan(self):
+        host = _host(("vm-a", ["/ws/a.qcow2", "/ws/b.qcow2", "/ws/c.qcow2"]))
+        host.files["/ws/b.qcow2"].corrupt = True
+        overlap = _Overlap(host, "/ws/a.qcow2", then="/ws/c.qcow2",
+                           command="qemu-img")
+
+        assert _scan(host) is None
+        assert overlap.overlapped
+
+    def test_a_deleted_disk_of_a_shut_off_domain_still_holds_nothing(self):
+        host = _host(("vm-a", ["/ws/a.qcow2", "/ws/c.qcow2"]))
+        host.define_domain("vm-a", ("file", "disk", "vda", "/ws/a.qcow2"),
+                           ("file", "cdrom", "sda", "/ws/b-gone.iso"),
+                           ("file", "disk", "vdb", "/ws/c.qcow2"))
+        overlap = _Overlap(host, "/ws/a.qcow2", then="/ws/c.qcow2",
+                           command="qemu-img")
+
+        in_use = _scan(host)
+
+        assert overlap.overlapped
+        assert in_use == {"/ws/a.qcow2": "vm-a", "/ws/c.qcow2": "vm-a"}
 
 
 class TestStillFailsClosed:
