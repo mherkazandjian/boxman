@@ -1127,7 +1127,15 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   attaching it and it is still at the recorded target with the recorded
   source; a replacement at a reused target, a disk a snapshot moved behind an
   overlay, or a hand-attached disk is reported and left alone, and the image
-  file is never deleted. The detach needs the guest shut off: on a running VM
+  file is never deleted. One the VM's snapshots record stays because libvirt
+  cannot delete a snapshot of a disk the domain no longer has: `snapshot
+  delete` them first, and the next `update` detaches it. A declared disk under
+  snapshots is on an overlay of its file; `update` takes it for that disk when
+  every layer above the file is one the VM's snapshots record for it, and
+  otherwise (an overlay made by hand, or snapshots or a chain it cannot read)
+  changes nothing on that VM and says why. A grown disk under snapshots grows
+  the overlay the guest writes to; the snapshots keep their size. The detach
+  needs the guest shut off: on a running VM
   it stays pending — an ordinary reboot does *not* apply it — until
   `update --restart` or an `update` while the VM is off.
 - **`shared_folders`** (virtiofs): hot-attached with a persistent fallback to

@@ -14,6 +14,8 @@ import pytest
 from boxman.exceptions import ProvisionError
 from boxman.providers.libvirt.disk_ownership import (
     DiskRecord,
+    SnapshotOverlays,
+    TargetConflict,
     occupied_target_conflicts,
     plan_disk_removals,
     read_disk_records,
@@ -27,6 +29,8 @@ pytestmark = pytest.mark.unit
 
 ROOT = "/vm/bprj__demo__bprj_cluster_node.qcow2"
 DATA = "/vm/bprj__demo__bprj_cluster_node_data.qcow2"
+#: the overlay a take of s1 puts that disk on, beside it (#294, finding 5)
+DATA_S1 = "/vm/bprj__demo__bprj_cluster_node_data.s1"
 
 
 def _attached(target, source, size_mb=1024):
@@ -154,6 +158,8 @@ class TestIndependentOverlayBackedByTheRecordedFile:
     An overlay created independently, backed by the recorded file, passes
     a backing-chain test: its chain contains the recorded source. Exact
     source matching is what rejects it -- the overlay's own path differs.
+    The overlays the domain's own snapshots made are let through since
+    #294 (finding 5), and this one still is not: no snapshot records it.
     """
 
     OVERLAY = "/vm/bprj__demo__bprj_cluster_node_data.overlay.qcow2"
@@ -168,13 +174,37 @@ class TestIndependentOverlayBackedByTheRecordedFile:
         assert removals == []
         assert self.OVERLAY in refusals[0][1]
 
+    def test_it_is_refused_with_the_snapshots_read_too(self):
+        """The domain has a snapshot of that disk, which made another
+        overlay: being built on the recorded file is not enough."""
+        reads = []
+        overlays = SnapshotOverlays(
+            lambda: {'vdb': {DATA_S1, DATA}},
+            lambda source: reads.append(source) or [source, DATA])
+
+        removals, refusals = plan_disk_removals(
+            records=[_record(name='data', target='vdb', source=DATA)],
+            desired_disks=[],
+            actual_disks=[_attached('vda', ROOT),
+                          _attached('vdb', self.OVERLAY)],
+            overlays=overlays)
+
+        assert removals == []
+        assert self.OVERLAY in refusals[0][1]
+        assert 'no snapshot of this VM records it' in refusals[0][1]
+        # refused on the top layer alone: its chain is never read
+        assert reads == []
+
     def test_a_snapshot_head_is_refused_the_same_way(self):
         """A snapshot moves the head; the source no longer matches.
 
-        Phrased as "the source differs", not "while a snapshot exists":
-        collapse_to() rebases the existing head rather than restoring the
-        original pathname, so collapsing does not necessarily make this
-        removable again.
+        Without the domain's snapshots read, that is all the rule knows;
+        with them it is refused all the same, and says the snapshots are
+        why (:class:`TestDisksUnderTheirOwnSnapshots`). Phrased as "the
+        source differs", not "while a snapshot exists": collapse_to()
+        rebases the existing head rather than restoring the original
+        pathname, so collapsing does not necessarily make this removable
+        again.
         """
         snap = "/vm/bprj__demo__bprj_cluster_node_data.snap1"
         removals, refusals = plan_disk_removals(
@@ -775,7 +805,7 @@ class TestOccupiedTargetConflicts:
             desired_disks=[{'name': 'logs', 'target': 'vdb', 'size': 4096}],
             actual_disks=[_attached('vda', ROOT), _attached('vdb', DATA)])
 
-        assert conflicts == [('logs', 'vdb', DATA)]
+        assert conflicts == [('logs', 'vdb', DATA, '')]
 
     def test_an_omitted_target_conflicts_the_same_way(self):
         conflicts = occupied_target_conflicts(
@@ -783,7 +813,7 @@ class TestOccupiedTargetConflicts:
             desired_disks=[{'name': 'logs', 'size': 4096}],
             actual_disks=[_attached('vda', ROOT), _attached('vdb', DATA)])
 
-        assert conflicts == [('logs', 'vdb', DATA)]
+        assert conflicts == [('logs', 'vdb', DATA, '')]
 
     def test_a_vacant_target_with_stale_metadata_is_not_a_conflict(self):
         """The operator already detached the old disk by hand.
@@ -812,7 +842,7 @@ class TestOccupiedTargetConflicts:
             actual_disks=[_attached('vda', ROOT),
                           _attached('vdb', '/vm/someone-elses.qcow2')])
 
-        assert conflicts == [('logs', 'vdb', '/vm/someone-elses.qcow2')]
+        assert conflicts == [('logs', 'vdb', '/vm/someone-elses.qcow2', '')]
 
     def test_swapping_targets_between_declared_disks_is_a_conflict(self):
         """Each one's target holds the other's file."""
@@ -832,7 +862,7 @@ class TestOccupiedTargetConflicts:
             desired_disks=[{'name': 'logs', 'target': 'vdb', 'size': 4096}],
             actual_disks=[_attached('vdb', DATA)])
 
-        assert conflicts == [('logs', 'vdb', DATA)]
+        assert conflicts == [('logs', 'vdb', DATA, '')]
 
     def test_a_still_declared_disk_is_not_a_conflict(self):
         conflicts = occupied_target_conflicts(
@@ -862,7 +892,7 @@ class TestOccupiedTargetConflicts:
             [{'name': 'logs', 'target': 'vdb'}],
             [_attached('vdb', '/vm/attached-by-hand.qcow2')],
             expected_paths={'logs': '/vm/vm01_logs.qcow2'}) == [
-                ('logs', 'vdb', '/vm/attached-by-hand.qcow2')]
+                ('logs', 'vdb', '/vm/attached-by-hand.qcow2', '')]
 
 
 class TestAConflictFailsBeforeAnyMutation:
@@ -873,7 +903,7 @@ class TestAConflictFailsBeforeAnyMutation:
                      resize_disks=[{'target': 'vdb', 'source': DATA,
                                     'current_size_mb': 1024,
                                     'desired_size_mb': 4096}])
-        diff['disk_conflicts'] = [('logs', 'vdb', DATA)]
+        diff['disk_conflicts'] = [TargetConflict('logs', 'vdb', DATA)]
         diff['cpu_changed'] = True
         mgr, result = _run(diff)
 
@@ -1140,7 +1170,7 @@ class TestAStaleRecordCannotVouchForAReplacement:
             actual_disks=[_attached('vdb', '/vm/replacement.qcow2')],
             expected_paths={'data': DATA})
 
-        assert conflicts == [('data', 'vdb', '/vm/replacement.qcow2')]
+        assert conflicts == [('data', 'vdb', '/vm/replacement.qcow2', '')]
 
     def test_the_unchanged_disk_is_still_fine(self):
         conflicts = occupied_target_conflicts(
@@ -1183,3 +1213,203 @@ class TestDeferralsSurviveTheWorkerBoundary:
         assert result['status'] == 'needs_restart'
         assert 'restarted' in result['details']
         assert 'saved state' in result['details']
+
+
+# ---------------------------------------------------------------------------
+# Disks under the domain's own snapshots (#294, finding 5)
+# ---------------------------------------------------------------------------
+
+#: ... or in a disk_snapshot_dir (#266)
+DATA_S1_DSD = "/ovl/bprj__demo__bprj_cluster_node_data.s1"
+#: a restore puts it on another overlay, beside the disk
+DATA_REVERT = "/vm/bprj__demo__bprj_cluster_node_data.1793883477"
+#: an overlay made outside boxman, by hand with qemu-img create -b
+FOREIGN = "/vm/made-by-hand.qcow2"
+
+
+def _snapshots(layers, chains):
+    """A domain whose snapshots record *layers* (``{target: files}``, or
+    ``None``: unreadable) and whose images have *chains*; each read is
+    counted in the dict returned with it."""
+    reads = {'snapshots': 0, 'chains': []}
+
+    def recorded():
+        reads['snapshots'] += 1
+        return layers
+
+    def chain_of(source):
+        reads['chains'].append(source)
+        return chains.get(source)
+
+    return SnapshotOverlays(recorded, chain_of), reads
+
+
+class TestDisksUnderTheirOwnSnapshots:
+    """Once a VM has a snapshot, no data disk of it is at its recorded path.
+
+    A take moves each disk onto an overlay of it, and a restore onto
+    another; compared by path alone, each read as a replacement, and
+    ``update`` refused every change to that VM, cpu and memory included.
+    The recorded file under overlays the domain's own snapshots record for
+    that disk is accepted, and nothing else: an overlay made any other way
+    is still refused (design 4), and so is one that cannot be checked.
+    """
+
+    def _conflicts(self, source, overlays, records=None, name='data',
+                   expected=DATA):
+        return occupied_target_conflicts(
+            records=[_record()] if records is None else records,
+            desired_disks=[{'name': name, 'target': 'vdb', 'size': 4096}],
+            actual_disks=[_attached('vda', ROOT), _attached('vdb', source)],
+            expected_paths={name: expected},
+            overlays=overlays)
+
+    def test_the_overlay_a_take_made_is_the_disk(self):
+        overlays, _reads = _snapshots({'vdb': {DATA_S1, DATA}},
+                                      {DATA_S1: [DATA_S1, DATA]})
+
+        assert self._conflicts(DATA_S1, overlays) == []
+
+    def test_an_overlay_in_a_disk_snapshot_dir_is_the_disk(self):
+        overlays, _reads = _snapshots({'vdb': {DATA_S1_DSD, DATA}},
+                                      {DATA_S1_DSD: [DATA_S1_DSD, DATA]})
+
+        assert self._conflicts(DATA_S1_DSD, overlays) == []
+
+    def test_a_restore_overlay_on_a_take_overlay_is_the_disk(self):
+        """take s1, take s2, restore s2: the guest is on a revert overlay
+        of the overlay s1 made, which s1 records and s2 built on."""
+        overlays, _reads = _snapshots(
+            {'vdb': {DATA_REVERT, DATA_S1, DATA}},
+            {DATA_REVERT: [DATA_REVERT, DATA_S1, DATA]})
+
+        assert self._conflicts(DATA_REVERT, overlays) == []
+
+    def test_a_disk_predating_the_record_is_its_file_under_snapshots(self):
+        overlays, _reads = _snapshots({'vdb': {DATA_S1, DATA}},
+                                      {DATA_S1: [DATA_S1, DATA]})
+
+        assert self._conflicts(DATA_S1, overlays, records=[]) == []
+
+    def test_nothing_is_read_for_a_disk_at_its_recorded_path(self):
+        overlays, reads = _snapshots(None, {})
+
+        assert self._conflicts(DATA, overlays) == []
+        assert reads == {'snapshots': 0, 'chains': []}
+
+    def test_a_foreign_overlay_of_the_recorded_disk_is_still_a_conflict(self):
+        overlays, reads = _snapshots({'vdb': {DATA_S1, DATA}},
+                                     {FOREIGN: [FOREIGN, DATA]})
+
+        [conflict] = self._conflicts(FOREIGN, overlays)
+
+        assert conflict[:3] == ('data', 'vdb', FOREIGN)
+        assert conflict.why == "no snapshot of this VM records it for vdb"
+        assert reads['chains'] == []
+
+    def test_a_foreign_layer_under_a_snapshot_overlay_is_still_a_conflict(
+            self):
+        overlays, _reads = _snapshots({'vdb': {DATA_S1, DATA}},
+                                      {DATA_S1: [DATA_S1, FOREIGN, DATA]})
+
+        [conflict] = self._conflicts(DATA_S1, overlays)
+
+        assert FOREIGN in conflict.why
+        assert 'no snapshot of this VM records' in conflict.why
+
+    def test_an_overlay_recorded_for_another_disk_is_still_a_conflict(self):
+        overlays, _reads = _snapshots({'vdc': {DATA_S1, DATA}},
+                                      {DATA_S1: [DATA_S1, DATA]})
+
+        [conflict] = self._conflicts(DATA_S1, overlays)
+
+        assert 'for vdb' in conflict.why
+
+    def test_a_renamed_declaration_still_conflicts_under_snapshots(self):
+        """The overlay is data's; logs, declared at its target, does not
+        get it -- the rename of #164 F2, finding 4, under a snapshot."""
+        logs = "/vm/bprj__demo__bprj_cluster_node_logs.qcow2"
+        overlays, _reads = _snapshots({'vdb': {DATA_S1, DATA}},
+                                      {DATA_S1: [DATA_S1, DATA]})
+
+        [conflict] = self._conflicts(DATA_S1, overlays, name='logs',
+                                     expected=logs)
+
+        assert conflict.why == f"it is not built on {logs}"
+
+    def test_snapshots_that_cannot_be_read_are_a_conflict_that_says_so(self):
+        overlays, reads = _snapshots(None, {DATA_S1: [DATA_S1, DATA]})
+
+        [conflict] = self._conflicts(DATA_S1, overlays)
+
+        assert 'snapshots of this VM could not be read' in conflict.why
+        assert reads['chains'] == []
+
+    def test_a_chain_that_cannot_be_read_is_a_conflict_that_says_so(self):
+        overlays, _reads = _snapshots({'vdb': {DATA_S1, DATA}}, {})
+
+        [conflict] = self._conflicts(DATA_S1, overlays)
+
+        assert 'backing chain could not be read' in conflict.why
+
+    def test_without_snapshots_a_replacement_reads_as_before(self):
+        overlays, reads = _snapshots({}, {})
+
+        assert self._conflicts(FOREIGN, overlays) == [
+            ('data', 'vdb', FOREIGN, '')]
+        assert reads['chains'] == []
+
+    def test_a_dropped_disk_stays_while_its_snapshots_record_it(self):
+        """libvirt deletes an external snapshot only while every disk it
+        records is in the domain: detached, the disk left each snapshot of
+        it undeletable. So it stays, and the refusal says what to do."""
+        overlays, _reads = _snapshots({'vdb': {DATA_S1, DATA}},
+                                      {DATA_S1: [DATA_S1, DATA]})
+
+        removals, refusals = plan_disk_removals(
+            records=[_record()], desired_disks=[],
+            actual_disks=[_attached('vda', ROOT), _attached('vdb', DATA_S1)],
+            overlays=overlays)
+
+        assert removals == []
+        [(record, reason)] = refusals
+        assert record.name == 'data'
+        assert reason.startswith("this VM's snapshots record it")
+        assert 'Delete those snapshots first' in reason
+
+    def test_a_foreign_overlay_is_refused_for_what_it_is(self):
+        overlays, _reads = _snapshots({'vdb': {DATA_S1, DATA}},
+                                      {FOREIGN: [FOREIGN, DATA]})
+
+        _removals, [(_rec, reason)] = plan_disk_removals(
+            records=[_record()], desired_disks=[],
+            actual_disks=[_attached('vda', ROOT), _attached('vdb', FOREIGN)],
+            overlays=overlays)
+
+        assert reason.endswith("(no snapshot of this VM records it for vdb)")
+
+    def test_unreadable_snapshots_refuse_a_removal_and_say_so(self):
+        overlays, _reads = _snapshots(None, {})
+
+        removals, refusals = plan_disk_removals(
+            records=[_record()], desired_disks=[],
+            actual_disks=[_attached('vda', ROOT), _attached('vdb', DATA_S1)],
+            overlays=overlays)
+
+        assert removals == []
+        assert 'could not be read' in refusals[0][1]
+
+    def test_the_refusal_says_why(self):
+        diff = _diff(vm_state='shut off')
+        diff['disk_conflicts'] = [TargetConflict(
+            'data', 'vdb', FOREIGN, 'no snapshot of this VM records it for '
+            'vdb')]
+        diff['cpu_changed'] = True
+
+        mgr, result = _run(diff)
+
+        assert result['status'] == 'failed'
+        assert (f"which still holds {FOREIGN} (no snapshot of this VM "
+                f"records it for vdb)") in result['details']
+        mgr.provider.update_vm_cpu_memory.assert_not_called()
+
