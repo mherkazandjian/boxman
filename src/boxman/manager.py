@@ -28,7 +28,7 @@ from boxman.providers import merge_provider_configs, primary_provider_type
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.runtime import RuntimeBase, create_runtime
 from boxman.utils.jinja_env import create_jinja_env
-from boxman.utils.shell import interrupt_on_sigterm, stop_workers
+from boxman.utils.shell import interrupt_on_signals, stop_workers
 
 #: Seconds to wait for a finished child's queue message before declaring its
 #: result missing (the child has already joined, so any wait here is just
@@ -50,12 +50,13 @@ def _parallel_worker(result_queue, label, target, args):
     raises — so the parent can never mistake a crashed worker for a
     success (or block forever waiting for a message that never comes).
 
-    *target* runs with :func:`~boxman.utils.shell.interrupt_on_sigterm`:
+    *target* runs with :func:`~boxman.utils.shell.interrupt_on_signals`:
     the SIGTERM the parent stops it with, when interrupted itself, stops the
     command it is running as a Ctrl-C does, rather than end the worker
-    there and then and leave the command running on alone (#294). Python
-    handlers, not ignored signals, so the commands it starts take SIGINT as
-    boxman does. Stopped, the worker has no result, and exits 130.
+    there and then and leave the command running on alone (#294); so does a
+    SIGHUP or SIGQUIT. Python handlers, not ignored signals, so the commands
+    it starts take SIGINT as boxman does. Stopped, the worker has no result,
+    and exits 130.
 
     Once *target* has returned, the parent owns cancellation: SIGINT is
     ignored while the result is written and flushed. A terminal's Ctrl-C
@@ -64,7 +65,7 @@ def _parallel_worker(result_queue, label, target, args):
     wait on forever. A SIGTERM ends the worker there, with no command left
     to stop.
     """
-    with interrupt_on_sigterm():
+    with interrupt_on_signals(worker=True):
         try:
             outcome = (label, True, target(*args))
         except Exception as exc:

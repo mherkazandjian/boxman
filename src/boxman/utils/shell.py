@@ -37,11 +37,21 @@ import contextlib
 import os
 import signal
 import subprocess
+import sys
+import threading
 import time
 from collections.abc import Iterable, Iterator
 from typing import Any
 
 import invoke
+
+#: the signals :func:`interrupt_on_signals` takes as a Ctrl-C
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+
+#: whether the stop under way was asked for by one of STOP_SIGNALS, not by a
+#: Ctrl-C at the terminal, which has reached a command in boxman's group
+#: itself: the stop takes it (see _StoppingLocal._stop)
+_asked_by_a_signal = False
 
 
 def _has_terminal() -> bool:
@@ -90,6 +100,118 @@ def _alive(pid: int, start: str) -> bool:
     return fields is not None and fields[19] == start and fields[0] != "Z"
 
 
+def _kill_from_another_group(number: int, pids: Iterable[int]) -> None:
+    """Send signal *number* to *pids*, from a short-lived process in a
+    process group of its own.
+
+    sudo passes on no signal that comes from the process group of whatever
+    started it, taking it for one the terminal sent the whole group: sent
+    from boxman's, which a command run with a terminal shares, a SIGTERM
+    never reached the command sudo runs as root (#294 review).
+    """
+    pids = [str(pid) for pid in pids]
+    if not pids:
+        return
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(
+            ["/bin/sh", "-c", 'kill -"$0" "$@"', str(int(number)), *pids],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True, timeout=10)
+
+
+#: the guardian: a process in a group of its own that outlives boxman only
+#: to end the commands boxman leaves behind. It reads "+<group>" for each
+#: command group started and "-<group>" for each that ended. When the pipe
+#: closes, boxman has gone, however it was killed, and each group still
+#: there is sent SIGTERM, then SIGKILL the grace after
+_GUARDIAN = r"""
+import os, signal, sys, time
+for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+    signal.signal(number, signal.SIG_IGN)
+groups = set()
+for line in sys.stdin.buffer:
+    if line[:1] == b"+":
+        groups.add(int(line[1:]))
+    elif line[:1] == b"-":
+        groups.discard(int(line[1:]))
+def there(group):
+    try:
+        os.killpg(group, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+for number in (signal.SIGTERM, signal.SIGKILL):
+    groups = set(filter(there, groups))
+    for group in groups:
+        try:
+            os.killpg(group, number)
+        except OSError:
+            pass
+    deadline = time.monotonic() + float(sys.argv[1])
+    while number == signal.SIGTERM and any(map(there, groups)) and time.monotonic() < deadline:
+        time.sleep(0.05)
+"""
+
+#: (the PID of the process it guards, the pipe to it), or None
+_guardian: tuple[int, int | None] | None = None
+_guardian_lock = threading.Lock()
+
+
+def _tell_guardian(line: bytes) -> None:
+    """Pass *line* to this process's guardian, started on first use.
+
+    Without a terminal, a command runs in a process group of its own, so
+    that sudo passes boxman's signals on to it: a SIGKILL, SIGHUP or SIGQUIT
+    to boxman's group, which ended the command with boxman, no longer
+    reached it, and it ran on alone (#294 review). A parent-death signal
+    would reach the shell alone, not the rest of a compound command.
+    """
+    global _guardian
+    with _guardian_lock:
+        if _guardian is None or _guardian[0] != os.getpid():
+            _guardian = (os.getpid(), _start_guardian())
+        pipe = _guardian[1]
+    if pipe is not None:
+        with contextlib.suppress(OSError):
+            os.write(pipe, line)
+
+
+def _start_guardian() -> int | None:
+    """Start a guardian; return the pipe to it, or None if it cannot be."""
+    if not sys.executable:
+        return None
+    read, write = os.pipe()
+    try:
+        os.posix_spawn(
+            sys.executable,
+            [sys.executable, "-I", "-S", "-c", _GUARDIAN, str(_StoppingLocal.TERM_TIMEOUT)],
+            os.environ,
+            file_actions=[(os.POSIX_SPAWN_DUP2, read, 0),
+                          (os.POSIX_SPAWN_OPEN, 1, os.devnull, os.O_WRONLY, 0),
+                          (os.POSIX_SPAWN_OPEN, 2, os.devnull, os.O_WRONLY, 0)],
+            setpgroup=0)
+    except (OSError, NotImplementedError):
+        os.close(write)
+        return None
+    finally:
+        os.close(read)
+    return write
+
+
+def _forget_guardian() -> None:
+    """In a forked child, as a worker is: its parent's guardian is not its
+    own, and holding the pipe to it would keep it from seeing the parent
+    go. The child starts a guardian of its own when it needs one."""
+    global _guardian
+    if _guardian is not None and _guardian[1] is not None:
+        with contextlib.suppress(OSError):
+            os.close(_guardian[1])
+    _guardian = None
+
+
+os.register_at_fork(after_in_child=_forget_guardian)
+
+
 class _StoppingLocal(invoke.runners.Local):
     """invoke's local runner, made to stop a command on a Ctrl-C.
 
@@ -104,13 +226,16 @@ class _StoppingLocal(invoke.runners.Local):
     terminal, it runs in a session, and so a process group, of its own, and
     every signal goes to that group: to each process of a compound command
     or a pipeline, not only to the shell, which does not pass a signal on.
-    With a terminal, it stays in boxman's group: there it can prompt on the
+    The guardian ends the group if boxman goes without stopping it. With a
+    terminal, it stays in boxman's group: there it can prompt on the
     terminal, as sudo asking for a password does, where in a group of its
     own the prompt would stop it (SIGTTOU); and a Ctrl-C at the terminal
     reaches it directly. It is not sent that SIGINT a second time, which
-    could cut its handling of the first short; the SIGTERM and SIGKILL go to
-    it and every process below it. A command run with ``pty=True`` leads a
-    session of its own, as invoke starts it, and is stopped as a group.
+    could cut its handling of the first short, unless the stop was asked for
+    otherwise; the signals go to it and every process below it, from a
+    process in another group, as sudo would pass on none from boxman's. A
+    command run with ``pty=True`` leads a session of its own, as invoke
+    starts it, and is stopped as a group.
     """
 
     #: how long a command has to end after its SIGINT, before its SIGTERM
@@ -126,31 +251,35 @@ class _StoppingLocal(invoke.runners.Local):
         # then waits for the command's exec: a KeyboardInterrupt in between
         # left _stop() no command to stop, and the command ran on without
         # boxman (#278). So a SIGINT is held back until invoke has the
-        # command, and handled then. Blocking SIGINT would not do: the
-        # command inherits the mask, so the SIGINT _stop() sends it stays
-        # pending, and another thread takes a SIGINT blocked here and has it
-        # raised here all the same. Only a Python handler is swapped, for
-        # another, which leaves the command's disposition as it was; an
-        # ignored SIGINT, or the default one, raises nothing to hold back
-        previous = signal.getsignal(signal.SIGINT)
+        # command, and handled then, and so is a signal interrupt_on_signals
+        # takes as one. Blocking it would not do: the command inherits the
+        # mask, so the SIGINT _stop() sends it stays pending, and another
+        # thread takes a SIGINT blocked here and has it raised here all the
+        # same. Only a Python handler is swapped, for another, which leaves
+        # the command's disposition as it was; an ignored signal, or one
+        # left to its default, raises nothing to hold back
         held_back: list[tuple[Any, ...]] = []
-        swapped = False
-        if callable(previous):
+        swapped: dict[int, Any] = {}
+        for number in (signal.SIGINT, *STOP_SIGNALS):
+            previous = signal.getsignal(number)
+            if not callable(previous):
+                continue
             try:
-                signal.signal(signal.SIGINT, lambda *received: held_back.append(received))
-                swapped = True
+                signal.signal(number, lambda *received: held_back.append(received))
             except ValueError:
-                # not the main thread, which is where SIGINT is handled anyway
-                pass
+                # not the main thread, which is where signals are handled anyway
+                break
+            swapped[number] = previous
         try:
             self._start(command, shell, env)
         finally:
-            if swapped:
-                signal.signal(signal.SIGINT, previous)
-                if held_back:
-                    # as if it came now, once however many came: for the
-                    # default handler, a KeyboardInterrupt
-                    previous(*held_back[0])
+            for number, previous in swapped.items():
+                signal.signal(number, previous)
+            if held_back:
+                # as if it came now, once however many came: for the
+                # default SIGINT handler, a KeyboardInterrupt
+                number, frame = held_back[0]
+                swapped[number](number, frame)
 
     def _start(self, command: str, shell: str, env: dict[str, Any]) -> None:
         #: the process group the command leads, or None: it is in boxman's
@@ -172,6 +301,8 @@ class _StoppingLocal(invoke.runners.Local):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE, start_new_session=True)
             self.group = self.process.pid
+        if self.group is not None:
+            _tell_guardian(b"+%d\n" % self.group)
 
     @property
     def process_is_finished(self) -> bool:
@@ -190,6 +321,14 @@ class _StoppingLocal(invoke.runners.Local):
         # command that ignores its SIGINT a deadline (#244 review)
         self.interrupted = True
         self._stop()
+
+    def _thread_join_timeout(self, target: Any) -> int | None:
+        # once stopped, the command may have left a process holding its
+        # output open, one sudo ran as root or one that left its group, and
+        # invoke waited for it to end before it returned (#294 review)
+        if getattr(self, "interrupted", False):
+            return 1
+        return super()._thread_join_timeout(target)
 
     def _started(self) -> bool:
         if self.using_pty:
@@ -223,10 +362,8 @@ class _StoppingLocal(invoke.runners.Local):
         # them by: once reaped, its PID may be another process's
         if not self.process_is_finished:
             self.signalled.update(_tree(self.process.pid))
-        for pid, start in self.signalled.items():
-            if _alive(pid, start):
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(pid, number)
+        _kill_from_another_group(
+            number, [pid for pid, start in self.signalled.items() if _alive(pid, start)])
 
     def _wait(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
@@ -244,13 +381,17 @@ class _StoppingLocal(invoke.runners.Local):
         It is sent SIGINT; SIGTERM if it has not ended STOP_TIMEOUT later;
         and SIGKILL if it still has not TERM_TIMEOUT after that. One in
         boxman's group had the SIGINT from the terminal already, and is not
-        sent another. Another Ctrl-C, at any step, moves on to the next at
-        once. Either way, the command has ended, and been reaped, when this
-        returns.
+        sent another, unless one of STOP_SIGNALS asked for the stop, or a
+        worker's parent did. Another Ctrl-C, at any step, moves on to the
+        next at once. Either way, the command has ended, and been reaped,
+        when this returns.
         """
+        global _asked_by_a_signal
         if not self._started():
             return
-        steps = [(signal.SIGINT if self.group is not None else None, self.STOP_TIMEOUT),
+        forward = self.group is not None or _asked_by_a_signal
+        _asked_by_a_signal = False
+        steps = [(signal.SIGINT if forward else None, self.STOP_TIMEOUT),
                  (signal.SIGTERM, self.TERM_TIMEOUT)]
         step = 0
         while True:
@@ -287,6 +428,10 @@ class _StoppingLocal(invoke.runners.Local):
             # wait for it, so the command would run on without boxman
             self._stop()
             raise
+        finally:
+            # ended, or let go of (disown, asynchronous): not the guardian's
+            if getattr(self, "group", None) is not None:
+                _tell_guardian(b"-%d\n" % self.group)
         if self.interrupted:
             raise KeyboardInterrupt
         return result
@@ -298,46 +443,61 @@ def stop_timeout() -> float:
 
 
 @contextlib.contextmanager
-def interrupt_on_sigterm() -> Iterator[None]:
-    """Within it, a SIGTERM stops this process as a first Ctrl-C does
-    (#294).
+def interrupt_on_signals(worker: bool = False) -> Iterator[None]:
+    """Within it, a SIGTERM, SIGHUP or SIGQUIT stops this process as a
+    Ctrl-C does (#294).
 
-    By default a SIGTERM ended boxman, or one of its worker processes, there
-    and then, and the command it was running ran on alone: in a session of
-    its own, a SIGTERM to boxman's group no longer reaches it either. Now
-    the command is stopped, as on a Ctrl-C, and the KeyboardInterrupt
-    raised. A Ctrl-C at the terminal reaches a worker as well as its parent,
-    so the parent's SIGTERM finds the worker stopping its command already:
-    it changes nothing then, where a second Ctrl-C would cut that stop
-    short. Both are Python handlers, which the commands started do not
-    inherit, and the ones it found are put back on the way out. Off the main
-    thread, where no signal is handled, it changes nothing.
+    By default each ended boxman, or one of its worker processes, there and
+    then, and the command it was running ran on alone: in a session of its
+    own, a signal to boxman's group no longer reaches it either. Now the
+    command is stopped, as on a Ctrl-C, and the KeyboardInterrupt raised;
+    with a terminal, the command is sent the SIGINT the terminal did not
+    send it. Another, during the stop, moves it on, as another Ctrl-C does.
+    A *worker* is the exception: a Ctrl-C at the terminal reaches it as well
+    as its parent, so the parent's SIGTERM finds it stopping its command
+    already, and changes nothing then, where a second Ctrl-C would cut that
+    stop short. A signal ignored on the way in, as SIGINT is in a script's
+    background job, stays ignored, and the commands started inherit that, as
+    they did. The handlers are Python ones, which commands do not inherit,
+    and the ones found are put back on the way out. Off the main thread,
+    where no signal is handled, it changes nothing.
     """
-    interrupted = False
+    stopping = False
 
     def on_sigint(number: int, frame: Any) -> None:
-        nonlocal interrupted
-        interrupted = True
+        nonlocal stopping
+        stopping = True
         signal.default_int_handler(number, frame)
 
-    def on_sigterm(number: int, frame: Any) -> None:
-        # whatever handles SIGINT now: on_sigint, or, while a command
-        # starts, the runner, which holds it back; and nothing once the
-        # SIGINT is ignored
+    def on_stop_signal(number: int, frame: Any) -> None:
+        global _asked_by_a_signal
+        nonlocal stopping
+        if worker and stopping:
+            return
+        stopping = True
+        _asked_by_a_signal = True
+        # whatever handles SIGINT now: on_sigint, or, while a command starts,
+        # the runner, which holds it back; with SIGINT ignored, this raises
         handler = signal.getsignal(signal.SIGINT)
-        if not interrupted and callable(handler):
+        if callable(handler):
             handler(signal.SIGINT, frame)
+        else:
+            raise KeyboardInterrupt
 
+    handlers = {signal.SIGINT: on_sigint, **{number: on_stop_signal for number in STOP_SIGNALS}}
+    previous: dict[int, Any] = {}
     try:
-        previous = (signal.signal(signal.SIGINT, on_sigint),
-                    signal.signal(signal.SIGTERM, on_sigterm))
+        for number, handler in handlers.items():
+            if signal.getsignal(number) is not signal.SIG_IGN:
+                previous[number] = signal.signal(number, handler)
     except ValueError:
+        # not the main thread: nothing was changed
         yield
         return
     try:
         yield
     finally:
-        for number, handler in zip((signal.SIGINT, signal.SIGTERM), previous, strict=True):
+        for number, handler in previous.items():
             signal.signal(number, signal.SIG_DFL if handler is None else handler)
 
 
@@ -346,7 +506,7 @@ _NOT_SWAPPED = object()
 
 
 def stop_workers(processes: Iterable[Any], slack: float = 5) -> None:
-    """Stop worker processes, which run :func:`interrupt_on_sigterm`, and
+    """Stop worker processes, which run :func:`interrupt_on_signals`, and
     reap them (#294).
 
     Each is sent SIGTERM, a Ctrl-C to it: the command it is running is

@@ -24,7 +24,7 @@ from boxman.utils.config_diagnostics import (
     yaml_config_error,
 )
 from boxman.utils.jinja_env import create_jinja_env
-from boxman.utils.shell import interrupt_on_sigterm
+from boxman.utils.shell import interrupt_on_signals
 
 #: Names of the :class:`BoxmanManager` methods the CLI may dispatch to.
 #: The parser declares them via ``set_defaults(handler='<name>')`` and
@@ -193,17 +193,19 @@ def main():
     surface only, non-functional), so without this every operation would die
     with a raw traceback mid-flow.
 
-    A SIGTERM stops boxman as a Ctrl-C does: the command it is running is
-    stopped first, which a SIGTERM to boxman's group no longer reaches, as
-    the command runs in a session of its own when there is no terminal
-    (#294). Either way the KeyboardInterrupt ends boxman by SIGINT: exit 130.
+    A SIGTERM, SIGHUP or SIGQUIT stops boxman as a Ctrl-C does: the command
+    it is running is stopped first, which a signal to boxman's group no
+    longer reaches, as the command runs in a session of its own when there
+    is no terminal (#294). Either way the KeyboardInterrupt ends boxman by
+    SIGINT: exit 130.
     """
-    with interrupt_on_sigterm():
+    with interrupt_on_signals():
         _cli()
 
 
 def _cli():
-    """The body of :func:`main`, with SIGTERM taken as a Ctrl-C."""
+    """The body of :func:`main`, with SIGTERM, SIGHUP and SIGQUIT taken as
+    a Ctrl-C."""
     try:
         _main()
     except BoxmanError as exc:

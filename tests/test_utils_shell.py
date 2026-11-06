@@ -10,6 +10,7 @@ Phase 2.8's follow-up fixed.
 
 from __future__ import annotations
 
+import contextlib
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -184,13 +185,10 @@ def no_leftovers(tmp_path):
 #: ``Popen`` instead, before invoke has the command: in the forked child
 #: before it execs the command, or in boxman once it has. The PID goes to
 #: the same file, and the hold lasts until the file IN_POPEN_GO names
-#: appears. With TERMINAL set, the pty on its stdin is its terminal
+#: appears
 _RUN_IN_A_CHILD = """
 import os, subprocess, sys, time
 from boxman.utils import shell
-if os.environ.get("TERMINAL"):
-    import fcntl, termios
-    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 for name in ("STOP_TIMEOUT", "TERM_TIMEOUT"):
     if os.environ.get(name):
         setattr(shell._StoppingLocal, name, float(os.environ[name]))
@@ -266,11 +264,12 @@ shell.run(sys.argv[1], hide=True, warn=True)
 open(sys.argv[2], "w").close()
 """
 
-#: the same, with a SIGTERM taken as a Ctrl-C, as boxman's main() takes it
-_GOES_ON_AFTER_A_RUN_UNDER_SIGTERM = """
+#: the same, with a SIGTERM, SIGHUP or SIGQUIT taken as a Ctrl-C, as
+#: boxman's main() takes them
+_GOES_ON_AFTER_A_RUN_UNDER_STOP_SIGNALS = """
 import sys
 from boxman.utils import shell
-with shell.interrupt_on_sigterm():
+with shell.interrupt_on_signals():
     shell.run(sys.argv[1], hide=True, warn=True)
     open(sys.argv[2], "w").close()
 """
@@ -298,18 +297,30 @@ _SIGINT_AS_PYTHON_SETS_IT = (
     "signal.signal(signal.SIGINT, signal.default_int_handler)\n"
 )
 
+#: what a child with a terminal does next: make the pty on its stdin the
+#: controlling terminal of the session it leads
+_THE_PTY_AS_ITS_TERMINAL = (
+    "import fcntl, termios\n"
+    "fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n"
+)
+
 
 def _interrupt(tmp_path, script, args, signal_at, how="alone", env=None,
-               release=None, typed=None):
+               release=None, typed=None, terminal=None, timings=None):
     """Run the child *script* with *args*, and interrupt it at each point
     in *signal_at*: once the file there, or every file of a tuple there, has
-    appeared; return what it printed, and how it exited.
+    appeared, or, for a number, that many seconds on; return what it
+    printed, and how it exited.
 
-    *how*: ``alone``, a SIGINT to its Python alone; ``group``, to its whole
-    process group, the command's too unless that has a session of its own;
-    ``terminal``, a Ctrl-C typed at a pty that is its controlling terminal,
-    which signals the terminal's foreground group; ``sigterm``, a SIGTERM to
-    its Python alone. *typed* is typed at that terminal first.
+    *how*, the same for every point or a list with one for each: ``alone``,
+    a SIGINT to its Python alone; ``group``, to its whole process group, the
+    command's too unless that has a session of its own; ``terminal``, a
+    Ctrl-C typed at the pty that is its controlling terminal, which signals
+    the terminal's foreground group; ``sigterm``, a SIGTERM to its Python
+    alone; or (``alone`` or ``group``, a signal). *terminal*: whether it has
+    such a pty, by default whether a Ctrl-C is typed at one. *typed* is
+    typed at that terminal first. *timings*, a dict, gets the time of the
+    first interrupt, ``first``, and of the child's end, ``ended``.
 
     After the last interrupt, the file *release* is created, to let a run
     held up inside ``Popen`` go on: once the child has ended, as it does
@@ -322,14 +333,20 @@ def _interrupt(tmp_path, script, args, signal_at, how="alone", env=None,
     import time
     from pathlib import Path
 
+    points = [when for when in signal_at if not isinstance(when, (int, float))]
+    hows = list(how) if isinstance(how, list) else [how] * len(points)
+    if terminal is None:
+        terminal = "terminal" in hows
+    timings = {} if timings is None else timings
     env = dict(env or os.environ,
                PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
     master = slave = None
-    if how == "terminal":
+    preamble = _SIGINT_AS_PYTHON_SETS_IT
+    if terminal:
         master, slave = os.openpty()
-        env["TERMINAL"] = "1"
+        preamble += _THE_PTY_AS_ITS_TERMINAL
     child = subprocess.Popen(
-        [sys.executable, "-c", _SIGINT_AS_PYTHON_SETS_IT + script, *map(str, args)],
+        [sys.executable, "-c", preamble + script, *map(str, args)],
         env=env, stdin=slave,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         start_new_session=True)
@@ -339,18 +356,29 @@ def _interrupt(tmp_path, script, args, signal_at, how="alone", env=None,
         if typed:
             os.write(master, typed)
         for when in signal_at:
+            if isinstance(when, (int, float)):
+                time.sleep(when)
+                continue
             files = when if isinstance(when, tuple) else (when,)
             deadline = time.monotonic() + 30
             while not all(path.exists() for path in files):
+                # its stderr only once it has ended: a read would wait for that
                 assert child.poll() is None and time.monotonic() < deadline, \
-                    child.stderr.read()
+                    child.stderr.read() if child.poll() is not None else "not there in time"
                 time.sleep(0.05)
-            if how == "terminal":
+            where = hows.pop(0)
+            timings.setdefault("first", time.monotonic())
+            if where == "terminal":
                 os.write(master, b"\x03")
-            elif how == "group":
-                os.killpg(child.pid, signal.SIGINT)
+                continue
+            if where == "sigterm":
+                where = ("alone", signal.SIGTERM)
+            elif isinstance(where, str):
+                where = (where, signal.SIGINT)
+            if where[0] == "group":
+                os.killpg(child.pid, where[1])
             else:
-                os.kill(child.pid, signal.SIGTERM if how == "sigterm" else signal.SIGINT)
+                os.kill(child.pid, where[1])
         if release:
             try:
                 child.wait(timeout=2)
@@ -358,6 +386,7 @@ def _interrupt(tmp_path, script, args, signal_at, how="alone", env=None,
                 pass
             release.touch()
         out, err = child.communicate(timeout=30)
+        timings["ended"] = time.monotonic()
     finally:
         if child.poll() is None:
             os.killpg(child.pid, signal.SIGKILL)
@@ -642,13 +671,13 @@ class TestRunStopsEveryCommand:
     def test_a_sigterm_stops_the_command_as_a_ctrl_c_does(self, tmp_path):
         """In a session of its own, the command no longer has a SIGTERM sent
         to boxman's group, and a SIGTERM ended boxman there and then: under
-        ``interrupt_on_sigterm``, as boxman's ``main()`` runs, boxman stops
+        ``interrupt_on_signals``, as boxman's ``main()`` runs, boxman stops
         the command first."""
         import signal
 
         up, next_step = tmp_path / "up", tmp_path / "next-step"
         out, err, code = _interrupt(
-            tmp_path, _GOES_ON_AFTER_A_RUN_UNDER_SIGTERM,
+            tmp_path, _GOES_ON_AFTER_A_RUN_UNDER_STOP_SIGNALS,
             [_program(_TRAPS_SIGINT, up), next_step], [up], how="sigterm")
         assert code == -signal.SIGINT, err
         assert (tmp_path / "up.sigint").exists()
@@ -688,50 +717,265 @@ class TestRunStopsEveryCommand:
         answer = tmp_path / "answer"
         out, err, code = _interrupt(
             tmp_path, _RUN_IN_A_CHILD, [f"read reply < /dev/tty && echo $reply > {answer}"],
-            [], how="terminal", env=self._env(), typed=b"yes\n")
+            [], terminal=True, env=self._env(), typed=b"yes\n")
         assert (out.split(), code) == (["RETURNED", "0"], 0), err
         assert answer.read_text() == "yes\n"
+
+
+def _gone_within(up, seconds) -> bool:
+    """Whether the program that wrote its PID to *up* is gone within
+    *seconds*."""
+    import time
+    deadline = time.monotonic() + seconds
+    while _running(up) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return not _running(up)
+
+
+def _sudo_works() -> bool:
+    import subprocess
+    try:
+        return subprocess.run(["sudo", "-n", "true"], capture_output=True,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+@pytest.mark.usefixtures("no_leftovers")
+class TestTheCommandDoesNotOutliveBoxman:
+    """
+    Without a terminal, the command runs in a process group of its own, so
+    that sudo passes boxman's signals on to it. A signal to boxman's group
+    that boxman could not turn into a stop then ended boxman alone, and the
+    command, which went with boxman before, ran on (#294 review). The
+    guardian ends it now, once boxman has gone.
+    """
+
+    @pytest.mark.parametrize("name", ["SIGKILL", "SIGTERM"])
+    def test_boxman_killed_with_its_group_takes_the_command_with_it(self, name, tmp_path):
+        """A SIGKILL, which nothing can handle, or a SIGTERM to boxman used
+        as a library, without the handlers ``main()`` has: the program,
+        below a shell that has more to run, is sent SIGTERM by the guardian."""
+        import signal
+
+        number = getattr(signal, name)
+        up = tmp_path / "up"
+        out, err, code = _interrupt(
+            tmp_path, _GOES_ON_AFTER_A_RUN,
+            [f"{_program(_TRAPS_SIGINT, up)}; true", tmp_path / "next-step"],
+            [up], how=[("group", number)])
+        assert code == -number, err
+        assert _gone_within(up, 5)
+
+    def test_a_sigkill_in_the_middle_of_a_stop_still_takes_the_command(self, tmp_path):
+        """A Ctrl-C began the stop of a program that ignores its SIGINT, and
+        a SIGKILL to the group came within the grace."""
+        import signal
+
+        up = tmp_path / "up"
+        out, err, code = _interrupt(
+            tmp_path, _GOES_ON_AFTER_A_RUN_UNDER_STOP_SIGNALS,
+            [f"{_program(_IGNORES_SIGINT, up)}; true", tmp_path / "next-step"],
+            [up, 1, up], how=["alone", ("group", signal.SIGKILL)])
+        assert code == -signal.SIGKILL, err
+        assert _gone_within(up, 5)
+
+    @pytest.mark.parametrize("name", ["SIGHUP", "SIGQUIT"])
+    def test_a_sighup_or_sigquit_to_the_group_stops_the_command_as_a_ctrl_c_does(
+            self, name, tmp_path):
+        """Under the handlers ``main()`` has, as a SIGTERM: each ended
+        boxman alone."""
+        import signal
+
+        up, next_step = tmp_path / "up", tmp_path / "next-step"
+        out, err, code = _interrupt(
+            tmp_path, _GOES_ON_AFTER_A_RUN_UNDER_STOP_SIGNALS,
+            [_program(_TRAPS_SIGINT, up), next_step], [up],
+            how=[("group", getattr(signal, name))])
+        assert code == -signal.SIGINT, err
+        assert (tmp_path / "up.sigint").exists()
+        assert not next_step.exists()
+
+
+@pytest.mark.usefixtures("no_leftovers")
+class TestWhatTheStopCannotEnd:
+    """
+    A process the stop cannot end, one sudo runs as root or one that left
+    the command's group, held its output open, and invoke waited for that
+    to close before boxman went on (#294 review).
+    """
+
+    def test_a_process_left_holding_the_output_does_not_hold_boxman_up(self, tmp_path):
+        """The process has left for a session of its own: invoke's wait for
+        the output it holds used to last until it ended."""
+        import os
+        import signal
+
+        up, held = tmp_path / "up", tmp_path / "held"
+        command = (f"setsid sh -c 'echo $$ > {held}; exec sleep 60' & "
+                   f"{_program(_TRAPS_SIGINT, up)}")
+        timings = {}
+        try:
+            out, err, code = _interrupt(
+                tmp_path, _RUN_IN_A_CHILD, [command], [(up, held)],
+                env=dict(os.environ, RUN="run"), timings=timings)
+            assert (out.split(), code) == (["STOPPED"], 0), err
+            assert timings["ended"] - timings["first"] < 10
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(held.read_text()), signal.SIGKILL)
+
+    # it runs a command as root, through sudo: the integration tier's (#214)
+    @pytest.mark.integration
+    def test_with_a_terminal_sudo_passes_the_sigterm_on_to_its_command(self, tmp_path):
+        """sudo passes on no signal from the process group of what started
+        it, boxman's, which the command shares with a terminal: the SIGTERM
+        never reached the command sudo ran as root, which ignores its
+        SIGINT, the SIGKILL ended sudo alone, and the command held boxman up
+        until it ended. The signals come from another group now."""
+        import os
+        import subprocess
+
+        if not _sudo_works():
+            pytest.skip("needs sudo without a password")
+        up = tmp_path / "up"
+        command = f"sudo -n sh -c \"trap '' INT; echo \\$\\$ > {up}; exec sleep 60\""
+        try:
+            out, err, code = _interrupt(
+                tmp_path, _RUN_IN_A_CHILD, [command], [up], how="terminal",
+                env=dict(os.environ, RUN="run", STOP_TIMEOUT="1", TERM_TIMEOUT="1"))
+            assert (out.split(), code) == (["STOPPED"], 0), err
+            assert _gone_within(up, 2)
+        finally:
+            if _running(up):
+                subprocess.run(["sudo", "-n", "kill", "-KILL", up.read_text().strip()])
+
+
+@pytest.mark.usefixtures("no_leftovers")
+class TestAStopTheTerminalDidNotAskFor:
+    """
+    With a terminal, the runner took every stop for a Ctrl-C there, which
+    the command has had itself, and sent it nothing for STOP_TIMEOUT; a
+    stop asked for otherwise reached the command 10 s on, as a SIGTERM
+    (#294 review).
+    """
+
+    def test_with_a_terminal_a_sigterm_has_the_command_sent_its_sigint_at_once(
+            self, tmp_path):
+        import signal
+
+        up, next_step = tmp_path / "up", tmp_path / "next-step"
+        timings = {}
+        out, err, code = _interrupt(
+            tmp_path, _GOES_ON_AFTER_A_RUN_UNDER_STOP_SIGNALS,
+            [_program(_TRAPS_SIGINT, up), next_step], [up], how="sigterm",
+            terminal=True, timings=timings)
+        assert code == -signal.SIGINT, err
+        assert (tmp_path / "up.sigint").exists()
+        assert not next_step.exists()
+        assert timings["ended"] - timings["first"] < 5
+
+    def test_a_sigterm_during_a_stop_moves_it_on(self, tmp_path):
+        """A Ctrl-C began the stop of a program that ignores its SIGINT: a
+        SIGTERM a second later was ignored, as all later ones were, where
+        another Ctrl-C moves the stop on to the program's SIGTERM at once."""
+        import signal
+
+        up = tmp_path / "up"
+        timings = {}
+        out, err, code = _interrupt(
+            tmp_path, _GOES_ON_AFTER_A_RUN_UNDER_STOP_SIGNALS,
+            [_program(_IGNORES_SIGINT, up), tmp_path / "next-step"],
+            [up, 1, up], how=["alone", "sigterm"], timings=timings)
+        assert code == -signal.SIGINT, err
+        assert not _running(up)
+        assert timings["ended"] - timings["first"] < 6
+
+    def test_an_ignored_sigint_stays_ignored_for_the_commands(self):
+        """boxman started in the background of a script has SIGINT ignored,
+        as its commands had too; the handler ``main()`` put in its place
+        took that away from them."""
+        import signal
+
+        from boxman.utils.shell import interrupt_on_signals, run
+
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            with interrupt_on_signals():
+                assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
+                out = run("grep '^SigIgn:' /proc/self/status", hide=True).stdout
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        assert int(out.split()[1], 16) >> (signal.SIGINT - 1) & 1
 
 
 class TestNoHandlerSwallowsACtrlC:
     """
     A KeyboardInterrupt is not an Exception, so ``except Exception`` lets
     it through; a bare ``except:``, or one that names BaseException or
-    KeyboardInterrupt, stops it short of the top, and boxman goes on to its
-    next step (#294). Each in src raises again, but for the few that end a
-    stop themselves.
+    KeyboardInterrupt, stops it short of the top, and so does a
+    ``contextlib.suppress`` of either, and boxman goes on to its next step
+    (#294). Each such handler in src raises, or exits, whatever happened,
+    but for the few that end a stop themselves.
     """
 
     #: (module, function) of the handlers that end a stop on purpose
     ENDS_A_STOP = {
-        # a worker stopped with its command exits 130
-        ("boxman/manager.py", "_parallel_worker"),
         # the workers' cleanup, with SIGINT ignored
         ("boxman/manager.py", "_stop_parallel"),
         # another Ctrl-C hurries the stop on, to its end
         ("boxman/utils/shell.py", "_stop"),
     }
 
+    BROAD = ("BaseException", "KeyboardInterrupt")
+
+    @staticmethod
+    def _names(node):
+        import ast
+        return [getattr(each, "id", getattr(each, "attr", None))
+                for each in (node.elts if isinstance(node, ast.Tuple) else [node])]
+
+    def _ends_the_run(self, handler):
+        """A ``raise``, or a ``sys.exit(...)``, among the handler's own
+        statements: not one only some paths through it reach."""
+        import ast
+        for statement in handler.body:
+            if isinstance(statement, ast.Raise):
+                return True
+            call = getattr(statement, "value", None)
+            if (isinstance(statement, ast.Expr) and isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute) and call.func.attr == "exit"
+                    and getattr(call.func.value, "id", None) == "sys"):
+                return True
+        return False
+
     def test_every_broad_handler_in_src_raises_again(self):
         import ast
         import pathlib
-
-        def broad(handler):
-            names = (handler.type.elts if isinstance(handler.type, ast.Tuple)
-                     else [handler.type])
-            return any(name is None or getattr(name, "id", getattr(name, "attr", None))
-                       in ("BaseException", "KeyboardInterrupt") for name in names)
 
         src = pathlib.Path(__file__).resolve().parent.parent / "src"
         offenders = []
         for py in sorted(src.rglob("*.py")):
             module = str(py.relative_to(src))
-            for function in ast.walk(ast.parse(py.read_text())):
-                if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            tree = ast.parse(py.read_text())
+            # every node, with the function it is in, "<module>" outside any
+            within = {}
+            for function in ast.walk(tree):
+                if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for node in ast.walk(function):
+                        within[id(node)] = function.name
+            for node in ast.walk(tree):
+                where = (module, within.get(id(node), "<module>"))
+                if where in self.ENDS_A_STOP:
                     continue
-                for node in ast.walk(function):
-                    if (isinstance(node, ast.ExceptHandler) and broad(node)
-                            and not any(isinstance(each, ast.Raise) for each in ast.walk(node))
-                            and (module, function.name) not in self.ENDS_A_STOP):
-                        offenders.append(f"{module}:{node.lineno} in {function.name}")
+                if isinstance(node, ast.ExceptHandler):
+                    broad = node.type is None or any(
+                        name in self.BROAD for name in self._names(node.type))
+                    if broad and not self._ends_the_run(node):
+                        offenders.append(f"{module}:{node.lineno} in {where[1]}")
+                elif (isinstance(node, ast.Call)
+                        and getattr(node.func, "attr", getattr(node.func, "id", None)) == "suppress"
+                        and any(name in self.BROAD for arg in node.args
+                                for name in self._names(arg))):
+                    offenders.append(f"{module}:{node.lineno} suppress in {where[1]}")
         assert not offenders, sorted(set(offenders))
