@@ -1006,13 +1006,25 @@ Edit `conf.yml` and run `boxman update` to reconcile the live state with the con
 - **Add disks**: add new disk entries to a VM's `disks:` section — they will be
   created and attached
 - **Grow disks**: increase the `size` of an existing disk — the disk image is
-  resized in place (shrinking is not supported)
+  resized in place (shrinking is not supported). On a VM with snapshots the
+  image grown is the overlay the guest writes to; the snapshots keep the size
+  they were taken at, and a restore goes back to it
 - **Remove disks**: remove a disk entry from a VM's `disks:` section — the disk
   is detached, and **its image file is left on disk**. Boxman detaches only a
   disk it recorded attaching, still at the target it recorded, with the exact
   source it recorded. Anything else — a replacement disk at a reused target, a
   snapshot overlay, a disk attached by hand, a VM predating the record — is
-  reported and left alone
+  reported and left alone. A disk the VM's snapshots record is kept because
+  libvirt cannot delete a snapshot of a disk the domain no longer has: delete
+  those snapshots first (`boxman snapshot delete`), and the next `update`
+  detaches it
+
+A disk under snapshots is not at the path boxman recorded: a snapshot moves it
+onto an overlay, and a restore onto another. `update` takes it for the declared
+disk when every layer above the recorded file is one the VM's snapshots record
+for that disk, and changes nothing on the VM otherwise, naming the reason — an
+overlay no snapshot of it records, or snapshots or a backing chain that could
+not be read.
 
 ### Restarts
 

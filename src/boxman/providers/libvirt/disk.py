@@ -779,6 +779,12 @@ class DiskManager:
         """
         Resize a disk image using qemu-img resize. Only grows.
 
+        Run through ``sudo`` as configured (``use_sudo``,
+        ``force_sudo_commands``), as a collapse runs ``qemu-img rebase``: a
+        disk under snapshots is grown at the overlay the guest writes to,
+        and libvirt made that one ``root`` and ``0600`` (#294, finding 5).
+        Growing an image leaves its owner as it was.
+
         Args:
             disk_path: Path to the disk image
             new_size_mb: New size in MiB (must be larger than current)
@@ -792,8 +798,7 @@ class DiskManager:
             self.logger.info(f"resizing disk image: {cmd}")
 
             cmd_executor = LibVirtCommandBase(
-                provider_config=self.provider_config,
-                override_config_use_sudo=False)
+                provider_config=self.provider_config)
             result = cmd_executor.execute_shell(cmd, warn=True)
 
             if not result.ok:

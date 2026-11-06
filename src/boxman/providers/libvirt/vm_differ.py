@@ -8,6 +8,7 @@ from .cdrom import cdroms_awaiting_boot
 from .commands import VirshCommand
 from .disk_ownership import (
     DEFAULT_DISK_TARGET,
+    SnapshotOverlays,
     disk_logical_name,
     occupied_target_conflicts,
     plan_disk_removals,
@@ -229,6 +230,39 @@ class VMStateDiffer:
         anything (#164 F2).
         """
         return read_disk_records(self.virsh, domain_name)
+
+    def get_snapshot_layers(self,
+                            domain_name: str) -> dict[str, set[str]] | None:
+        """
+        Every file the snapshots of *domain_name* record for each of its
+        disks, by target; ``None`` when they cannot all be read
+        (:meth:`SnapshotManager.disk_layers`).
+        """
+        from .snapshot import SnapshotManager
+        return SnapshotManager(self.provider_config).disk_layers(domain_name)
+
+    def get_backing_chain(self, source: str) -> list[str] | None:
+        """
+        The backing chain of *source*, *source* first, read as a teardown
+        reads it (:meth:`LibVirtSession.backing_chains`): through ``sudo``
+        as configured, or through libvirt for a ``0600`` overlay the user
+        may not read. ``None`` when it cannot be read, or *source* is gone.
+        """
+        from .session import LibVirtSession
+        session = LibVirtSession(
+            {'provider': {'libvirt': self.provider_config or {}}})
+        chains = session.backing_chains([source])
+        return None if chains is None else chains.get(source)
+
+    def snapshot_overlays(self, domain_name: str) -> SnapshotOverlays:
+        """
+        Whether a disk of *domain_name* is one of its own seen through the
+        overlays its snapshots made (:class:`SnapshotOverlays`), read only
+        when a disk is not at its recorded path.
+        """
+        return SnapshotOverlays(
+            lambda: self.get_snapshot_layers(domain_name),
+            self.get_backing_chain)
 
     def get_actual_disks(self, domain_name: str,
                          inactive: bool = False) -> list[dict[str, Any]]:
@@ -495,7 +529,12 @@ class VMStateDiffer:
                 # true` in the config still adopts it on purpose.
                 new_disks.append(disk_config)
             elif target in actual_targets:
-                # disk exists — check if resize needed
+                # disk exists — check if resize needed. Its source is the
+                # top of its chain: under snapshots, the overlay the guest
+                # writes to, which is what is grown. The layers below it are
+                # what the snapshots hold, at the size they were taken at,
+                # and growing one of those would change a snapshot and not
+                # the disk the guest sees.
                 actual_disk = actual_by_target[target]
                 if desired_size > actual_disk['size_mb']:
                     resize_disks.append({
@@ -518,6 +557,12 @@ class VMStateDiffer:
         # too, so "attached but not declared" starts by removing it
         # (#164 F2). A domain with no ownership record yields nothing.
         disk_records = self.get_disk_records(domain_name)
+        # A disk under snapshots is at an overlay of its recorded file, not
+        # at that file. The conflict check takes it for its declaration
+        # through overlays its own snapshots made, and nothing else; the
+        # removal rule keeps it, and says those snapshots are why (#294,
+        # finding 5).
+        overlays = self.snapshot_overlays(domain_name)
         # Against the PERSISTENT definition, which is what
         # `detach-disk --config` edits. For a running domain the live view
         # can differ -- an earlier config-only replacement is enough -- and
@@ -526,7 +571,8 @@ class VMStateDiffer:
         # review, finding 3).
         persistent_disks = self.get_actual_disks(domain_name, inactive=True)
         removed_disks, refused_disk_removals = plan_disk_removals(
-            disk_records, desired_disks or [], persistent_disks)
+            disk_records, desired_disks or [], persistent_disks,
+            overlays=overlays)
         # Against the view the add/resize path acts on -- the live one for
         # a running guest -- so preflight and reconciliation cannot
         # disagree about whether a target is occupied (#164 F2 review
@@ -537,7 +583,8 @@ class VMStateDiffer:
                 disk_logical_name(d):
                     self._expected_disk_path(d, workdir, disk_prefix)
                 for d in (desired_disks or [])
-            })
+            },
+            overlays=overlays)
         unowned = unowned_disks(
             disk_records, desired_disks or [], persistent_disks,
             root_source=(persistent_disks[0]['source']

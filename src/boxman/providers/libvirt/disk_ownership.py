@@ -18,8 +18,10 @@ variants of it that were tried and what each one detaches by mistake.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 from xml.etree import ElementTree as ET
 
 from boxman import log
@@ -91,6 +93,109 @@ class DiskRecord:
     #: empty otherwise). A copy that keeps the token's extended attribute
     #: is another inode (#215).
     ino: str = ""
+
+
+class TargetConflict(NamedTuple):
+    """A declaration whose target holds a disk that is not its own."""
+
+    name: str
+    target: str
+    source: str
+    #: why the occupant is not taken for the declaration's disk, beyond
+    #: being another file; empty when there is nothing more to say
+    why: str = ""
+
+
+def _named_in(path: str, paths: set[str]) -> bool:
+    """Whether *paths* name *path*, as written or resolved."""
+    return (path in paths or os.path.realpath(path)
+            in {os.path.realpath(p) for p in paths})
+
+
+#: :attr:`SnapshotOverlays._layers` before the snapshots were first read
+_UNREAD: Any = object()
+
+
+class SnapshotOverlays:
+    """
+    Whether a disk's source is one of the domain's own disks, seen through
+    the overlays its snapshots made.
+
+    A snapshot moves each disk onto a new overlay of it, ``<vm>_<disk>.<snap>``
+    (in a ``disk_snapshot_dir`` when one is set), and a restore onto another,
+    ``<vm>_<disk>.<epoch>``; so once a VM has a snapshot no data disk of it is
+    at the path boxman recorded. Compared by path alone, each read as a
+    replacement, and ``update`` refused every change to that VM, cpu and
+    memory included (#294, finding 5).
+
+    The backing chain alone does not settle it either: an overlay made
+    outside boxman, backed by the recorded file, reaches it too, and that is
+    the disk the exact-path rule was written to refuse (design 4 of
+    :func:`plan_disk_removals`). So each layer above the recorded file must
+    be one this domain's own snapshots record for that disk: the overlay a
+    take made (``<disks>``), the one a revert made (``<revertDisks>``, or
+    ``<disks>``, which libvirt rewrites for a snapshot without children), or
+    the disk's source in a definition one saved (``<domain>``,
+    ``<inactiveDomain>``), which is what a later take built on. Any other
+    layer is refused, and so is a source whose snapshots or chain cannot be
+    read: what cannot be told is never taken for the disk.
+
+    Both are read lazily, once per checker, and only for a source that is
+    not the recorded file itself.
+    """
+
+    def __init__(self,
+                 recorded: Callable[[], dict[str, set[str]] | None],
+                 chain_of: Callable[[str], list[str] | None]) -> None:
+        """
+        Args:
+            recorded: reads ``{disk target: {file, ...}}``, every file the
+                domain's snapshots record for each disk, or ``None`` when
+                they cannot all be read
+                (:meth:`SnapshotManager.disk_layers`).
+            chain_of: reads the backing chain of a source, the source first,
+                or ``None`` when it cannot be read.
+        """
+        self._recorded = recorded
+        self._chain_of = chain_of
+        self._layers = _UNREAD
+        self._chains: dict[str, list[str] | None] = {}
+
+    def why_not(self, source: str, target: str,
+                disks: Iterable[str]) -> str | None:
+        """
+        ``None`` when *source*, at *target*, is one of *disks* reached
+        through overlays the domain's snapshots record for *target*; else
+        why it is not taken for one: empty when the domain has no snapshot
+        at all, so there is nothing to say beyond its being another file.
+        """
+        disks = tuple(dict.fromkeys(d for d in disks if d))
+        wanted = " or ".join(disks) or "the disk"
+        if self._layers is _UNREAD:
+            self._layers = self._recorded()
+        if self._layers is None:
+            return (f"the snapshots of this VM could not be read, so whether "
+                    f"it is an overlay of {wanted} they made cannot be told")
+        if not self._layers:
+            return ""
+        recorded = self._layers.get(target, set())
+        if not _named_in(source, recorded):
+            return f"no snapshot of this VM records it for {target}"
+        if source not in self._chains:
+            self._chains[source] = self._chain_of(source)
+        chain = self._chains[source]
+        if not chain:
+            return (f"its backing chain could not be read, so whether it is "
+                    f"built on {wanted} cannot be told")
+        for layer in chain:
+            if any(layer == disk
+                   or os.path.realpath(layer) == os.path.realpath(disk)
+                   for disk in disks):
+                return None
+            if not _named_in(layer, recorded):
+                return (f"it is built on {layer}, which no snapshot of this "
+                        f"VM records for {target}")
+        return f"it is not built on {wanted}"
 
 
 def records_to_xml(records: list[DiskRecord]) -> str:
@@ -218,6 +323,7 @@ def plan_disk_removals(
     records: list[DiskRecord] | None,
     desired_disks: list[dict[str, Any]],
     actual_disks: list[dict[str, Any]],
+    overlays: SnapshotOverlays | None = None,
 ) -> tuple[list[DiskRecord], list[tuple[DiskRecord, str]]]:
     """
     Decide which recorded disks may be detached.
@@ -252,11 +358,18 @@ def plan_disk_removals(
     Condition 3 is what closes all of them: the source has to be the same
     path, not merely related to it. Note that this refuses while the disk
     at the target is something else *for any reason* -- including after a
-    snapshot has moved the domain's head to an overlay. Collapsing
-    snapshots does not necessarily restore the recorded pathname, because
-    ``collapse_to()`` rebases the existing head rather than returning to
-    the original file, so the refusal is phrased in terms of the source
-    differing rather than promising a remedy.
+    snapshot has moved the domain's head to an overlay. That one is kept on
+    purpose, and given *overlays* (:class:`SnapshotOverlays`) the refusal
+    says so: libvirt deletes an external snapshot only while every disk it
+    records is still in the domain ("disk 'vdb' not found in domain"), so
+    detaching the disk left each snapshot of it undeletable (#294, finding
+    5). Deleting those snapshots puts the disk back on its recorded file,
+    and the next update detaches it. Any other overlay is refused as
+    before, and so is one whose snapshots or chain cannot be read, each
+    with its reason. Collapsing snapshots does not necessarily restore the
+    recorded pathname, because ``collapse_to()`` rebases the existing head
+    rather than returning to the original file, so the remedy named is
+    deleting the snapshots.
     """
     if records is None:
         # No ownership record: boxman does not know what it attached here.
@@ -300,11 +413,24 @@ def plan_disk_removals(
             continue
 
         if attached.get('source') != record.source:
-            refusals.append((
-                record,
-                f"the disk at {record.target} is now "
-                f"{attached.get('source')!r}, not the {record.source!r} "
-                f"boxman attached"))
+            why = (overlays.why_not(attached.get('source'), record.target,
+                                    (record.source,))
+                   if overlays is not None else "")
+            if why is None:
+                refusals.append((
+                    record,
+                    f"this VM's snapshots record it: it is on "
+                    f"{attached.get('source')!r}, an overlay of the "
+                    f"{record.source!r} boxman attached, and libvirt cannot "
+                    f"delete a snapshot of a disk the domain no longer has. "
+                    f"Delete those snapshots first (boxman snapshot delete), "
+                    f"and update detaches it then"))
+            else:
+                refusals.append((
+                    record,
+                    f"the disk at {record.target} is now "
+                    f"{attached.get('source')!r}, not the {record.source!r} "
+                    f"boxman attached" + (f" ({why})" if why else "")))
             continue
 
         removals.append(record)
@@ -317,7 +443,8 @@ def occupied_target_conflicts(
     desired_disks: list[dict[str, Any]],
     actual_disks: list[dict[str, Any]],
     expected_paths: dict[str, str] | None = None,
-) -> list[tuple[str, str, str]]:
+    overlays: SnapshotOverlays | None = None,
+) -> list[TargetConflict]:
     """
     Declarations whose target is held by a disk that is not theirs.
 
@@ -343,8 +470,15 @@ def occupied_target_conflicts(
     there, and without this every one of its disks would read as a
     conflict and no such project could be updated at all.
 
+    *overlays*, when given, also accepts either file seen through overlays
+    the domain's own snapshots made of it (:class:`SnapshotOverlays`): once
+    a VM has a snapshot, none of its data disks is at its recorded path,
+    and every update of it was refused (#294, finding 5). An overlay made
+    any other way is still a conflict, and so is one whose snapshots or
+    chain cannot be read, with the reason.
+
     Returns:
-        ``(declared_name, target, occupant_source)`` per conflict.
+        A :class:`TargetConflict` per conflict.
     """
     actual_by_target = {d['target']: d for d in actual_disks}
     recorded_by_target = {r.target: r for r in (records or ())}
@@ -359,8 +493,9 @@ def occupied_target_conflicts(
             continue
 
         record = recorded_by_target.get(target)
-        if (record is not None and record.name == name
-                and occupant.get('source') == record.source):
+        own = (record.source if record is not None and record.name == name
+               else None)
+        if own is not None and occupant.get('source') == own:
             # this declaration's own disk, still where it was put, and
             # still the same file. Matching the name alone let a stale
             # record vouch for a *replacement* at the target, which
@@ -370,11 +505,18 @@ def occupied_target_conflicts(
             # the occupant IS this declaration's image file -- unrecorded
             # (a domain predating the record) but unambiguously its own
             continue
+        why = (overlays.why_not(occupant.get('source'), target,
+                                (own, expected_paths.get(name)))
+               if overlays is not None else "")
+        if why is None:
+            # one of those, under the overlays its snapshots made of it
+            continue
         # something else holds the target: a replacement, a disk boxman
-        # never recorded, an adopted one, or the other half of a swap
-        # between two declared disks. Writing to it is not this
-        # declaration's to do.
-        conflicts.append((name, target, occupant.get('source')))
+        # never recorded, an adopted one, an overlay made outside its
+        # snapshots, or the other half of a swap between two declared
+        # disks. Writing to it is not this declaration's to do.
+        conflicts.append(TargetConflict(name, target, occupant.get('source'),
+                                        why))
     return conflicts
 
 

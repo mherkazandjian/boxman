@@ -46,6 +46,18 @@ def _no_disk_ownership_records():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_snapshots():
+    """diff_vm reads the domain's snapshots when a disk is not at its
+    recorded path, to tell an overlay of it they made (#294, finding 5).
+
+    Default it to "this domain has no snapshots"; tests about disks under
+    snapshots patch it themselves.
+    """
+    with patch.object(VMStateDiffer, 'get_snapshot_layers', return_value={}):
+        yield
+
+
 @pytest.fixture
 def differ() -> VMStateDiffer:
     return VMStateDiffer(provider_config={"use_sudo": False,
@@ -383,6 +395,91 @@ class TestDiskRemovalsReachTheDiff:
 
         assert diff['removed_disks'] == []
         assert len(diff['refused_disk_removals']) == 1
+
+
+class TestDisksUnderSnapshotsReachTheDiff:
+    """``diff_vm`` hands both disk rules the domain's snapshots (#294,
+    finding 5).
+
+    Once a VM had a snapshot, its data disk was on an overlay, the conflict
+    check read that as a replacement, and ``update`` changed nothing on the
+    VM -- cpu, memory, disks or cdroms.
+    """
+
+    def _diff(self, differ, tmp_path, source, size, layers, chains):
+        from boxman.providers.libvirt.disk_ownership import DiskRecord
+
+        data = str(tmp_path / "vm01_data.qcow2")
+        with patch.object(differ, "get_vm_state", return_value="running"), \
+             patch.object(differ, "get_actual_cpu",
+                          return_value={"sockets": 1, "cores": 1,
+                                        "threads": 1, "total_vcpus": 1,
+                                        "current_vcpus": 1}), \
+             patch.object(differ, "get_max_vcpus", return_value=1), \
+             patch.object(differ, "get_actual_memory_mb", return_value=1024), \
+             patch.object(differ, "get_max_memory_mb", return_value=1024), \
+             patch.object(differ, "get_actual_disks", return_value=[
+                 {'target': 'vda', 'source': '/vm/vm01.s1', 'size_mb': 4096},
+                 {'target': 'vdb', 'source': source, 'size_mb': 1024}]), \
+             patch.object(differ, "get_disk_records", return_value=[
+                 DiskRecord('data', 'vdb', 'data', data)]), \
+             patch.object(differ, "get_snapshot_layers",
+                          return_value=layers) as read, \
+             patch.object(differ, "get_backing_chain",
+                          side_effect=lambda s: chains(data).get(s)), \
+             patch.object(differ, "get_actual_memballoon",
+                          return_value={'free_page_reporting': False,
+                                        'autodeflate': False,
+                                        'stats_period': None}), \
+             patch.object(differ, "get_actual_cdroms", return_value=[]), \
+             patch.object(differ, "get_actual_shared_folders", return_value=[]):
+            diff = differ.diff_vm(
+                domain_name="vm01", desired_cpus=None, desired_memory_mb=2048,
+                desired_disks=[{'name': 'data', 'target': 'vdb',
+                                'size': size}],
+                workdir=str(tmp_path), disk_prefix="vm01")
+        return diff, read
+
+    def test_a_disk_on_its_snapshot_overlay_is_no_conflict(
+            self, differ: VMStateDiffer, tmp_path: Path):
+        overlay = str(tmp_path / "vm01_data.s1")
+        diff, read = self._diff(
+            differ, tmp_path, overlay, 1024,
+            layers={'vdb': {overlay, str(tmp_path / "vm01_data.qcow2")}},
+            chains=lambda data: {overlay: [overlay, data]})
+
+        assert diff['disk_conflicts'] == []
+        assert diff['memory_changed'] is True
+        # one read of the snapshots serves both rules
+        assert read.call_count == 1
+
+    def test_a_grown_disk_grows_the_overlay_the_guest_writes_to(
+            self, differ: VMStateDiffer, tmp_path: Path):
+        """Not the file under it: that is what the snapshot holds, at the
+        size it was taken at."""
+        overlay = str(tmp_path / "vm01_data.s1")
+        diff, _read = self._diff(
+            differ, tmp_path, overlay, 2048,
+            layers={'vdb': {overlay, str(tmp_path / "vm01_data.qcow2")}},
+            chains=lambda data: {overlay: [overlay, data]})
+
+        assert diff['disk_conflicts'] == []
+        assert diff['resize_disks'] == [{
+            'target': 'vdb', 'source': overlay,
+            'current_size_mb': 1024, 'desired_size_mb': 2048}]
+
+    def test_a_foreign_overlay_still_conflicts(self, differ: VMStateDiffer,
+                                               tmp_path: Path):
+        overlay = str(tmp_path / "vm01_data.s1")
+        foreign = str(tmp_path / "by-hand.qcow2")
+        diff, _read = self._diff(
+            differ, tmp_path, foreign, 2048,
+            layers={'vdb': {overlay, str(tmp_path / "vm01_data.qcow2")}},
+            chains=lambda data: {foreign: [foreign, data]})
+
+        [conflict] = diff['disk_conflicts']
+        assert conflict.source == foreign
+        assert conflict.why == "no snapshot of this VM records it for vdb"
 
 
 class TestRemovalsAreDecidedFromThePersistentDefinition:

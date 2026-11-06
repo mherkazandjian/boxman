@@ -1504,25 +1504,13 @@ class SnapshotManager:
         cannot be trusted: a blank entry, which cannot be told apart from a
         name made only of newlines, or a name listed twice.
         """
-        list_result = self.virsh.execute(
-            "snapshot-list", vm_name, "--name", warn=True)
-        if not list_result.ok:
-            return None
-        names = self._listed_snapshot_names(list_result.stdout)
-        if any(n == '' for n in names) or len(set(names)) != len(names):
+        roots = self._snapshot_roots(vm_name)
+        if roots is None:
             return None
         images: dict[str, str] = {}
         overlays: dict[str, list[str]] = {}
         unnamed = False
-        for name in names:
-            xml_result = self.virsh.execute(
-                "snapshot-dumpxml", vm_name, name, warn=True)
-            if not xml_result.ok:
-                return None
-            try:
-                root = ET.fromstring(xml_result.stdout)
-            except ET.ParseError:
-                return None
+        for name, root in roots.items():
             memory_elem = root.find("memory")
             path = memory_elem.get("file") if memory_elem is not None else None
             if path:
@@ -1541,6 +1529,70 @@ class SnapshotManager:
             if files:
                 overlays[name] = files
         return images, overlays, unnamed
+
+    def _snapshot_roots(self, vm_name: str) -> dict[str, Any] | None:
+        """
+        ``{snapshot: its parsed XML}`` for every snapshot of *vm_name*;
+        ``None`` when they cannot all be read, or the list cannot be
+        trusted (see :meth:`recorded_files`).
+        """
+        list_result = self.virsh.execute(
+            "snapshot-list", vm_name, "--name", warn=True)
+        if not list_result.ok:
+            return None
+        names = self._listed_snapshot_names(list_result.stdout)
+        if any(n == '' for n in names) or len(set(names)) != len(names):
+            return None
+        roots = {}
+        for name in names:
+            xml_result = self.virsh.execute(
+                "snapshot-dumpxml", vm_name, name, warn=True)
+            if not xml_result.ok:
+                return None
+            try:
+                roots[name] = ET.fromstring(xml_result.stdout)
+            except ET.ParseError:
+                return None
+        return roots
+
+    def disk_layers(self, vm_name: str) -> dict[str, set[str]] | None:
+        """
+        ``{disk target: {file, ...}}``: every file a snapshot of *vm_name*
+        records for each of its disks, as libvirt recorded it — the overlay
+        a take made (``<disks>``), the one a revert made (``<revertDisks>``,
+        or ``<disks>``, which a revert rewrites for a snapshot with no
+        children), and the disk's source in each definition it saved
+        (``<domain>``, ``<inactiveDomain>``), which a later take, or a
+        revert, built on. Together they are every layer a take or a restore
+        of this domain left under a disk (:class:`SnapshotOverlays`).
+
+        A disk whose mode names no file records none. ``None`` when the
+        snapshots cannot all be read, which is not "none recorded"; ``{}``
+        when it has none.
+        """
+        roots = self._snapshot_roots(vm_name)
+        if roots is None:
+            return None
+        layers: dict[str, set[str]] = {}
+        for root in roots.values():
+            for section in root:
+                if section.tag in ("disks", "revertDisks"):
+                    disks = [(disk.get("name"), disk)
+                             for disk in section.findall("disk")
+                             if disk.get("snapshot") == "external"]
+                elif section.tag in ("domain", "inactiveDomain"):
+                    disks = [(target.get("dev"), disk)
+                             for disk in section.findall("devices/disk")
+                             if (target := disk.find("target")) is not None]
+                else:
+                    continue
+                for target, disk in disks:
+                    source = disk.find("source")
+                    path = (source.get("file") or source.get("dev")
+                            if source is not None else None)
+                    if target and path:
+                        layers.setdefault(target, set()).add(path)
+        return layers
 
     def compress_memory_file(self,
                              raw_path: str,

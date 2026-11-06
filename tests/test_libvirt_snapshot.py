@@ -595,6 +595,65 @@ class TestOverlayFiles:
             assert sm.overlay_files("vm01") is None
 
 
+class TestDiskLayers:
+    """Every file a snapshot records for each disk, by target: what a disk
+    on an overlay is checked against before ``update`` takes it for its
+    own (#294, finding 5)."""
+
+    XML = {
+        # restored once with no children: libvirt rewrote its <disks>
+        # with the overlay it reverted onto
+        "s1": "<domainsnapshot><name>s1</name><memory snapshot='no'/>"
+              "<disks><disk name='vdb' snapshot='external'>"
+              "<source file='/w/d.1793883477'/></disk>"
+              "<disk name='sda' snapshot='no'/></disks>"
+              "<domain><devices>"
+              "<disk type='file' device='disk'><source file='/w/d.qcow2'/>"
+              "<target dev='vdb'/></disk>"
+              "<disk type='file' device='cdrom'><source file='/iso/x.iso'/>"
+              "<target dev='sda'/></disk>"
+              "</devices></domain></domainsnapshot>",
+        # taken on that, then restored with a child: <revertDisks>
+        "s2": "<domainsnapshot><name>s2</name><memory snapshot='no'/>"
+              "<disks><disk name='vdb' snapshot='external'>"
+              "<source file='/ovl/d.s2'/></disk></disks>"
+              "<revertDisks><disk name='vdb' snapshot='external'>"
+              "<source file='/w/d.1793883499'/></disk></revertDisks>"
+              "<inactiveDomain><devices><disk type='file' device='disk'>"
+              "<source file='/w/d.1793883477'/><target dev='vdb'/></disk>"
+              "</devices></inactiveDomain></domainsnapshot>",
+    }
+
+    def test_each_section_names_its_files_under_the_disk_target(
+            self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute", side_effect=_virsh_snapshots(
+                list(self.XML), self.XML.get)):
+            assert sm.disk_layers("vm01") == {
+                "vdb": {"/w/d.1793883477", "/w/d.qcow2", "/ovl/d.s2",
+                        "/w/d.1793883499"},
+                "sda": {"/iso/x.iso"},
+            }
+
+    def test_no_snapshots_record_nothing(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute",
+                          side_effect=_virsh_snapshots([], lambda _n: None)):
+            assert sm.disk_layers("vm01") == {}
+
+    def test_a_list_that_fails_is_unknown(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute", side_effect=_virsh_snapshots(
+                list(self.XML), self.XML.get, list_ok=False)):
+            assert sm.disk_layers("vm01") is None
+
+    @pytest.mark.parametrize("bad", [None, "<domainsnapshot><name>s2"],
+                             ids=["unreadable", "not xml"])
+    def test_one_snapshot_that_cannot_be_read_makes_them_unknown(
+            self, sm: SnapshotManager, bad):
+        xml = {"s1": self.XML["s1"], "s2": bad}
+        with patch.object(sm.virsh, "execute",
+                          side_effect=_virsh_snapshots(list(xml), xml.get)):
+            assert sm.disk_layers("vm01") is None
+
+
 class TestGetSnapshotOverlayFiles:
 
     def test_collects_external_overlays_per_snapshot(self, sm: SnapshotManager):

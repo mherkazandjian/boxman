@@ -2054,10 +2054,13 @@ class VMsMixin:
             # anything is applied -- cpu and memory included (#164 F2
             # review, finding 4).
             if diff['disk_conflicts']:
+                # each with why the occupant is not the declaration's disk
+                # seen through its own snapshots' overlays, where there is
+                # more to say than that it is another file (#294, finding 5)
                 detail = '; '.join(
                     f"'{name}' declares target {target}, which still holds "
-                    f"{source}"
-                    for name, target, source in diff['disk_conflicts'])
+                    f"{source}" + (f" ({why})" if why else "")
+                    for name, target, source, why in diff['disk_conflicts'])
                 result_queue.put((vm_name, {
                     'status': 'failed',
                     'details': (

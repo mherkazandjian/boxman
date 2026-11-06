@@ -688,6 +688,21 @@ class TestDiskManagerResize:
         mock_instance.execute_shell.assert_called_once_with(
             'qemu-img resize /data/disk.qcow2 4096M', warn=True)
 
+    @pytest.mark.parametrize("use_sudo, command", [
+        (True, "sudo qemu-img resize /w/vm_disk01.s1 4096M"),
+        (False, "qemu-img resize /w/vm_disk01.s1 4096M"),
+    ], ids=["use_sudo", "no use_sudo"])
+    def test_resize_disk_offline_runs_through_the_configured_sudo(
+            self, use_sudo, command):
+        """Under snapshots the image grown is the overlay the guest writes
+        to, which libvirt made root and 0600 (#294, finding 5)."""
+        dm = _make_disk_manager()
+        dm.provider_config = {'uri': 'qemu:///system', 'use_sudo': use_sudo}
+        with patch('boxman.providers.libvirt.commands._shell_run',
+                   return_value=MagicMock(ok=True)) as run:
+            assert dm.resize_disk_offline('/w/vm_disk01.s1', 4096) is True
+        assert run.call_args.args[0] == command
+
     @patch('boxman.providers.libvirt.disk.LibVirtCommandBase')
     def test_resize_disk_offline_failure(self, mock_cmd_cls):
         dm = _make_disk_manager()
@@ -1357,6 +1372,188 @@ class TestRemovedVmLeftoverDisks:
             mgr._destroy_removed_vm(self.VM)
 
         assert extra.exists()
+
+
+# ---------------------------------------------------------------------------
+# Updating a VM whose data disk has a snapshot (#294, finding 5)
+# ---------------------------------------------------------------------------
+class TestUpdatingAVmWhoseDataDiskHasASnapshot:
+    """A take moves the data disk onto an overlay of it, and a restore onto
+    another, and ``update`` read either as a replacement at the disk's
+    target: it refused every change to that VM, cpu and memory included.
+
+    Run through the real ``diff_vm``; only what libvirt and ``qemu-img``
+    answer is made up: the domain, its snapshot ``s1``, and the chains.
+    """
+
+    VM = 'bprj__demo__bprj_cluster1_node01'
+
+    def _paths(self, tmp_path):
+        ws = str(tmp_path)
+        return {
+            'root': f"{ws}/{self.VM}.qcow2",
+            'root_s1': f"{ws}/{self.VM}.s1",
+            'data': f"{ws}/{self.VM}_disk01.qcow2",
+            'data_s1': f"{ws}/{self.VM}_disk01.s1",
+            'revert': f"{ws}/{self.VM}_disk01.1793883477",
+            'foreign': f"{ws}/made-by-hand.qcow2",
+        }
+
+    def _snapshot_xml(self, p, data_overlay):
+        return (
+            f"<domainsnapshot><name>s1</name><memory snapshot='no'/>"
+            f"<disks><disk name='vda' snapshot='external' type='file'>"
+            f"<source file='{p['root_s1']}'/></disk>"
+            f"<disk name='vdb' snapshot='external' type='file'>"
+            f"<source file='{data_overlay}'/></disk></disks>"
+            f"<domain type='kvm'><devices>"
+            f"<disk type='file' device='disk'><source file='{p['root']}'/>"
+            f"<target dev='vda'/></disk>"
+            f"<disk type='file' device='disk'><source file='{p['data']}'/>"
+            f"<target dev='vdb'/></disk>"
+            f"</devices></domain></domainsnapshot>")
+
+    def _update(self, tmp_path, occupant, recorded=None, chains=None,
+                snapshots_ok=True, size=1024, declared=True):
+        from boxman.providers.libvirt.commands import VirshCommand
+        from boxman.providers.libvirt.session import LibVirtSession
+
+        p = self._paths(tmp_path)
+        recorded = recorded or p['data_s1']
+
+        def virsh(_self, *args, **_kw):
+            if args[0] == 'snapshot-list':
+                return MagicMock(ok=snapshots_ok, stdout='s1\n\n',
+                                 stderr='error: failed to connect')
+            if args[0] == 'snapshot-dumpxml':
+                return MagicMock(ok=True,
+                                 stdout=self._snapshot_xml(p, recorded))
+            raise AssertionError(f"unexpected virsh {args}")
+
+        def backing_chains(_self, sources):
+            if chains is None:
+                return None
+            return {s: chains[s] for s in sources if s in chains}
+
+        mgr = make_bare_manager({'project': 'demo'})
+        mgr.provider = MagicMock()
+        mgr.provider.provider_config = {'uri': 'qemu:///system'}
+        mgr.provider.update_vm_cpu_memory.return_value = {
+            'success': True, 'restart_needed': False}
+        mgr.provider.update_vm_disks.return_value = True
+        disks = [{'target': 'vda', 'source': p['root_s1'], 'size_mb': 4096},
+                 {'target': 'vdb', 'source': occupant, 'size_mb': 1024}]
+        queue = MagicMock()
+        with patch.object(VMStateDiffer, 'get_vm_state',
+                          return_value='running'), \
+             patch.object(VMStateDiffer, 'get_actual_cpu', return_value={
+                 'sockets': 1, 'cores': 2, 'threads': 1,
+                 'total_vcpus': 2, 'current_vcpus': 2}), \
+             patch.object(VMStateDiffer, 'get_max_vcpus', return_value=2), \
+             patch.object(VMStateDiffer, 'get_actual_memory_mb',
+                          return_value=2048), \
+             patch.object(VMStateDiffer, 'get_max_memory_mb',
+                          return_value=2048), \
+             patch.object(VMStateDiffer, 'get_actual_memballoon',
+                          return_value={'free_page_reporting': False,
+                                        'autodeflate': False,
+                                        'stats_period': None}), \
+             patch.object(VMStateDiffer, 'get_actual_disks',
+                          return_value=disks), \
+             patch.object(VMStateDiffer, 'get_disk_records', return_value=[
+                 DiskRecord('disk01', 'vdb', ROLE_DATA, p['data'])]), \
+             patch.object(VMStateDiffer, 'get_actual_cdroms',
+                          return_value=[]), \
+             patch.object(VMStateDiffer, 'get_actual_shared_folders',
+                          return_value=[]), \
+             patch.object(VirshCommand, 'execute', virsh), \
+             patch.object(LibVirtSession, 'backing_chains', backing_chains):
+            mgr._update_single_vm(
+                'cluster1', {'workdir': str(tmp_path)}, 'node01',
+                {'memory': 1536,
+                 'disks': [{'name': 'disk01', 'target': 'vdb',
+                            'size': size}] if declared else []},
+                queue)
+        return mgr, queue.put.call_args.args[0][1], p
+
+    def test_a_memory_change_goes_through(self, tmp_path):
+        p = self._paths(tmp_path)
+        mgr, result, _p = self._update(
+            tmp_path, p['data_s1'],
+            chains={p['data_s1']: [p['data_s1'], p['data']]})
+
+        assert result['status'] == 'updated', result['details']
+        assert mgr.provider.update_vm_cpu_memory.call_args.kwargs[
+            'memory_mb'] == 1536
+
+    def test_it_goes_through_after_a_restore_too(self, tmp_path):
+        """A restore of s1, which has no children, rewrote its <disks>
+        with the overlay it put the disk on."""
+        p = self._paths(tmp_path)
+        _mgr, result, _p = self._update(
+            tmp_path, p['revert'], recorded=p['revert'],
+            chains={p['revert']: [p['revert'], p['data']]})
+
+        assert result['status'] == 'updated', result['details']
+
+    def test_a_grow_goes_to_the_overlay_the_guest_writes_to(self, tmp_path):
+        p = self._paths(tmp_path)
+        mgr, result, _p = self._update(
+            tmp_path, p['data_s1'], size=2048,
+            chains={p['data_s1']: [p['data_s1'], p['data']]})
+
+        assert result['status'] == 'updated', result['details']
+        [grow] = mgr.provider.update_vm_disks.call_args.kwargs['resize_disks']
+        assert (grow['source'], grow['desired_size_mb']) == (p['data_s1'],
+                                                             2048)
+
+    def test_a_dropped_disk_stays_and_the_rest_goes_through(self, tmp_path):
+        """libvirt cannot delete a snapshot of a disk the domain no longer
+        has, so the disk stays until its snapshots are deleted -- and the
+        warning says so, not that it is some other file."""
+        p = self._paths(tmp_path)
+        mgr, result, _p = self._update(
+            tmp_path, p['data_s1'], declared=False,
+            chains={p['data_s1']: [p['data_s1'], p['data']]})
+
+        assert result['status'] == 'updated', result['details']
+        mgr.provider.remove_vm_disks.assert_not_called()
+        [warning] = [c.args[0] for c in mgr.logger.warning.call_args_list
+                     if "not detaching 'disk01'" in c.args[0]]
+        assert "this VM's snapshots record it" in warning
+        assert "Delete those snapshots first" in warning
+
+    def test_a_foreign_overlay_still_fails_it_and_says_why(self, tmp_path):
+        p = self._paths(tmp_path)
+        mgr, result, _p = self._update(
+            tmp_path, p['foreign'],
+            chains={p['foreign']: [p['foreign'], p['data']]})
+
+        assert result['status'] == 'failed'
+        assert (f"still holds {p['foreign']} (no snapshot of this VM "
+                f"records it for vdb)") in result['details']
+        mgr.provider.update_vm_cpu_memory.assert_not_called()
+
+    def test_snapshots_that_cannot_be_read_fail_it_and_say_why(
+            self, tmp_path):
+        p = self._paths(tmp_path)
+        mgr, result, _p = self._update(
+            tmp_path, p['data_s1'], snapshots_ok=False,
+            chains={p['data_s1']: [p['data_s1'], p['data']]})
+
+        assert result['status'] == 'failed'
+        assert ("the snapshots of this VM could not be read"
+                in result['details'])
+        mgr.provider.update_vm_cpu_memory.assert_not_called()
+
+    def test_a_chain_that_cannot_be_read_fails_it_and_says_why(
+            self, tmp_path):
+        p = self._paths(tmp_path)
+        mgr, result, _p = self._update(tmp_path, p['data_s1'], chains=None)
+
+        assert result['status'] == 'failed'
+        assert "its backing chain could not be read" in result['details']
+        mgr.provider.update_vm_cpu_memory.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
