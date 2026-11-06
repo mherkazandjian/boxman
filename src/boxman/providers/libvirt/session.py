@@ -1277,6 +1277,47 @@ class LibVirtSession(SessionConfigMixin):
         (:func:`.scan_pool.scan_workers`)."""
         return scan_workers(self.provider_config, self.logger)
 
+    def files_in_use(self, paths: list[str]) -> dict[str, str] | None:
+        """
+        Which of *paths* have to stay because a domain uses them, from one
+        host-wide in-use scan (:meth:`disk_paths_in_use`) however many
+        paths there are. Several VMs' files can be asked about together,
+        the CD-ROM overlays their reverts made say, at one scan's cost
+        rather than one scan each.
+
+        Returns:
+            ``{path: why it has to stay}`` for each one that does: a domain
+            uses it, by the name given, its resolved path, or its identity
+            (``st_dev``, ``st_ino``, links followed); or its identity
+            cannot be read other than for naming no file. A path left out
+            is one no domain uses, or one that is not there. ``None`` when
+            the scan fails: every path has to stay.
+
+        The answer is the scan's, as of when it ran. Ask once the command
+        has done whatever changes what the domains use (its reverts, its
+        media changes): a scan taken before them knows nothing of them.
+        """
+        in_use = self.disk_paths_in_use()
+        if in_use is None:
+            return None
+        why: dict[str, str] = {}
+        for path in paths:
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                identity = None
+            except OSError as exc:
+                why[path] = f"it cannot be inspected ({exc.strerror})"
+                continue
+            else:
+                identity = (st.st_dev, st.st_ino)
+            domain = (in_use.get(path) or in_use.get(os.path.realpath(path))
+                      or (in_use.identities.get(identity)
+                          if identity is not None else None))
+            if domain:
+                why[path] = f"domain {domain} uses it"
+        return why
+
     def _files_used_by(self, virsh, reads: _ChainReads, domain: str,
                        uuid: str, active: bool,
                        media: dict[str, str] | None = None

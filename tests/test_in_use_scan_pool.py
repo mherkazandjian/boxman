@@ -548,3 +548,69 @@ class TestSharedStateUnderThreads:
 
         assert calls == [1]
         assert len(raised) == 16
+
+
+class TestFilesInUse:
+    """``files_in_use`` asks about many files at the cost of one scan: what
+    a command that removes several VMs' files at once needs to know."""
+
+    def _host(self, tmp_path) -> tuple[Host, dict[str, str]]:
+        used = tmp_path / "used.qcow2"
+        used.write_bytes(b"disk")
+        files = {"used": str(used),
+                 "alias": str(tmp_path / "alias.qcow2"),
+                 "link": str(tmp_path / "link.qcow2"),
+                 "free": str(tmp_path / "free.qcow2"),
+                 "absent": str(tmp_path / "absent.qcow2")}
+        os.link(files["used"], files["alias"])
+        os.symlink(files["used"], files["link"])
+        (tmp_path / "free.qcow2").write_bytes(b"overlay")
+        host = _host(("vm-a", [os.path.realpath(files["used"])]),
+                     ("vm-b", ["/ws/b.qcow2"]))
+        return host, files
+
+    def test_many_files_are_asked_about_in_one_scan(self, tmp_path):
+        host, files = self._host(tmp_path)
+
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=host.run):
+            why = _session().files_in_use(list(files.values()))
+
+        listings = [args for args in host.asked("list") if "--all" in args]
+        assert len(listings) == 1
+        assert set(why) == {files["used"], files["alias"], files["link"]}
+        assert all(reason == "domain vm-a uses it" for reason in why.values())
+
+    def test_a_file_no_domain_uses_or_that_is_not_there_may_go(self, tmp_path):
+        host, files = self._host(tmp_path)
+
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=host.run):
+            why = _session().files_in_use([files["free"], files["absent"]])
+
+        assert why == {}
+
+    def test_a_failed_scan_keeps_everything(self, tmp_path):
+        host, files = self._host(tmp_path)
+        host.fail.add("domblklist")
+
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=host.run):
+            assert _session().files_in_use([files["free"]]) is None
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")
+    def test_a_file_that_cannot_be_inspected_stays(self, tmp_path):
+        host, _files = self._host(tmp_path)
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        (locked / "overlay").write_bytes(b"x")
+        locked.chmod(0)
+        try:
+            with patch("boxman.providers.libvirt.commands._shell_run",
+                       side_effect=host.run):
+                why = _session().files_in_use([str(locked / "overlay")])
+        finally:
+            locked.chmod(0o700)
+
+        assert why == {str(locked / "overlay"):
+                       "it cannot be inspected (Permission denied)"}
