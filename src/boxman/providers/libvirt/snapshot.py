@@ -19,12 +19,30 @@ from boxman.exceptions import SnapshotError, SnapshotRecoveryError
 
 from .cdrom import CDROMManager, media_disk_xml
 from .commands import VirshCommand
+from .pending_overlays import PendingOverlays, identity_of
 from .virsh_parse import parse_domblklist
 
 #: one ``<disk>`` element of a snapshot's XML, as libvirt formats it: an
 #: empty one, or one up to its own ``</disk>`` -- a disk element never holds
 #: another. Its children (``<backingStore>``) are named otherwise.
 _DISK_ELEMENT = re.compile(r"<disk\b[^>]*/>|<disk\b[^>]*>.*?</disk>", re.S)
+
+
+class _Backup(tuple):
+    """
+    ``(original, backup)``, as :meth:`SnapshotManager._preserve_snapshot_overlays`
+    made it. :attr:`linked` is the identity, ``(st_dev, st_ino)``, the two
+    names share when the backup is a hard link of the original, and None
+    when it is a copy.
+    """
+
+    linked: tuple[int, int] | None
+
+    def __new__(cls, original: str, backup: str,
+                linked: tuple[int, int] | None = None) -> "_Backup":
+        pair = super().__new__(cls, (original, backup))
+        pair.linked = linked
+        return pair
 
 
 class SnapshotManager:
@@ -63,7 +81,10 @@ class SnapshotManager:
     def _flatten_cdrom_overlays(self, vm_name: str, paths_in_use=None) -> None:
         """
         Before a take: put every CDROM of *vm_name* back on its ISO
-        (:meth:`_put_cdroms_back_on_their_isos`).
+        (:meth:`_put_cdroms_back_on_their_isos`), and remove the overlays of
+        its ISOs that its restores left for later
+        (:mod:`.pending_overlays`): this is where a restore's deferred
+        removal runs, one scan of every domain for all of them.
 
         ``snapshot-create-as --memspec`` saves the domain as it is, a CDROM
         on a qcow2 overlay of its ISO included, and every revert to the
@@ -77,7 +98,12 @@ class SnapshotManager:
                 (``LibVirtSession.disk_paths_in_use``), asked before an
                 overlay is removed; without it nothing is done.
         """
-        self._put_cdroms_back_on_their_isos(vm_name, paths_in_use=paths_in_use)
+        ledger = PendingOverlays()
+        waiting = ledger.chains(vm_name)
+        self._name_unreadable_records(ledger)
+        self._put_cdroms_back_on_their_isos(
+            vm_name, paths_in_use=paths_in_use,
+            pending=[(chain.layers, chain.iso) for chain in waiting])
 
     @staticmethod
     def _why_not_iso_overlays(layers: list[tuple[str, str | None]]) -> str | None:
@@ -575,10 +601,12 @@ class SnapshotManager:
 
     @staticmethod
     def _why_keep_overlay(layer: str, iso: str, named: set,
-                          in_use) -> str | None:
+                          in_use, identities=None) -> str | None:
         """
         Why the overlay *layer* of *iso* may not be removed, if it may not:
-        it is not a plain file, it is the ISO itself, a snapshot names it
+        it is not a plain file, it is the ISO itself, it is not the file
+        recorded for later removal (*identities*, ``{layer: identity}``, as
+        :mod:`.pending_overlays` recorded them), a snapshot names it
         (*named*), or a domain uses it (*in_use*, by path or by identity).
         """
         try:
@@ -591,6 +619,13 @@ class SnapshotManager:
         identity = (info.st_dev, info.st_ino)
         if identity == (under.st_dev, under.st_ino):
             return "it is the ISO itself"
+        if identities is not None and layer in identities:
+            if identities[layer] is None:
+                return ("its identity could not be read when it was left for "
+                        "later removal, so it cannot be told to be that file")
+            if identities[layer] != identity:
+                return ("it is not the file left there for later removal: "
+                        "another one has taken its name since")
         if layer in named or os.path.realpath(layer) in named:
             return "a snapshot of the VM still names it"
         domain = (in_use.get(layer) or in_use.get(os.path.realpath(layer))
@@ -620,7 +655,8 @@ class SnapshotManager:
 
     def _remove_iso_overlays(self, vm_name: str,
                              chains: list[tuple[list[str], str]],
-                             paths_in_use) -> None:
+                             paths_in_use, identities=None,
+                             gone: bool = False) -> None:
         """
         Remove the overlays of *chains* — ``(overlays top first, the ISO
         under them)`` — that nothing needs any more, each above the one it
@@ -629,10 +665,15 @@ class SnapshotManager:
         Kept, together with every layer under it: one a domain uses
         (*paths_in_use*, ``LibVirtSession.disk_paths_in_use``, asked now,
         after the CDROMs moved), one a snapshot of *vm_name* still names
-        anywhere in its XML, one that is not a plain file, or one that could
-        not be removed. Everything is kept when either cannot be told. The
-        ISO is never in a chain (:meth:`_why_not_iso_overlays`), and is told
-        apart by identity besides.
+        anywhere in its XML, one that is not a plain file, one that is not
+        the file *identities* recorded for later removal
+        (:meth:`_why_keep_overlay`), or one that could not be removed.
+        Everything is kept when either cannot be told. The ISO is never in a
+        chain (:meth:`_why_not_iso_overlays`), and is told apart by identity
+        besides.
+
+        With *gone*, the domain of *vm_name* is confirmed undefined, and its
+        snapshots went with it: none names anything.
         """
         present = list(dict.fromkeys(
             layer for layers, _iso in chains for layer in layers
@@ -640,7 +681,7 @@ class SnapshotManager:
         if not present:
             return
         left = f"left beside their ISO: {', '.join(present)}"
-        snapshots = self._snapshot_xmls(vm_name)
+        snapshots = {} if gone else self._snapshot_xmls(vm_name)
         in_use = paths_in_use() if snapshots is not None else None
         named: set = set()
         for xml in (snapshots or {}).values():
@@ -660,7 +701,8 @@ class SnapshotManager:
             for i, layer in enumerate(layers):
                 if not os.path.lexists(layer):
                     continue
-                why = self._why_keep_overlay(layer, iso, named, in_use)
+                why = self._why_keep_overlay(layer, iso, named, in_use,
+                                             identities)
                 if why:
                     kept.setdefault(layer, why)
                     for below in layers[i + 1:]:
@@ -688,10 +730,12 @@ class SnapshotManager:
                                     f"{why}")
 
     def _put_cdroms_back_on_their_isos(self, vm_name: str, paths_in_use=None,
-                                       also=()) -> None:
+                                       also=(), pending=(),
+                                       defer: bool = False) -> None:
         """
         Point every CDROM of *vm_name* at the ISO it reads again, and remove
-        the overlays libvirt made of it beside it (#273).
+        the overlays libvirt made of it beside it (#273) -- now, or, with
+        *defer*, later.
 
         Reverting to an external snapshot, libvirt builds a new overlay on
         every disk of the domain, its CDROMs included, whatever the snapshot
@@ -710,13 +754,18 @@ class SnapshotManager:
         Undone in that order, each step for a drive only once the one before
         worked for it:
 
-        1. each CDROM on such overlays (:meth:`_cdroms_on_overlays`) reads
+        1. every overlay this is about to move a CDROM off, and those of
+           *also*, is recorded for later removal (:mod:`.pending_overlays`)
+           before anything moves: moved off and then not removed, nothing
+           would record it any more, nor remove it;
+        2. each CDROM on such overlays (:meth:`_cdroms_on_overlays`) reads
            the ISO at the bottom of its chain again, in its live and
            persistent definition when *vm_name* is active, in the persistent
-           one alone when it is not (:meth:`_put_cdrom_back`);
-        2. no snapshot of *vm_name* names those overlays any more, nor
+           one alone when it is not (:meth:`_put_cdrom_back`). The record of
+           one still on them is dropped again;
+        3. no snapshot of *vm_name* names those overlays any more, nor
            records any overlay of a CDROM (:meth:`_retarget_snapshot_xml`),
-           whatever step 1 managed. libvirt's own delete of a
+           whatever step 2 managed. libvirt's own delete of a
            snapshot block-commits each overlay it records into the image
            under it: left recording a CDROM's, the delete opens the ISO
            read-write and commits into it — failing on the write lock while
@@ -724,29 +773,36 @@ class SnapshotManager:
            fails "failed to find parent disk source in backing chain".
            Naming a file that is gone, it also fails ``validate_snapshot``,
            and one that saved a CDROM on it fails its revert;
-        3. each one nothing needs any more is removed, top first
-           (:meth:`_remove_iso_overlays`).
+        4. each one nothing needs any more is removed, top first
+           (:meth:`_remove_iso_overlays`), and its record dropped. With
+           *defer* -- a restore -- this is left to the next command that
+           asks: the VM's next ``snapshot take`` or its teardown
+           (:meth:`remove_pending_iso_overlays`). Whether nothing uses an
+           overlay takes a scan of every domain on the host, which costs
+           more than the revert; the overlay holds nothing, and once
+           nothing records or uses it, it is harmless where it is.
 
         *also* holds more chains — ``(overlays top first, the ISO under
-        them)`` — the CDROM overlays the backup left to the revert
-        (:meth:`_cdrom_overlays_a_revert_discards`), told before it. The
-        revert deleted those the current snapshot recorded, and left every
-        other record of them: none may name them afterwards, gone or not,
-        and those still there go in step 3.
+        them)`` — the overlays the CDROMs were on before the revert
+        (:meth:`_cdrom_overlay_chains`). The revert deleted those the
+        current snapshot recorded, and the put-back brought back those the
+        backup kept; it left every other record of them: none may name them
+        afterwards, gone or not, and those still there go in step 4.
+        *pending* holds the chains recorded for later removal already, which
+        go in steps 3 and 4 as they were recorded.
 
         A VM holding managed saved state is left alone: its next start
         restores the definition saved with it, which names whatever its
         CDROMs were on.
 
-        Nothing is done without *paths_in_use*
-        (``LibVirtSession.disk_paths_in_use``): moved off overlays that are
-        then never removed, the CDROMs would leave them recorded by nothing,
-        where libvirt's next revert removes those it records.
+        Without *paths_in_use* (``LibVirtSession.disk_paths_in_use``)
+        nothing is done unless *defer*: an overlay moved off that cannot be
+        removed must be recorded, and is removed now when it cannot be.
 
         Housekeeping, after a revert that worked: what it cannot do is
         warned about, never raised.
         """
-        if paths_in_use is None:
+        if paths_in_use is None and not defer:
             self.logger.debug(f"{vm_name}: no domain-usage check was given, "
                               f"so its CDROMs are left as they are")
             return
@@ -772,19 +828,28 @@ class SnapshotManager:
             return
         entries, _isos = found
         taken = {layer for entry in entries for layer in entry["layers"]}
-        chains = [([layer for layer in layers if layer not in taken], iso)
-                  for layers, iso in also]
-        chains = [(layers, iso) for layers, iso in chains if layers]
+
+        def untaken(given):
+            kept = [([layer for layer in layers if layer not in taken], iso)
+                    for layers, iso in given]
+            return [(layers, iso) for layers, iso in kept if layers]
+        chains = untaken(also)
+        waiting = untaken(pending)
         snapshots = self._snapshot_xmls(vm_name)
         if snapshots is None:
             overlays = sorted(taken | {layer for layers, _iso in chains
-                                       for layer in layers})
+                                       + waiting for layer in layers})
             self.logger.warning(
                 f"{vm_name}: its snapshots could not be read, so its CDROMs "
                 f"are left as they are"
                 + (f", on {', '.join(overlays)}" if overlays else ""))
             return
 
+        ledger = PendingOverlays()
+        recorded = self._record_pending(
+            vm_name, ledger,
+            chains + [(entry["layers"], entry["iso"]) for entry in entries],
+            replacing=[layers[0] for layers, _iso in also if layers])
         groups: dict[str, list[dict]] = {}
         for entry in entries:
             groups.setdefault(entry["target"], []).append(entry)
@@ -792,11 +857,189 @@ class SnapshotManager:
             if self._put_cdrom_back(vm_name, cdroms, target, group):
                 chains.extend((entry["layers"], entry["iso"])
                               for entry in group)
+            elif recorded:
+                # still on them: what needs them is the VM itself, and the
+                # next take or restore finds them there
+                self._forget_pending(vm_name, ledger, [
+                    entry["layers"][0] for entry in group])
 
+        chains += waiting
         retired = {layer: iso for layers, iso in chains for layer in layers}
         self._unrecord_cdrom_overlays(vm_name, snapshots, retired)
-        if chains:
-            self._remove_iso_overlays(vm_name, chains, paths_in_use)
+        if not chains:
+            return
+        if defer and recorded:
+            self._name_pending(vm_name, ledger, chains)
+            return
+        if paths_in_use is None:
+            self.logger.warning(
+                f"{vm_name}: the overlays its CDROMs were moved off could not "
+                f"be recorded for later removal, and whether anything uses "
+                f"them cannot be asked here, so they are left beside their "
+                f"ISO: "
+                + ", ".join(dict.fromkeys(layer for layers, _iso in chains
+                                          for layer in layers
+                                          if os.path.lexists(layer))))
+            return
+        self._remove_iso_overlays(vm_name, chains, paths_in_use,
+                                  identities=self._pending_identities(
+                                      vm_name, ledger))
+        self._settle_pending(vm_name, ledger)
+
+    def remove_pending_iso_overlays(self, vm_name: str, paths_in_use,
+                                    gone: bool = False) -> None:
+        """
+        Remove the overlays of its CDROM images that restores of *vm_name*
+        left for later (:mod:`.pending_overlays`), behind the checks a
+        removal right after the revert asked (:meth:`_remove_iso_overlays`):
+        each is still the file recorded, no snapshot of *vm_name* names it,
+        and no domain uses it -- *paths_in_use*, asked once for all of them.
+        Then drop the record of each that is gone, or is no longer the file
+        recorded; one kept stays recorded, and is named at every removal.
+
+        A teardown of the VM calls this, with *gone* once its domain is
+        confirmed undefined. A take removes them on its way
+        (:meth:`_flatten_cdrom_overlays`). Housekeeping: what it cannot do
+        is warned about, never raised.
+        """
+        ledger = PendingOverlays()
+        waiting = ledger.chains(vm_name)
+        self._name_unreadable_records(ledger)
+        if not waiting:
+            return
+        self._remove_iso_overlays(
+            vm_name, [(chain.layers, chain.iso) for chain in waiting],
+            paths_in_use,
+            identities=self._pending_identities(vm_name, ledger), gone=gone)
+        self._settle_pending(vm_name, ledger)
+
+    def _record_pending(self, vm_name: str, ledger: PendingOverlays,
+                        chains: list[tuple[list[str], str]],
+                        replacing=()) -> bool:
+        """
+        Record *chains* of *vm_name* for later removal in *ledger*, in place
+        of the records topped by *replacing*; whether that worked. What
+        could not be recorded is said, and is removed right away where a
+        usage check is at hand.
+        """
+        try:
+            ledger.forget(vm_name, replacing)
+            ledger.record(vm_name, chains)
+        except OSError as exc:
+            self.logger.warning(
+                f"{vm_name}: the overlays of its CDROM images could not be "
+                f"recorded for later removal in {ledger.directory} ({exc})")
+            return False
+        return True
+
+    def _forget_pending(self, vm_name: str, ledger: PendingOverlays,
+                        tops) -> None:
+        """Drop the records of *vm_name* topped by *tops*, saying so when
+        that cannot be done."""
+        try:
+            ledger.forget(vm_name, tops)
+        except OSError as exc:
+            self.logger.warning(
+                f"{vm_name}: the record of {', '.join(tops)} for later "
+                f"removal could not be dropped ({exc}); the removal keeps it "
+                f"while it is used")
+
+    def _settle_pending(self, vm_name: str, ledger: PendingOverlays) -> None:
+        """:meth:`PendingOverlays.settle`, saying so when it cannot be
+        done."""
+        try:
+            ledger.settle(vm_name)
+        except OSError as exc:
+            self.logger.warning(
+                f"{vm_name}: the records of the overlays left for later "
+                f"removal could not be brought up to date ({exc}); the next "
+                f"removal does it")
+
+    @staticmethod
+    def _pending_identities(vm_name: str, ledger: PendingOverlays) -> dict:
+        """``{layer: identity}`` for every overlay recorded for later
+        removal of *vm_name*, as recorded."""
+        return {layer: chain.identity(layer)
+                for chain in ledger.chains(vm_name) for layer in chain.layers}
+
+    def _name_unreadable_records(self, ledger: PendingOverlays) -> None:
+        """Name each record *ledger* could not read: never removed, it
+        is left for a person to check."""
+        for path, why in sorted(ledger.unreadable.items()):
+            self.logger.warning(
+                f"{path}, a record of CDROM overlays left for later removal, "
+                f"cannot be read ({why}): check the overlays it names by "
+                f"hand, then remove it")
+
+    def _name_pending(self, vm_name: str, ledger: PendingOverlays,
+                      chains: list[tuple[list[str], str]]) -> None:
+        """Say which overlays of *chains* wait beside their ISO for later
+        removal, and, at the default verbosity, how many of *vm_name*'s do
+        once more than these do."""
+        now = list(dict.fromkeys(layer for layers, _iso in chains
+                                 for layer in layers
+                                 if os.path.lexists(layer)))
+        if now:
+            self.logger.info(
+                f"{vm_name}: {', '.join(now)} left beside its ISO for later "
+                f"removal: the next `boxman snapshot take` of the VM, or its "
+                f"destroy, removes it once nothing uses it")
+        waiting = [layer for chain in ledger.chains(vm_name)
+                   for layer in chain.layers]
+        if len(waiting) > len(now):
+            self.logger.status(
+                f"{vm_name}: {len(waiting)} overlays libvirt made of its "
+                f"CDROM images wait beside them for removal: its next "
+                f"`boxman snapshot take`, or its destroy, removes them once "
+                f"nothing uses them (`boxman snapshot prune --dry-run` lists "
+                f"them)")
+
+    def _cdrom_overlay_chains(self,
+                              vm_name: str) -> list[tuple[list[str], str]]:
+        """
+        The overlays the CDROMs of *vm_name* read their ISOs through now,
+        as chains -- ``(overlays top first, the ISO)`` -- read from its own
+        definitions alone, no other domain's
+        (:meth:`_cdroms_on_overlays`); empty when there are none, or that
+        cannot be told.
+        """
+        cdroms = CDROMManager(vm_name, provider_config=self.provider_config)
+        active = self._domain_is_active(vm_name)
+        found = (None if active is None else self._cdroms_on_overlays(
+            vm_name, cdroms, active, quiet=True))
+        if not found:
+            return []
+        chains: dict[tuple, str] = {}
+        for entry in found[0]:
+            chains.setdefault(tuple(entry["layers"]), entry["iso"])
+        return [(list(layers), iso) for layers, iso in chains.items()]
+
+    def _unbackable_cdrom_overlays(self, vm_name: str,
+                                   chains: list[tuple[list[str], str]],
+                                   paths_in_use) -> list[str]:
+        """
+        Of the overlays in *chains*, those the backup is to leave to the
+        revert: the ones in a directory boxman may not write to -- where no
+        backup can be reserved, as ``/usr/share/virtio-win`` -- that
+        :meth:`_cdrom_overlays_a_revert_discards` finds no revert opens and
+        no other domain uses. That check scans every domain, so it is asked
+        only for those. Every other overlay at risk, a CDROM's included, is
+        backed up: a hard link, which writes no data (#273).
+        """
+        unwritable = {layer for layers, _iso in chains for layer in layers
+                      if not os.access(os.path.dirname(layer),
+                                       os.W_OK | os.X_OK)}
+        if not unwritable:
+            return []
+        try:
+            discarded = self._cdrom_overlays_a_revert_discards(vm_name,
+                                                               paths_in_use)
+        except Exception as exc:
+            self.logger.debug(f"{vm_name}: every overlay at risk is backed "
+                              f"up ({type(exc).__name__}: {exc})")
+            return []
+        return [layer for layers, _iso in discarded for layer in layers
+                if layer in unwritable]
 
     def _cdrom_overlays_a_revert_discards(
             self, vm_name: str,
@@ -808,13 +1051,15 @@ class SnapshotManager:
         revert opens it, and no other domain uses one.
 
         One a snapshot records as its overlay of a CDROM is at risk like any
-        other (:meth:`_preserve_snapshot_overlays`). But it holds nothing —
-        a guest cannot write to a CDROM — and copying it means writing
-        beside the ISO, in a directory that may not be boxman's (#273). The
-        revert deletes it when the current snapshot records it — and leaves
-        every other record of it — and :meth:`_put_cdroms_back_on_their_isos`
-        takes them over afterwards: it rewrites the records, gone or not,
-        and removes what is still there.
+        other (:meth:`_preserve_snapshot_overlays`). It holds nothing — a
+        guest cannot write to a CDROM — but it is backed up all the same,
+        by a hard link, unless its directory is one boxman may not write to
+        (:meth:`_unbackable_cdrom_overlays`): only there is this asked, as
+        it scans every domain. The revert deletes it when the current
+        snapshot records it — and leaves every other record of it — and
+        :meth:`_put_cdroms_back_on_their_isos` takes them over afterwards:
+        it rewrites the records, gone or not, and records what is still
+        there for removal.
 
         Empty when any of that cannot be told: then everything at risk is
         backed up, as before.
@@ -2489,7 +2734,9 @@ class SnapshotManager:
         """
         Back up the overlay files that ``snapshot-revert`` to
         *snapshot_name* can delete, so they can be restored afterwards
-        and every snapshot stays reachable.
+        and every snapshot stays reachable: each a hard link of the
+        overlay where one can be made (:meth:`_link_backups`), which writes
+        no data, and a copy where not.
 
         Two sets. The overlays of the target and of every snapshot newer
         than it in the chain; older ones are not copied, which avoids
@@ -2512,11 +2759,12 @@ class SnapshotManager:
             vm_name: the domain whose overlays are at risk.
             snapshot_name: the snapshot about to be reverted to.
             skip: overlays at risk that need no backup — a CDROM's, which
-                holds nothing and which no revert opens
-                (:meth:`_cdrom_overlays_a_revert_discards`).
+                holds nothing and which no revert opens, in a directory no
+                backup can be reserved in (:meth:`_unbackable_cdrom_overlays`).
 
         Returns:
-            list: ``(original_path, backup_path)`` pairs. Empty means there
+            list: ``(original_path, backup_path)`` pairs (:class:`_Backup`,
+            which says whether the backup is a hard link). Empty means there
             was nothing at risk, and nothing else — the caller reverts on
             that answer, so a failed backup must not be able to produce it.
 
@@ -2570,6 +2818,10 @@ class SnapshotManager:
         if not pairs:
             return []
 
+        linked = self._link_backups(vm_name, pairs)
+        if linked is not None:
+            return linked
+
         # the copy does not go straight to the reserved path. `cp` truncates
         # its destination before filling it, and a zero-length file at an
         # overlay path is one libvirt will adopt as the overlay it was about
@@ -2582,11 +2834,11 @@ class SnapshotManager:
         signatures = self._reserve_backup_paths(to_reserve)
         owned = [path for _src, path in to_reserve]
 
-        # batch it all into one command → one sudo prompt.
-        # --reflink=auto shares the extents on a CoW filesystem instead of
-        # writing a second full copy beside the original, which is the ENOSPC
-        # this backup used to die of (#164 CL-R2). Elsewhere it falls back to
-        # the sparse copy `rsync -aW --sparse` was already making.
+        # where no hard link could be made: a copy, in one command → one
+        # sudo prompt. --reflink=auto shares the extents on a CoW filesystem
+        # instead of writing a second full copy beside the original, which is
+        # the ENOSPC this backup used to die of (#164 CL-R2). Elsewhere it
+        # falls back to the sparse copy `rsync -aW --sparse` was making.
         #
         # Every command carries its own prefix: execute_shell prefixes the
         # first word of the string it is handed, which in a chain reaches
@@ -2620,7 +2872,7 @@ class SnapshotManager:
             if not unusable:
                 for src, _dst in pairs:
                     self.logger.debug(f"preserved snapshot overlay: {src}")
-                return pairs
+                return [_Backup(src, dst) for src, dst in pairs]
 
             self._reap_preserve_files(owned)
             raise SnapshotError(
@@ -2643,15 +2895,85 @@ class SnapshotManager:
             f"so without the backup every snapshot from '{snapshot_name}' "
             f"onwards would be gone.")
 
-    @staticmethod
-    def _backup_was_written(dst: str, reserved: tuple) -> bool:
+    def _link_backups(self, vm_name: str,
+                      pairs: list[tuple]) -> list[_Backup] | None:
         """
-        Whether the copy actually replaced this call's reservation.
+        Back up each original of *pairs* -- ``(original, backup path)``,
+        every backup path claimed (:meth:`_claim_backup_paths`) -- as a hard
+        link of it at its backup path, in one command; the pairs, or None
+        when the links could not all be made, any this made removed again.
+        The caller copies then.
+
+        A hard link writes no data, where a copy writes everything the guest
+        wrote since the last restore, with the guest paused (ext4 has no
+        reflinks): ~1.2 s per GiB measured. It keeps the overlay as it is
+        only because nothing writes into an overlay once it is backed up:
+        the guest is paused for the backup (:meth:`_pause_for_backup`) and
+        stays paused up to the revert; the revert builds new overlays and
+        unlinks the ones it discards rather than writing into them
+        (``qemuSnapshotRevertExternalFinish``, measured on libvirt 10.10);
+        a revert that fails stops before that; the CDROM steps after it
+        change which image a drive reads, never an image; and the put-back
+        renames the backup over the original's name. A revert that wrote
+        into an overlay it keeps would write into the original as much, and
+        no backup is needed for one the revert keeps.
+
+        ``ln`` creates the link only where nothing is (``link(2)``), so the
+        backup path needs no reservation: the file appears there whole, or
+        not at all. What it cannot link -- across devices, a file the user
+        may not link under ``fs.protected_hardlinks``, a filesystem without
+        hard links -- fails the command. A backup path holding a link of its
+        original is this call's; nothing else is touched.
+
+        A directory the user may not write to takes no link either, though a
+        ``sudo ln`` could make one: removing a backup the revert left
+        redundant takes no ``sudo`` (:meth:`_reap_preserve_files`), and one
+        left there refuses the next restore. The copy refuses such a
+        directory up front, at its reservation, as it always has.
+        """
+        identities: dict[str, tuple[int, int]] = {}
+        for src, dst in pairs:
+            identity = identity_of(src)
+            if identity is None or not os.access(os.path.dirname(dst),
+                                                 os.W_OK | os.X_OK):
+                return None
+            identities[src] = identity
+        steps = [f"ln -T -- {shlex.quote(src)} {shlex.quote(dst)}"
+                 for src, dst in pairs]
+        cmd = " && ".join(self.virsh.sudo_prefix(c) + c for c in steps)
+        try:
+            result = self.virsh.execute_shell(cmd, warn=True)
+            why = (result.stderr or "").strip() if not result.ok else ""
+        except Exception as exc:
+            result, why = None, f"{type(exc).__name__}: {exc}"
+        made = [dst for src, dst in pairs
+                if self._backup_was_written(dst, None, linked=identities[src])]
+        if result is not None and result.ok and len(made) == len(pairs):
+            for src, _dst in pairs:
+                self.logger.debug(f"preserved snapshot overlay: {src} "
+                                  f"(a hard link)")
+            return [_Backup(src, dst, identities[src]) for src, dst in pairs]
+        self._reap_preserve_files(made)
+        self.logger.debug(
+            f"{vm_name}: the overlays at risk could not all be backed up by "
+            f"hard links ({why or 'a link is not where it was made'}); "
+            f"copying them")
+        return None
+
+    @staticmethod
+    def _backup_was_written(dst: str, reserved: tuple | None,
+                            linked: tuple[int, int] | None = None) -> bool:
+        """
+        Whether the copy actually replaced this call's reservation -- or,
+        with *linked*, whether *dst* is a hard link of the original, whose
+        identity that is.
 
         The reservation is deliberately non-empty, so neither "is it a
         regular file" nor "is it larger than zero" tells a real backup from
         an untouched placeholder — and ``cp`` can exit 0 having written
-        nothing.
+        nothing. A hard link is told by its identity alone: it is the
+        original's inode, the same size and mtime, and was never a
+        reservation.
 
         The question is asked of the inode rather than of the contents.
         Reading the file would need permission the copy does not: a
@@ -2664,11 +2986,12 @@ class SnapshotManager:
         Args:
             dst: the backup path to inspect.
             reserved: the ``(inode, size, mtime_ns)`` the reservation had.
+            linked: the original's ``(st_dev, st_ino)``, for a hard link.
 
         Returns:
             bool: True when the file at *dst* is a regular file that is no
-            longer the reservation. A path that cannot be stat'ed counts as
-            not written.
+            longer the reservation, or is the original's inode. A path that
+            cannot be stat'ed counts as not written.
         """
         try:
             now = os.lstat(dst)
@@ -2676,6 +2999,8 @@ class SnapshotManager:
             return False
         if not stat.S_ISREG(now.st_mode):
             return False
+        if linked is not None:
+            return (now.st_dev, now.st_ino) == linked
         return (now.st_ino, now.st_size, now.st_mtime_ns) != reserved
 
     @staticmethod
@@ -3054,14 +3379,31 @@ class SnapshotManager:
         # retry then has just the stragglers to move.
         unrecovered: list[tuple] = []
         redundant: list[str] = []
-        for original, backup in preserved:
+        replaced: list[tuple] = []
+        for pair in preserved:
+            original, backup = pair
+            linked = getattr(pair, "linked", None)
             if self._is_regular_file(original):
                 # the overlay is where it belongs; its backup, if one is
-                # still lying about, is a spare copy and safe to drop
-                if self._is_regular_file(backup):
+                # still lying about, is a spare copy and safe to drop -- a
+                # hard link, only while the original is the file it links:
+                # a name taken by another file since is no proof the
+                # backed-up one is safe
+                if not self._is_regular_file(backup):
+                    continue
+                if linked is None or identity_of(original) == linked:
                     redundant.append(backup)
+                else:
+                    replaced.append((original, backup))
             else:
                 unrecovered.append((original, backup))
+
+        if replaced:
+            self.logger.error(
+                f"another file has taken the name of each overlay below since "
+                f"it was backed up, so its backup is kept: check which of the "
+                f"two the snapshots need: "
+                f"{', '.join(f'{o} (backed up as {b})' for o, b in replaced)}")
 
         if unrecovered:
             # deliberately no reap for these: their .preserve file may be
@@ -3131,7 +3473,7 @@ class SnapshotManager:
               "move refuses.")
 
     def snapshot_restore(self, vm_name: str, snapshot_name: str,
-                         paths_in_use=None) -> bool:
+                         paths_in_use=None, after_media=None) -> bool:
         """
         Revert a VM to a specific snapshot.
 
@@ -3141,8 +3483,9 @@ class SnapshotManager:
         are what the revert deletes, though it be older than the target
         (see :meth:`_preserve_snapshot_overlays`, which falls back to
         backing up every overlay if the target isn't found in the chain).
-        After the revert any overlays libvirt deleted are restored so that
-        every snapshot remains reachable.
+        Each is a hard link where one can be made, and a copy where not
+        (:meth:`_link_backups`). After the revert any overlays libvirt
+        deleted are restored so that every snapshot remains reachable.
 
         That backup is a precondition, not a courtesy. If it cannot be made,
         :meth:`_preserve_snapshot_overlays` raises and no revert is
@@ -3150,11 +3493,12 @@ class SnapshotManager:
         target onwards, and the old code could not tell a failed backup
         apart from "there was nothing to back up" (#164 CL-D1).
 
-        Each backup path is *reserved* rather than merely checked, so a
-        second restore -- or a ``snapshot take`` that happens to name its
-        overlay the same thing -- cannot land on a path this call is about
-        to write, and the cleanup only ever removes files this call
-        created.
+        Each backup path is taken exclusively rather than merely checked --
+        a hard link is made only where nothing is, and a copy's path is
+        *reserved* first -- so a second restore -- or a ``snapshot take``
+        that happens to name its overlay the same thing -- cannot land on a
+        path this call is about to write, and the cleanup only ever removes
+        files this call created.
 
         Compressed memory: if the snapshot's ``.raw`` memory file is missing
         but a ``.raw.zst`` sibling exists (created by ``snapshot take
@@ -3170,17 +3514,24 @@ class SnapshotManager:
         CDROMs: the revert builds a qcow2 overlay of each one's ISO beside
         the ISO, although the snapshot left them out, and moves the CDROM
         onto it. After a revert that worked, each is put back on its ISO and
-        the overlays nothing needs are removed
-        (:meth:`_put_cdroms_back_on_their_isos`, #273). One the CDROMs were
-        on already is not backed up, as long as no revert opens it
-        (:meth:`_cdrom_overlays_a_revert_discards`).
+        no snapshot record names those overlays any more; they are recorded
+        for removal by the VM's next take or its teardown, which ask whether
+        anything uses them (:meth:`_put_cdroms_back_on_their_isos`, #273).
+        One the CDROMs were on already is backed up like any other overlay
+        at risk, a hard link (:meth:`_unbackable_cdrom_overlays`).
 
         Args:
             vm_name: Name of the vm
             snapshot_name: Name of the snapshot to revert to
             paths_in_use: what every domain uses
-                (``LibVirtSession.disk_paths_in_use``), asked before a CDROM
-                overlay is removed or left unbacked; without it neither is.
+                (``LibVirtSession.disk_paths_in_use``): without it the
+                CDROMs are left as they are. It is asked only before a
+                CDROM overlay the backup cannot keep is left to the revert,
+                or one that cannot be recorded for later removal is removed.
+            after_media: called once the CDROMs are back on their ISOs, after
+                a revert that worked: the guest's clock is set there
+                (``LibVirtSession._set_clock_after_revert``), with nothing
+                slow before it. A failure in it is warned about.
 
         Returns:
             bool: True if successful, False otherwise
@@ -3192,24 +3543,24 @@ class SnapshotManager:
                 could not be put back. Never retry this one — the retry
                 would revert a second time.
         """
-        # read before the pause: it can scan every domain, and the guest
-        # holds still for the copy alone. Leaving one unbacked is an
-        # economy, never a reason to refuse.
-        try:
-            discarded = self._cdrom_overlays_a_revert_discards(
-                vm_name, paths_in_use)
-        except Exception as exc:
-            self.logger.debug(f"{vm_name}: every overlay at risk is backed "
-                              f"up ({type(exc).__name__}: {exc})")
-            discarded = []
+        # read before the pause: the guest holds still for the copy alone.
+        # Without a usage check its CDROMs are left as they are
+        before: list[tuple[list[str], str]] = []
+        if paths_in_use is not None:
+            try:
+                before = self._cdrom_overlay_chains(vm_name)
+            except Exception as exc:
+                self.logger.debug(f"{vm_name}: the overlays its CDROMs are "
+                                  f"on could not be told "
+                                  f"({type(exc).__name__}: {exc})")
+        skip = self._unbackable_cdrom_overlays(vm_name, before, paths_in_use)
 
         # the overlays have to hold still while they are copied, and the
         # newest one is the disk the guest is writing to (#195)
         paused = self._pause_for_backup(vm_name)
         try:
             preserved = self._preserve_snapshot_overlays(
-                vm_name, snapshot_name,
-                skip=[layer for layers, _iso in discarded for layer in layers])
+                vm_name, snapshot_name, skip=skip)
         except Exception:
             self._resume_after_backup(vm_name, paused)
             raise
@@ -3219,10 +3570,10 @@ class SnapshotManager:
         # and the next restore refuses on them. Nothing has been reverted
         # yet, so every original is still in place and the backups are
         # redundant.
+        mem_path, decompressed_for_revert = None, False
         try:
             # Just-in-time decompress if the memory file was zstd'd.
             mem_path = self._memory_path_from_xml(vm_name, snapshot_name)
-            decompressed_for_revert = False
             if mem_path and not os.path.isfile(mem_path) and os.path.isfile(f"{mem_path}.zst"):
                 self.logger.info(
                     f"memory file is compressed; decompressing before revert: "
@@ -3236,45 +3587,52 @@ class SnapshotManager:
         except Exception as exc:
             self._reap_preserve_files([b for _o, b in preserved])
             self._resume_after_backup(vm_name, paused)
+            self._undo_decompression(mem_path, decompressed_for_revert)
             raise SnapshotError(
                 f"could not prepare {vm_name} for the revert to "
                 f"'{snapshot_name}' ({type(exc).__name__}: {exc}); refusing "
                 f"to revert") from exc
 
+        ledger = PendingOverlays()
+        intended = False
         max_retries = 3
         last_stderr = ''
         success = False
 
         for attempt in range(1, max_retries + 1):
             try:
+                if not intended:
+                    # what the CDROMs are on now, recorded for later
+                    # removal before the revert leaves it unused
+                    intended = self._record_pending(vm_name, ledger, before)
                 result = self.virsh.execute(
                     "snapshot-revert", vm_name, snapshot_name, warn=True)
-
-                if result.ok:
-                    self.logger.info(f"vm {vm_name} reverted to snapshot '{snapshot_name}'")
-                    success = True
-                    break
-
-                last_stderr = result.stderr or ''
-                if 'write' in last_stderr and 'lock' in last_stderr and attempt < max_retries:
-                    self.logger.warning(
-                        f"write lock contention reverting {vm_name}, "
-                        f"retrying in 2s (attempt {attempt}/{max_retries})")
-                    time.sleep(2)
-                    continue
-
-                break
-
             except Exception as exc:
                 self.logger.error(
                     f"error reverting vm {vm_name} to snapshot '{snapshot_name}': {exc}")
                 self._report_pause_after_failed_revert(vm_name, paused)
+                self._forget_intended(vm_name, ledger, before, intended)
                 self._finish_restore(
                     preserved, mem_path, decompressed_for_revert)
                 return False
 
+            if result.ok:
+                self.logger.info(f"vm {vm_name} reverted to snapshot '{snapshot_name}'")
+                success = True
+                break
+
+            last_stderr = result.stderr or ''
+            if 'write' in last_stderr and 'lock' in last_stderr and attempt < max_retries:
+                self.logger.warning(
+                    f"write lock contention reverting {vm_name}, "
+                    f"retrying in 2s (attempt {attempt}/{max_retries})")
+                time.sleep(2)
+                continue
+            break
+
         if not success:
             self._report_pause_after_failed_revert(vm_name, paused)
+            self._forget_intended(vm_name, ledger, before, intended)
         # only a revert that succeeded tells what it discarded
         self._finish_restore(preserved, mem_path, decompressed_for_revert,
                              vm_name=vm_name if success else None)
@@ -3285,17 +3643,50 @@ class SnapshotManager:
             # What it did to the CDROMs is undone after the overlays are
             # back: a failure there is housekeeping, not a failed restore.
             try:
-                self._put_cdroms_back_on_their_isos(
-                    vm_name, paths_in_use=paths_in_use, also=discarded)
+                if paths_in_use is not None:
+                    self._put_cdroms_back_on_their_isos(
+                        vm_name, paths_in_use=paths_in_use, also=before,
+                        defer=True)
             except Exception as exc:
                 self.logger.warning(
                     f"{vm_name}: its CDROMs could not be put back on their "
                     f"ISOs after the revert ({type(exc).__name__}: {exc})")
+            # right after the media change, which pauses the guest: nothing
+            # slow is left before it
+            if after_media is not None:
+                try:
+                    after_media()
+                except Exception as exc:
+                    self.logger.warning(
+                        f"{vm_name}: what follows the CDROMs' put-back failed "
+                        f"({type(exc).__name__}: {exc})")
             return True
 
         self.logger.error(
             f"failed to revert vm {vm_name} to snapshot '{snapshot_name}': {last_stderr}")
         return False
+
+    def _undo_decompression(self, mem_path: str | None,
+                            decompressed: bool) -> None:
+        """:meth:`_recompress_after_revert` on a path that refuses the
+        revert: what it cannot do is warned about, never raised over the
+        refusal."""
+        try:
+            self._recompress_after_revert(mem_path, decompressed)
+        except Exception as exc:
+            self.logger.warning(
+                f"could not remove the memory image decompressed for the "
+                f"revert, {mem_path} ({type(exc).__name__}: {exc})")
+
+    def _forget_intended(self, vm_name: str, ledger: PendingOverlays,
+                         before: list[tuple[list[str], str]],
+                         intended: bool) -> None:
+        """Drop what a restore recorded of *before* -- the overlays the
+        CDROMs were on -- for later removal, its revert having failed: the
+        CDROMs are still on them."""
+        if intended and before:
+            self._forget_pending(vm_name, ledger,
+                                 [layers[0] for layers, _iso in before])
 
     def _recompress_after_revert(self,
                                  mem_path: str | None,

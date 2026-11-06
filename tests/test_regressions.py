@@ -85,7 +85,9 @@ class TestSnapshotOverlayPreservation057eb7d:
         """Regression: a naive per-file loop would fire one sudo prompt
         per overlay. The fix batches into a single `sudo cp && sudo cp ...`
         chain to keep it to one auth prompt. The copy tool changed with
-        #164 CL-R2 (rsync -> cp --reflink=auto); the batching did not."""
+        #164 CL-R2 (rsync -> cp --reflink=auto), and the backup became a
+        hard link, `ln`, with the copy where one cannot be made; the
+        batching did not."""
         sm = SnapshotManager({"use_sudo": True})
 
         a = tmp_path / "a.qcow2"
@@ -118,8 +120,8 @@ class TestSnapshotOverlayPreservation057eb7d:
 
         assert len(calls) == 1
         cmd = calls[0]
-        # one sudo prefix per copy, chained with &&, not ;
-        assert cmd.count("sudo cp ") == 3
+        # one sudo prefix per link, chained with &&, not ;
+        assert cmd.count("sudo ln -T ") == 3
         assert " && " in cmd
 
 

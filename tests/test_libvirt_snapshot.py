@@ -27,8 +27,9 @@ from boxman.exceptions import SnapshotError, SnapshotRecoveryError
 from boxman.providers.libvirt.cdrom import CDROMManager
 from boxman.providers.libvirt.commands import LibVirtCommandBase, VirshCommand
 from boxman.providers.libvirt.disk_cleanup import FilesInUse
+from boxman.providers.libvirt.pending_overlays import PendingOverlays
 from boxman.providers.libvirt.session import LibVirtSession
-from boxman.providers.libvirt.snapshot import SnapshotManager
+from boxman.providers.libvirt.snapshot import SnapshotManager, _Backup
 
 pytestmark = pytest.mark.unit
 
@@ -84,6 +85,17 @@ def _not_running(sm: SnapshotManager):
     TestTheGuestHoldsStillWhileCopying for the pause itself.
     """
     return patch.object(sm, "_pause_for_backup", return_value=False)
+
+
+def _no_hard_links(sm: SnapshotManager):
+    """The overlays cannot be hard-linked where they are -- another device
+    under a bind mount, ``fs.protected_hardlinks``, a filesystem without
+    hard links -- so the backup copies them.
+
+    For the tests about that copy, which a backup made before hard links
+    always was. See TestBackupsAreHardLinks for the links.
+    """
+    return patch.object(sm, "_link_backups", return_value=None)
 
 
 @contextlib.contextmanager
@@ -699,7 +711,7 @@ class TestPreserveSnapshotOverlays:
         calls: list[str] = []
         # reverting to s1 (oldest) preserves s1 and the newer s2
         with _inventory(sm, {"s1": [str(overlay1)], "s2": [str(overlay2)]},
-                        ["s1", "s2"]), \
+                        ["s1", "s2"]), _no_hard_links(sm), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_copies(calls)):
             preserved = sm._preserve_snapshot_overlays("vm01", "s1")
@@ -789,6 +801,7 @@ class TestPreserveSnapshotOverlays:
         overlay.write_bytes(b"x")
         calls: list[str] = []
         with _inventory(sm, {"s": [str(overlay)]}, ["s"]), \
+             _no_hard_links(sm), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_copies(calls,
                                                          strip_sudo=True)):
@@ -1310,6 +1323,7 @@ class TestBackupPathsAreReserved:
         backup.write_bytes(b"somebody else's overlay")
 
         with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
+             _no_hard_links(sm), \
              patch.object(sm, "_claim_backup_paths"), \
              patch.object(sm.virsh, "execute_shell") as shell:
             with pytest.raises(SnapshotError, match="could not reserve"):
@@ -1994,7 +2008,7 @@ class TestBackupIsAPrecondition:
             # the copy chain fails; the reap that follows it succeeds
             return _result(ok=cmd.startswith("rm "), stderr="disk full")
 
-        with _inventory(sm, overlays, ["s1", "s2"]), \
+        with _inventory(sm, overlays, ["s1", "s2"]), _no_hard_links(sm), \
              patch.object(sm.virsh, "execute_shell", side_effect=capture):
             with pytest.raises(SnapshotError):
                 sm._preserve_snapshot_overlays("vm01", "s1")
@@ -2151,11 +2165,16 @@ class TestBatchedCommandPrivilege:
             sm._preserve_snapshot_overlays("vm01", "s")
         return calls[0]
 
+    def _copied(self, sm, tmp_path, calls):
+        """:meth:`_preserve` where the backup is a copy."""
+        with _no_hard_links(sm):
+            return self._preserve(sm, tmp_path, calls)
+
     def test_a_skipped_copy_is_not_sudo_prefixed_even_under_use_sudo(
         self, tmp_path: Path
     ):
         sm = SnapshotManager({"use_sudo": True, "sudo_skip_commands": ["cp"]})
-        cmd = self._preserve(sm, tmp_path, [])
+        cmd = self._copied(sm, tmp_path, [])
         parts = cmd.split(" && ")
         # the skip applies to cp, and only to cp: mv is a different
         # executable and keeps the privilege use_sudo gives it
@@ -2167,7 +2186,7 @@ class TestBatchedCommandPrivilege:
     ):
         sm = SnapshotManager({"use_sudo": False,
                               "force_sudo_commands": ["cp"]})
-        cmd = self._preserve(sm, tmp_path, [])
+        cmd = self._copied(sm, tmp_path, [])
         parts = cmd.split(" && ")
         # every cp, not just the first: the ones after an && used to
         # inherit nothing at all
@@ -2175,6 +2194,21 @@ class TestBatchedCommandPrivilege:
         assert not any(part.startswith("cp ") for part in parts)
         # and the force names cp, so mv is left as use_sudo=False has it
         assert any(part.startswith("mv -fT ") for part in parts)
+
+    def test_every_hard_link_is_sudo_prefixed_under_use_sudo(
+        self, tmp_path: Path
+    ):
+        sm = SnapshotManager({"use_sudo": True})
+        cmd = self._preserve(sm, tmp_path, [])
+        parts = cmd.split(" && ")
+        assert len(parts) == 2
+        assert all(part.startswith("sudo ln -T -- ") for part in parts)
+
+    def test_a_skipped_link_is_not_sudo_prefixed(self, tmp_path: Path):
+        sm = SnapshotManager({"use_sudo": True, "sudo_skip_commands": ["ln"]})
+        cmd = self._preserve(sm, tmp_path, [])
+        assert all(part.startswith("ln -T -- ")
+                   for part in cmd.split(" && "))
 
     def test_a_skipped_rename_is_not_sudo_prefixed_either(self, tmp_path: Path):
         sm = SnapshotManager({"use_sudo": True, "sudo_skip_commands": ["mv"]})
@@ -4613,11 +4647,27 @@ def _restore(sm: SnapshotManager, virsh: _RevertingLibvirt, name: str,
             virsh.VM, name, paths_in_use=lambda: virsh.in_use(others))
 
 
+def _waiting(virsh: _RevertingLibvirt) -> list[str]:
+    """The overlays recorded for later removal of *virsh*'s domain."""
+    return sorted(layer for chain in PendingOverlays().chains(virsh.VM)
+                  for layer in chain.layers)
+
+
+def _drain(sm: SnapshotManager, virsh: _RevertingLibvirt, others=()) -> None:
+    """The removal a take or a teardown runs of what restores left for
+    later (``remove_pending_iso_overlays``), *others* another domain's."""
+    execute, shell = _restoring(sm, virsh)
+    with execute, shell:
+        sm.remove_pending_iso_overlays(
+            virsh.VM, paths_in_use=lambda: virsh.in_use(others))
+
+
 class TestARestorePutsTheCdromBackOnItsIso:
     """#273: reverting an external snapshot, libvirt builds a qcow2 overlay
     of the CDROM's ISO beside the ISO, although the snapshot left the CDROM
     out, and moves the CDROM onto it. After the restore the CDROM reads its
-    ISO again and nothing is left beside the ISO."""
+    ISO again, no snapshot names the overlay, and the overlay is recorded
+    for removal; once that runs nothing is left beside the ISO."""
 
     @pytest.fixture
     def vm(self, tmp_path: Path) -> _RevertingLibvirt:
@@ -4638,10 +4688,20 @@ class TestARestorePutsTheCdromBackOnItsIso:
 
     def test_nothing_is_left_beside_the_iso_after_restores_in_a_row(
             self, sm, vm):
+        made = []
         for name in ("s1", "s2", "s2", "s1"):
             assert _restore(sm, vm, name) is True
-            assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
+            made.append(f"{os.path.splitext(vm.iso)[0]}.{vm.epoch}")
             assert vm.live["sda"] == vm.config["sda"] == vm.iso
+            # each one left beside the ISO is on record: none unknown
+            assert _waiting(vm) == sorted(made)
+            assert vm.files_beside_the_iso() == sorted(
+                ["nixos-minimal.iso", *map(os.path.basename, made)])
+
+        _drain(sm, vm)
+
+        assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
+        assert _waiting(vm) == []
         assert Path(vm.iso).read_bytes() == b"the ISO"
 
     def test_no_snapshot_names_the_overlay_it_made(self, sm, vm):
@@ -4786,13 +4846,14 @@ class TestARestorePutsTheCdromBackOnItsIso:
             vm._revert("s2")          # sda on <iso>.<e1>, as before #273
         under = vm.live["sda"]
         vm.take("s3")                 # saves sda on <iso>.<e1>
+        assert _restore(sm, vm, "s3") is True
+        top = f"{os.path.splitext(vm.iso)[0]}.{vm.epoch}"
         removed = []
         real_remove = sm._remove_file
         with patch.object(sm, "_remove_file",
                           side_effect=lambda p: removed.append(p)
                           or real_remove(p)):
-            assert _restore(sm, vm, "s3") is True
-        top = f"{os.path.splitext(vm.iso)[0]}.{vm.epoch}"
+            _drain(sm, vm)
 
         assert vm.live["sda"] == vm.config["sda"] == vm.iso
         assert removed.index(top) < removed.index(under)
@@ -4800,6 +4861,7 @@ class TestARestorePutsTheCdromBackOnItsIso:
         # no revert to s3 opens the overlay any more
         assert vm.snapshots["s3"]["domain"]["sda"] == vm.iso
         assert _restore(sm, vm, "s3") is True
+        _drain(sm, vm)
         assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
 
     def test_one_another_domain_uses_is_kept_with_what_is_under_it(
@@ -4811,33 +4873,44 @@ class TestARestorePutsTheCdromBackOnItsIso:
         vm.take("s3")
         top = f"{os.path.splitext(vm.iso)[0]}.{vm.epoch + 1}"
 
-        assert _restore(sm, vm, "s3", others=[top]) is True
+        assert _restore(sm, vm, "s3") is True
+        _drain(sm, vm, others=[top])
 
         assert vm.live["sda"] == vm.iso
         assert os.path.exists(top) and os.path.exists(under)
+        # kept on record, and removed once nothing uses it
+        assert _waiting(vm) == sorted([top, under])
+        _drain(sm, vm)
+        assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
+        assert _waiting(vm) == []
 
-    def test_a_cdrom_overlay_is_not_backed_up_beside_the_iso(self, sm, vm):
-        """A restore before #273 left the CDROM on an overlay that the
-        current snapshot records: the backup copied it beside the ISO, and
-        the put-back brought it back for good."""
+    def test_a_cdrom_overlay_at_risk_is_backed_up_by_a_hard_link(
+            self, sm, vm):
+        """A restore before #273 -- or a revert by hand -- left the CDROM on
+        an overlay that the current snapshot records, so the revert deletes
+        it. Backed up like any other overlay at risk, it is a hard link
+        beside the ISO, which writes no data: telling whether it could be
+        lost unbacked took a scan of every domain, before the revert. It is
+        put back, and recorded for removal with the one the revert made."""
         execute, shell = _restoring(sm, vm)
         with execute, shell:
             vm._revert("s2")
         old = vm.live["sda"]
-        commands = []
-        real = vm.qemu_img
+        scans = []
 
-        def recording(command, *a, **kw):
-            commands.append(command)
-            return real(command, *a, **kw)
-        with patch.object(VirshCommand, "execute", side_effect=vm), \
-             patch.object(LibVirtCommandBase, "execute_shell",
-                          side_effect=recording):
-            assert sm.snapshot_restore(vm.VM, "s2",
-                                       paths_in_use=vm.in_use) is True
+        def scan():
+            scans.append(1)
+            return vm.in_use()
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            assert sm.snapshot_restore(vm.VM, "s2", paths_in_use=scan) is True
 
-        assert not any(str(vm.isodir) in c for c in commands
-                       if c.startswith(("cp ", "sudo cp", "mv ", "sudo mv")))
+        assert scans == []
+        beside = [c for c in vm.shell if str(vm.isodir) in c]
+        assert any(c.startswith("ln -T -- ") for c in beside)
+        assert not any(c.startswith(("cp ", "sudo cp")) for c in beside)
+        assert old in _waiting(vm)
+        _drain(sm, vm)
         assert not os.path.exists(old)
         assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
 
@@ -4867,6 +4940,7 @@ class TestARestorePutsTheCdromBackOnItsIso:
         with execute, shell:
             assert sm.validate_snapshot(vm.VM, "s2") == (True, [])
         assert vm.snapshots["s2"]["disks"]["sda"] is None
+        _drain(sm, vm)
         assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
 
     def test_a_restore_after_one_made_before_this_fix_leaves_every_snapshot_valid(
@@ -4887,9 +4961,12 @@ class TestARestorePutsTheCdromBackOnItsIso:
         execute, shell = _restoring(sm, vm)
         with execute, shell:
             assert sm.validate_snapshot(vm.VM, "s2") == (True, [])
+        assert stale in _waiting(vm)
+        _drain(sm, vm)
         assert not os.path.exists(stale)
         assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
         assert _restore(sm, vm, "s2") is True
+        _drain(sm, vm)
         assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
 
     def test_a_file_beside_the_iso_libvirt_did_not_name_is_left_alone(
@@ -4926,10 +5003,13 @@ class TestARestorePutsTheCdromBackOnItsIso:
         vm.fail_redefine = "error: invalid argument"
 
         assert _restore(sm, vm, "s2") is True
+        _drain(sm, vm)
 
         overlay = vm.snapshots["s2"]["disks"]["sda"]
         assert vm.live["sda"] == vm.iso
         assert os.path.exists(overlay)
+        # kept while a snapshot names it, and on record
+        assert overlay in _waiting(vm)
 
     def test_without_a_usage_check_nothing_is_touched(self, sm, vm):
         execute, shell = _restoring(sm, vm)
@@ -5142,7 +5222,8 @@ class TestARestoreKeepsWhatTheCurrentSnapshotRecords:
         assert Path(base).read_bytes() == held
         self._restores(sm, vm, "s2", "s1", "s2")
         assert not any(str(vm.isodir) in c for c in vm.shell
-                       if c.startswith(("cp ", "mv ")))
+                       if c.startswith(("cp ", "mv ", "ln ")))
+        _drain(sm, vm)
         assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
         assert Path(vm.iso).read_bytes() == b"the ISO"
         assert not list(tmp_path.rglob("*.preserve*"))
@@ -5303,7 +5384,8 @@ class TestARestoreKeepsWhatTheCurrentSnapshotRecords:
             self._restores(sm, vm, "s2")
 
         assert os.path.exists(ran_on)
-        copies = " ".join(c for c in vm.shell if c.startswith("cp "))
+        # backed up by a hard link, as every overlay at risk is
+        copies = " ".join(c for c in vm.shell if c.startswith(("cp ", "ln ")))
         assert f"{ran_on} " in copies and f"{taken} " not in copies
         assert ran_on in " ".join(str(c.args[0])
                                   for c in warning.call_args_list)
@@ -7206,3 +7288,460 @@ class TestOverlaysInADiskSnapshotDir:
 
         assert str(used) not in "\n".join(removed)
         assert used.read_bytes() == b"another domain's disk"
+
+
+# ---------------------------------------------------------------------------
+# a restore leaves the overlays of a CDROM's ISO for later removal
+# ---------------------------------------------------------------------------
+
+def _scan_counting(virsh: _RevertingLibvirt, scans: list, others=()):
+    """``disk_paths_in_use`` of *virsh*, each time it is asked counted in
+    *scans*."""
+    def scan():
+        scans.append(1)
+        return virsh.in_use(others)
+    return scan
+
+
+def _take(sm: SnapshotManager, virsh: _RevertingLibvirt, name: str,
+          paths_in_use) -> bool:
+    execute, shell = _restoring(sm, virsh)
+    with execute, shell:
+        return sm.create_snapshot(virsh.VM, str(virsh.workdir), name, name,
+                                  paths_in_use=paths_in_use)
+
+
+class TestARestoreLeavesTheIsoOverlayForLater:
+    """Whether nothing else uses the overlay a revert made of a CDROM's ISO
+    took a scan of every domain on the host: 8.8 s of a 12 s restore with
+    73 domains defined. The restore puts the CDROM back on its ISO and
+    rewrites every record of the overlay at once, records it for removal
+    before the CDROM moves off it, and leaves the removal -- the scan
+    included, and every check it made -- to the VM's next take or its
+    teardown, one scan for all of them."""
+
+    @pytest.fixture
+    def vm(self, tmp_path: Path) -> _RevertingLibvirt:
+        virsh = _RevertingLibvirt(tmp_path)
+        virsh.take("s1")
+        return virsh
+
+    def made(self, vm) -> str:
+        return f"{os.path.splitext(vm.iso)[0]}.{vm.epoch}"
+
+    def test_a_restore_asks_no_scan_of_every_domain(self, sm, vm):
+        scans: list = []
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            assert sm.snapshot_restore(
+                vm.VM, "s1", paths_in_use=_scan_counting(vm, scans)) is True
+
+        assert scans == []
+        assert vm.live["sda"] == vm.config["sda"] == vm.iso
+        assert vm.snapshots["s1"]["disks"]["sda"] is None
+        assert os.path.exists(self.made(vm))
+        assert _waiting(vm) == [self.made(vm)]
+
+    def test_the_overlay_is_on_record_before_the_cdrom_moves_off_it(
+            self, sm, vm):
+        """Moved off and then not recorded -- a restore killed in between
+        -- nothing would name it again, nor remove it."""
+        on_record = []
+        update = vm._update
+
+        def recording(disk, flags):
+            on_record.append(_waiting(vm))
+            return update(disk, flags)
+        vm._update = recording
+
+        assert _restore(sm, vm, "s1") is True
+
+        assert on_record[0] == [self.made(vm)]
+
+    def test_the_next_take_removes_what_restores_left_with_one_scan(
+            self, sm, vm):
+        made = []
+        for _ in range(3):
+            assert _restore(sm, vm, "s1") is True
+            made.append(self.made(vm))
+        assert _waiting(vm) == sorted(made)
+        scans: list = []
+
+        assert _take(sm, vm, "s2", _scan_counting(vm, scans)) is True
+
+        assert scans == [1]
+        assert _waiting(vm) == []
+        assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
+        assert Path(vm.iso).read_bytes() == b"the ISO"
+
+    def test_a_take_keeps_one_another_domain_uses_and_its_record(
+            self, sm, vm):
+        assert _restore(sm, vm, "s1") is True
+        overlay = self.made(vm)
+
+        with patch.object(sm.logger, "warning") as warning:
+            assert _take(sm, vm, "s2", _scan_counting(
+                vm, [], others=[overlay])) is True
+
+        assert os.path.exists(overlay) and _waiting(vm) == [overlay]
+        assert any(overlay in str(c.args[0]) and "domain other01 uses it"
+                   in str(c.args[0]) for c in warning.call_args_list)
+        _drain(sm, vm)
+        assert not os.path.exists(overlay) and _waiting(vm) == []
+
+    def test_a_file_that_has_taken_its_name_since_is_not_removed(
+            self, sm, vm):
+        assert _restore(sm, vm, "s1") is True
+        overlay = self.made(vm)
+        newcomer = Path(f"{overlay}.new")
+        newcomer.write_bytes(b"another file")
+        os.replace(newcomer, overlay)
+
+        _drain(sm, vm)
+
+        assert Path(overlay).read_bytes() == b"another file"
+        # not the restore's: no longer on record either
+        assert _waiting(vm) == []
+
+    def test_a_teardown_removes_them_once_the_domain_is_gone(self, sm, vm):
+        """Its snapshots went with the domain: none names anything, though
+        none can be read."""
+        assert _restore(sm, vm, "s1") is True
+        overlay = self.made(vm)
+        gone = _result(ok=False, stderr="error: failed to get domain 'vm01'")
+
+        with patch.object(VirshCommand, "execute", return_value=gone), \
+             patch.object(LibVirtCommandBase, "execute_shell",
+                          side_effect=vm.qemu_img):
+            sm.remove_pending_iso_overlays(vm.VM, vm.in_use, gone=True)
+
+        assert not os.path.exists(overlay) and _waiting(vm) == []
+
+    def test_with_its_snapshots_unreadable_nothing_is_removed(self, sm, vm):
+        assert _restore(sm, vm, "s1") is True
+        overlay = self.made(vm)
+        unreadable = _result(ok=False, stderr="error: cannot list")
+
+        with patch.object(VirshCommand, "execute", return_value=unreadable), \
+             patch.object(LibVirtCommandBase, "execute_shell",
+                          side_effect=vm.qemu_img):
+            sm.remove_pending_iso_overlays(vm.VM, vm.in_use)
+
+        assert os.path.exists(overlay) and _waiting(vm) == [overlay]
+
+    def test_a_record_that_cannot_be_read_is_named_and_kept(self, sm, vm):
+        ledger = PendingOverlays()
+        os.makedirs(ledger.directory)
+        record = Path(ledger.directory) / "0123.json"
+        record.write_text("{not json")
+
+        with patch.object(sm.logger, "warning") as warning:
+            _drain(sm, vm)
+
+        assert record.exists()
+        assert any(str(record) in str(c.args[0]) and "cannot be read"
+                   in str(c.args[0]) for c in warning.call_args_list)
+
+    def test_one_that_cannot_be_recorded_is_removed_at_once(self, sm, vm):
+        scans: list = []
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, \
+             patch.object(PendingOverlays, "record",
+                          side_effect=OSError(28, "No space left on device")):
+            assert sm.snapshot_restore(
+                vm.VM, "s1", paths_in_use=_scan_counting(vm, scans)) is True
+
+        assert scans == [1]
+        assert vm.files_beside_the_iso() == ["nixos-minimal.iso"]
+
+    def test_a_failed_revert_leaves_no_record_of_what_the_cdrom_is_on(
+            self, sm, vm):
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            vm._revert("s1")          # sda on an overlay, as before #273
+        on_it = vm.live["sda"]
+        vm._revert = lambda _name: _result(ok=False, stderr="error: boom")
+
+        assert _restore(sm, vm, "s1") is False
+
+        assert vm.live["sda"] == on_it and _waiting(vm) == []
+
+    def test_restores_that_leave_more_than_one_say_how_many_wait(
+            self, sm, vm):
+        assert _restore(sm, vm, "s1") is True
+        with patch.object(sm.logger, "status") as status:
+            assert _restore(sm, vm, "s1") is True
+
+        assert len(status.call_args_list) == 1
+        line = str(status.call_args.args[0])
+        assert "2 overlays" in line and "snapshot take" in line
+        assert "snapshot prune --dry-run" in line
+
+
+# ---------------------------------------------------------------------------
+# the backup of an overlay a revert can delete is a hard link of it
+# ---------------------------------------------------------------------------
+
+def _identity(path) -> tuple[int, int]:
+    st = os.lstat(path)
+    return (st.st_dev, st.st_ino)
+
+
+class TestBackupsAreHardLinks:
+    """A copy writes everything the guest wrote since the last restore,
+    the guest paused: ~1.2 s per GiB on ext4, which has no reflinks. A hard
+    link writes nothing, and keeps the overlay as it was: nothing writes
+    into an overlay once it is backed up -- the guest stays paused up to the
+    revert, which unlinks what it discards (libvirt 10.10), and the put-back
+    renames the backup over the original's name. Where no link can be made
+    the backup is a copy, as before."""
+
+    def _overlays(self, tmp_path: Path) -> dict:
+        overlays = {}
+        for name in ("s1", "s2"):
+            f = tmp_path / f"{name}.qcow2"
+            f.write_bytes(f"{name}'s overlay".encode())
+            overlays[name] = [str(f)]
+        return overlays
+
+    def test_each_backup_is_a_hard_link_of_its_overlay(self, sm, tmp_path):
+        overlays = self._overlays(tmp_path)
+        calls: list[str] = []
+        with _inventory(sm, overlays, ["s1", "s2"]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies(calls)):
+            preserved = sm._preserve_snapshot_overlays("vm01", "s1")
+
+        # one command, one sudo prompt at most, and no data written
+        assert len(calls) == 1
+        assert calls[0].count("ln -T -- ") == 2 and "cp " not in calls[0]
+        assert sorted(o for o, _b in preserved) == sorted(
+            path for paths in overlays.values() for path in paths)
+        for original, backup in preserved:
+            assert _identity(backup) == _identity(original)
+            assert preserved[0].linked is not None
+        assert not list(tmp_path.glob("*.copy"))
+
+    def test_the_revert_unlinking_the_overlay_leaves_it_whole(
+            self, sm, tmp_path):
+        """Restoring the latest snapshot deletes its overlay -- the disk
+        the guest wrote to since -- and puts it back: the very file, with
+        what was written."""
+        vm = _RevertingLibvirt(tmp_path, data_disk=True)
+        vm.take("s1")
+        live = vm.live["vdb"]
+        Path(live).write_bytes(b"written since s1")
+        before = _identity(live)
+
+        assert _restore(sm, vm, "s1") is True
+
+        assert _identity(live) == before
+        assert Path(live).read_bytes() == b"written since s1"
+        assert os.stat(live).st_nlink == 1
+        assert not list(tmp_path.rglob("*.preserve*"))
+
+    def test_where_no_link_can_be_made_the_backup_is_a_copy(
+            self, sm, tmp_path):
+        overlays = self._overlays(tmp_path)
+        calls: list[str] = []
+        copying = _shell_that_copies(calls)
+
+        def cross_device(cmd, *a, **kw):
+            if cmd.startswith("ln "):
+                calls.append(cmd)
+                return _result(ok=False, stderr=(
+                    "ln: failed to create hard link: Invalid cross-device "
+                    "link"))
+            return copying(cmd, *a, **kw)
+        with _inventory(sm, overlays, ["s1", "s2"]), \
+             patch.object(sm.virsh, "execute_shell", side_effect=cross_device):
+            preserved = sm._preserve_snapshot_overlays("vm01", "s1")
+
+        assert calls[0].startswith("ln ") and calls[1].startswith("cp ")
+        for pair in preserved:
+            original, backup = pair
+            assert pair.linked is None
+            assert _identity(backup) != _identity(original)
+            assert Path(backup).read_bytes() == Path(original).read_bytes()
+
+    def test_links_made_before_one_failed_go_before_the_copy(
+            self, sm, tmp_path):
+        overlays = self._overlays(tmp_path)
+        calls: list[str] = []
+        copying = _shell_that_copies(calls)
+
+        def first_link_only(cmd, *a, **kw):
+            if cmd.startswith("ln "):
+                calls.append(cmd)
+                subprocess.run(cmd.split(" && ")[0], shell=True, check=True)
+                return _result(ok=False, stderr="ln: Operation not permitted")
+            return copying(cmd, *a, **kw)
+        with _inventory(sm, overlays, ["s1", "s2"]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=first_link_only):
+            preserved = sm._preserve_snapshot_overlays("vm01", "s1")
+
+        reap = calls[1]
+        assert reap.startswith("rm -f ") and reap.count(".preserve") == 1
+        assert calls[2].startswith("cp ")
+        for original, backup in preserved:
+            assert _identity(backup) != _identity(original)
+
+    def test_a_backup_path_taken_meanwhile_is_not_written_through(
+            self, sm, tmp_path):
+        """``ln`` makes the link only where nothing is: the file there is
+        left as it was, and the copy, which has to reserve the path, then
+        refuses."""
+        overlay = tmp_path / "o.qcow2"
+        overlay.write_bytes(b"overlay")
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"somebody else's overlay")
+
+        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
+             patch.object(sm, "_claim_backup_paths"), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies()):
+            with pytest.raises(SnapshotError, match="could not reserve"):
+                sm._preserve_snapshot_overlays("vm01", "s1")
+
+        assert backup.read_bytes() == b"somebody else's overlay"
+        assert overlay.read_bytes() == b"overlay"
+
+    def test_a_link_is_written_only_while_it_is_the_original(
+            self, sm, tmp_path):
+        original = tmp_path / "o.qcow2"
+        original.write_bytes(b"overlay")
+        link = tmp_path / "o.qcow2.preserve"
+        os.link(original, link)
+        copy = tmp_path / "p.qcow2.preserve"
+        shutil.copy2(original, copy)
+
+        assert sm._backup_was_written(str(link), None,
+                                      linked=_identity(original))
+        assert not sm._backup_was_written(str(copy), None,
+                                          linked=_identity(original))
+        assert not sm._backup_was_written(str(tmp_path / "gone"), None,
+                                          linked=_identity(original))
+
+    def test_a_spare_link_is_dropped_and_the_overlay_kept(self, sm, tmp_path):
+        original = tmp_path / "o.qcow2"
+        original.write_bytes(b"overlay")
+        backup = tmp_path / "o.qcow2.preserve"
+        os.link(original, backup)
+        pair = _Backup(str(original), str(backup), _identity(original))
+
+        with patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies()):
+            assert sm._restore_preserved_overlays([pair]) == []
+
+        assert not backup.exists()
+        assert original.read_bytes() == b"overlay"
+        assert os.stat(original).st_nlink == 1
+
+    def test_a_link_put_back_is_the_overlay_itself(self, sm, tmp_path):
+        original = tmp_path / "o.qcow2"
+        original.write_bytes(b"overlay")
+        backup = tmp_path / "o.qcow2.preserve"
+        os.link(original, backup)
+        identity = _identity(original)
+        original.unlink()             # the revert
+
+        with patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies()):
+            assert sm._restore_preserved_overlays(
+                [_Backup(str(original), str(backup), identity)]) == []
+
+        assert _identity(original) == identity and not backup.exists()
+
+    def test_a_link_whose_overlay_name_another_file_took_is_kept(
+            self, sm, tmp_path):
+        """No proof the backed-up file is safe: its backup stays, named."""
+        original = tmp_path / "o.qcow2"
+        original.write_bytes(b"overlay")
+        backup = tmp_path / "o.qcow2.preserve"
+        os.link(original, backup)
+        identity = _identity(original)
+        newcomer = tmp_path / "newcomer"
+        newcomer.write_bytes(b"another file")
+        os.replace(newcomer, original)
+
+        with patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies()), \
+             patch.object(sm.logger, "error") as error:
+            sm._restore_preserved_overlays(
+                [_Backup(str(original), str(backup), identity)])
+
+        assert backup.read_bytes() == b"overlay"
+        assert any(str(backup) in str(c.args[0])
+                   for c in error.call_args_list)
+
+
+# ---------------------------------------------------------------------------
+# the guest's clock is set as soon as the CDROMs are back on their ISOs
+# ---------------------------------------------------------------------------
+
+class TestTheClockIsSetRightAfterTheCdromsGoBack:
+    """The media change pauses the guest, and a paused guest's clock stops:
+    the clock is set after it, and before anything slow -- of which nothing
+    is left in a restore."""
+
+    @pytest.fixture
+    def vm(self, tmp_path: Path) -> _RevertingLibvirt:
+        virsh = _RevertingLibvirt(tmp_path)
+        virsh.take("s1")
+        virsh.take("s2")
+        return virsh
+
+    def test_after_the_media_change_and_the_records_and_last(self, sm, vm):
+        seen: dict = {}
+
+        def clock():
+            seen.update(calls=len(vm.calls), sda=(vm.live["sda"],
+                                                  vm.config["sda"]),
+                        paused=vm.paused, redefined=len(vm.redefined),
+                        waiting=_waiting(vm))
+        scans: list = []
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            assert sm.snapshot_restore(
+                vm.VM, "s1", paths_in_use=_scan_counting(vm, scans),
+                after_media=clock) is True
+
+        assert seen["sda"] == (vm.iso, vm.iso) and seen["paused"] is False
+        assert seen["redefined"] == len(vm.redefined) >= 1
+        assert seen["waiting"] == _waiting(vm) != []
+        # nothing asked of libvirt after it, and no scan before it
+        assert seen["calls"] == len(vm.calls)
+        assert scans == []
+
+    def test_a_revert_that_failed_calls_nothing_after_it(self, sm, vm):
+        clock = MagicMock()
+        vm._revert = lambda _name: _result(ok=False, stderr="error: boom")
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            assert sm.snapshot_restore(vm.VM, "s1", paths_in_use=vm.in_use,
+                                       after_media=clock) is False
+        clock.assert_not_called()
+
+    def test_one_that_raises_does_not_fail_the_restore(self, sm, vm):
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, patch.object(sm.logger, "warning") as warning:
+            assert sm.snapshot_restore(
+                vm.VM, "s1", paths_in_use=vm.in_use,
+                after_media=MagicMock(side_effect=RuntimeError("no agent")))
+        assert "no agent" in " ".join(str(c.args[0])
+                                      for c in warning.call_args_list)
+
+    def test_the_session_hands_the_restore_its_clock(self, tmp_path):
+        session = LibVirtSession.__new__(LibVirtSession)
+        session.provider_config = {}
+        session.logger = MagicMock()
+        with patch.object(SnapshotManager, "snapshot_restore",
+                          return_value=True) as restore, \
+             patch.object(LibVirtSession, "_set_clock_after_revert") as clock:
+            assert session.snapshot_restore("vm01", "s1") is True
+            after_media = restore.call_args.kwargs["after_media"]
+            clock.assert_not_called()
+            after_media()
+        clock.assert_called_once()
+

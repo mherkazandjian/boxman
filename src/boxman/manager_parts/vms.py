@@ -875,12 +875,23 @@ class VMsMixin:
                 f"undefined; leaving its disks in place rather than removing "
                 f"storage under a possibly-live guest")
 
+        # what every domain uses, asked once -- by the storage removal, and
+        # by the removal of the overlays of its CDROM images its restores
+        # left for later -- after the domain is gone: no domain starts using
+        # either in between
+        scans: list = []
+
+        def paths_in_use():
+            if not scans:
+                scans.append(session.disk_paths_in_use())
+            return scans[0]
+
         # remove_vm_storage() raises on a filesystem error, which reaches
         # _run_parallel's failure handling. Other domains' overlays are
         # asked about only where one can be removed: in a disk_snapshot_dir
         overlay_dirs = self._cluster_disk_snapshot_dirs()
         outcome = remove_vm_storage(
-            inventory, self._cluster_workdirs(), session.disk_paths_in_use,
+            inventory, self._cluster_workdirs(), paths_in_use,
             memory_dirs=self._cluster_memory_snapshot_dirs(),
             recorded_in_use=lambda: session.snapshot_files_in_use(
                 overlays_too=bool(overlay_dirs)),
@@ -888,6 +899,18 @@ class VMsMixin:
         for path, reason in outcome.kept:
             self.logger.warning(
                 f"{full_vm_name}: left {path} in place because {reason}")
+        # the overlays libvirt made of its CDROM images that its restores
+        # left beside them for later: its snapshots went with the domain.
+        # Housekeeping -- what it keeps it names, and keeps on record
+        remove_pending = getattr(session, 'remove_pending_iso_overlays', None)
+        if remove_pending is not None:
+            try:
+                remove_pending(full_vm_name, paths_in_use, gone=True)
+            except Exception as exc:
+                self.logger.warning(
+                    f"{full_vm_name}: the overlays of its CDROM images left "
+                    f"for later removal could not be removed "
+                    f"({type(exc).__name__}: {exc})")
         self._name_memory_images_left(full_vm_name, inventory, outcome)
         # The saved inventory and its locator stay while the inventory still
         # protects a kept file, so a retry keeps it too; with nothing kept

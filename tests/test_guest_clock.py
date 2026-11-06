@@ -575,6 +575,17 @@ def _session(provider: dict | None = None, clusters: dict | None = None
     return session
 
 
+def _reverting(restored=True):
+    """``SnapshotManager.snapshot_restore`` answering *restored*: a revert
+    that worked calls what follows the CDROMs' put-back, the clock."""
+    def revert(_self, _vm, _snapshot, paths_in_use=None, after_media=None):
+        if restored and after_media is not None:
+            after_media()
+        return restored
+    return patch.object(SnapshotManager, "snapshot_restore", autospec=True,
+                        side_effect=revert)
+
+
 def _restore(guest, restored=True, snapshot="s1", session=None):
     """``LibVirtSession.snapshot_restore`` against *guest*, the revert
     itself (``SnapshotManager.snapshot_restore``) answering *restored*."""
@@ -583,8 +594,7 @@ def _restore(guest, restored=True, snapshot="s1", session=None):
                return_value=guest), \
          patch("boxman.providers.libvirt.snapshot.VirshCommand",
                return_value=guest), \
-         patch.object(SnapshotManager, "snapshot_restore",
-                      return_value=restored):
+         _reverting(restored):
         ok = session.snapshot_restore(VM, snapshot)
     return session, ok
 
@@ -692,8 +702,7 @@ class TestAfterASnapshotRestore:
     def test_trouble_reading_the_snapshot_never_fails_the_restore(
             self, clock):
         session = _session()
-        with patch.object(SnapshotManager, "snapshot_restore",
-                          return_value=True), \
+        with _reverting(), \
              patch.object(SnapshotManager, "state_and_creation_time",
                           side_effect=RuntimeError("virsh vanished")):
             assert session.snapshot_restore(VM, "s1") is True

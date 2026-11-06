@@ -2780,11 +2780,24 @@ class LibVirtSession(SessionConfigMixin):
             self.logger.info(f"restoring latest snapshot '{snapshot_name}' for vm {vm_name}")
         else:
             self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
-        restored = snapshot_mgr.snapshot_restore(
-            vm_name, snapshot_name, paths_in_use=self.disk_paths_in_use)
-        if restored:
-            self._set_clock_after_revert(snapshot_mgr, vm_name, snapshot_name)
-        return restored
+        # the clock is set as soon as the CDROMs are back on their ISOs,
+        # the last step that pauses the guest
+        return snapshot_mgr.snapshot_restore(
+            vm_name, snapshot_name, paths_in_use=self.disk_paths_in_use,
+            after_media=lambda: self._set_clock_after_revert(
+                snapshot_mgr, vm_name, snapshot_name))
+
+    def remove_pending_iso_overlays(self, vm_name: str, paths_in_use=None,
+                                    gone: bool = False) -> None:
+        """
+        Remove the overlays of its CDROM images that restores of *vm_name*
+        left for later, once nothing uses them
+        (:meth:`SnapshotManager.remove_pending_iso_overlays`); with *gone*,
+        its domain is confirmed undefined. *paths_in_use* defaults to
+        :meth:`disk_paths_in_use`.
+        """
+        SnapshotManager(self.provider_config).remove_pending_iso_overlays(
+            vm_name, paths_in_use or self.disk_paths_in_use, gone=gone)
 
     def _set_clock_after_revert(self, snapshot_mgr: SnapshotManager,
                                 vm_name: str, snapshot_name: str) -> None:

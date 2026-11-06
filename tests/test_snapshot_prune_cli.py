@@ -19,6 +19,7 @@ import pytest
 
 from boxman.exceptions import ConfigError, SnapshotError
 from boxman.manager import BoxmanManager
+from boxman.providers.libvirt.pending_overlays import PendingOverlays
 from boxman.providers.libvirt.snapshot_prune import (
     Held,
     References,
@@ -240,6 +241,49 @@ class TestTheTable:
         assert "removing it frees only those it does not share" in out
         assert (f"note: both {raw} and {raw}.zst are there; `boxman storage "
                 f"compress-snapshots` keeps one of them") in out
+
+
+class TestTheOverlaysOfCdromImagesLeftForLater:
+    """A restore leaves the overlay libvirt's revert made of a CD-ROM's ISO
+    beside the ISO, recorded for removal by the VM's next take or its
+    destroy (#273). The ISO's directory is no snapshot directory, so they
+    are not in the table: a note names each, and what keeps it now."""
+
+    @staticmethod
+    def _left(project, vm=VM):
+        isodir = project.tmp / "image-cache"
+        isodir.mkdir(exist_ok=True)
+        iso = project.file("nixos.iso", b"the ISO", where=isodir)
+        overlay = project.file(f"nixos.{len(vm)}", b"QFI\xfb", where=isodir)
+        PendingOverlays().record(vm, [([overlay], iso)])
+        return iso, overlay
+
+    def test_each_is_named_with_what_removes_it(self, project, capsys):
+        iso, overlay = self._left(project)
+
+        project.prune()
+
+        out = capsys.readouterr().out
+        assert (f"note: {overlay} waits for removal: an overlay libvirt made "
+                f"of {iso} for a CD-ROM of {VM}; its next `boxman snapshot "
+                f"take`, or its destroy, removes it once nothing uses it\n"
+                ) in out
+        assert overlay not in _rows(out)
+
+    def test_what_keeps_one_now_is_said(self, project, capsys):
+        _iso, overlay = self._left(project)
+        project.session.held[overlay] = "other01"
+
+        project.prune()
+
+        assert "(domain other01 uses it)" in capsys.readouterr().out
+
+    def test_another_projects_are_not_listed(self, project, capsys):
+        _iso, overlay = self._left(project, vm="bprj__else__bprj_c1_vm01")
+
+        project.prune()
+
+        assert overlay not in capsys.readouterr().out
 
 
 class TestTheLockProbe:
