@@ -17,6 +17,7 @@ from boxman.exceptions import (
     ImageImportError,
     ProvisionError,
 )
+from boxman.utils.shell import interrupt_on_sigterm, stop_workers
 
 from ..session_base import SessionConfigMixin
 from . import net_reconcile, read_cache
@@ -2109,11 +2110,12 @@ class LibVirtSession(SessionConfigMixin):
 
         def _configure(i, disk_config):
             self.logger.info(f"configuring disk {i+1} for VM {vm_name}")
-            ok = disk_manager.configure_from_disk_config(
-                disk_config=disk_config,
-                workdir=workdir,
-                disk_prefix=disk_prefix
-            )
+            with interrupt_on_sigterm():
+                ok = disk_manager.configure_from_disk_config(
+                    disk_config=disk_config,
+                    workdir=workdir,
+                    disk_prefix=disk_prefix
+                )
             result_queue.put((i, ok))
             if ok:
                 self.logger.info(f"successfully configured disk {i+1} for vm {vm_name}")
@@ -2124,8 +2126,14 @@ class LibVirtSession(SessionConfigMixin):
             Process(target=_configure, args=(i, disk_config))
             for i, disk_config in enumerate(disks)
         ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        try:
+            [p.start() for p in processes]
+            [p.join() for p in processes]
+        except BaseException:
+            # a Ctrl-C: the workers stop too, their commands first, rather
+            # than configure disks on their own once boxman has gone (#294)
+            stop_workers(processes)
+            raise
 
         success = True
         for _ in range(len(disks)):

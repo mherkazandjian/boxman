@@ -1,5 +1,6 @@
 import os
 import signal
+import sys
 from multiprocessing import Process, Queue
 from typing import Any, Optional
 
@@ -27,13 +28,15 @@ from boxman.providers import merge_provider_configs, primary_provider_type
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.runtime import RuntimeBase, create_runtime
 from boxman.utils.jinja_env import create_jinja_env
+from boxman.utils.shell import interrupt_on_sigterm, stop_workers
 
 #: Seconds to wait for a finished child's queue message before declaring its
 #: result missing (the child has already joined, so any wait here is just
 #: feeder-thread flush latency — or a child that died before queue.put).
 _PARALLEL_RESULT_TIMEOUT = 5
 _PARALLEL_POLL_INTERVAL = 0.2
-# how long an abandoned worker gets to exit after SIGTERM before SIGKILL
+# how long an abandoned worker gets to exit after SIGTERM before SIGKILL,
+# beyond the time the stop of the command it runs may take
 _PARALLEL_STOP_TIMEOUT = 5
 # _abandon_parallel could not change SIGINT (not on the main thread)
 _NOT_IGNORED = object()
@@ -47,19 +50,29 @@ def _parallel_worker(result_queue, label, target, args):
     raises — so the parent can never mistake a crashed worker for a
     success (or block forever waiting for a message that never comes).
 
+    *target* runs with :func:`~boxman.utils.shell.interrupt_on_sigterm`:
+    the SIGTERM the parent stops it with, when interrupted itself, stops the
+    command it is running as a Ctrl-C does, rather than end the worker
+    there and then and leave the command running on alone (#294). Python
+    handlers, not ignored signals, so the commands it starts take SIGINT as
+    boxman does. Stopped, the worker has no result, and exits 130.
+
     Once *target* has returned, the parent owns cancellation: SIGINT is
     ignored while the result is written and flushed. A terminal's Ctrl-C
     reaches every process in its group, and one landing mid-write would
     leave half a message in the pipe, which the parent's drain would then
-    wait on forever. *target* itself runs with the default handler, so the
-    commands it starts still stop on Ctrl-C (an ignored signal would be
-    inherited by them).
+    wait on forever. A SIGTERM ends the worker there, with no command left
+    to stop.
     """
-    try:
-        outcome = (label, True, target(*args))
-    except Exception as exc:
-        outcome = (label, False, f"{type(exc).__name__}: {exc}")
+    with interrupt_on_sigterm():
+        try:
+            outcome = (label, True, target(*args))
+        except Exception as exc:
+            outcome = (label, False, f"{type(exc).__name__}: {exc}")
+        except KeyboardInterrupt:
+            sys.exit(128 + signal.SIGINT)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     result_queue.put(outcome)
 
 
@@ -599,16 +612,8 @@ class BoxmanManager(
         if alive:
             self.logger.warning(
                 f"{op_label}: stopping {len(alive)} worker(s) still running")
-        for proc in alive:
-            proc.terminate()
-        for proc in running.values():
-            try:
-                proc.join(timeout=_PARALLEL_STOP_TIMEOUT)
-            except BaseException:
-                pass
-            if proc.is_alive():
-                proc.kill()
-                proc.join()
+        # each stops the command it runs first, as on a Ctrl-C (#294)
+        stop_workers(running.values(), slack=_PARALLEL_STOP_TIMEOUT)
 
     def _vm_cluster_map(self) -> dict[str, str]:
         """

@@ -61,6 +61,16 @@ def _dying_update_worker(*_args):
     os._exit(1)
 
 
+def _command_worker(up, after):
+    """Run, in one command, a program that takes a second over a SIGINT and
+    a next step after it (see tests/test_utils_shell.py)."""
+    from tests.test_utils_shell import _TRAPS_SIGINT, _program
+
+    from boxman.utils import shell
+    shell.run(f"{_program(_TRAPS_SIGINT, up)} && touch {after}", hide=True)
+    return "ran"
+
+
 class TestRunParallel:
 
     def test_success_collects_results(self):
@@ -300,6 +310,86 @@ print("sigint handler restored", signal.getsignal(signal.SIGINT) is signal.defau
         assert "raised RuntimeError callback probe" in out
         assert "active 0" in out
         assert "sigint handler restored True" in out
+
+    @staticmethod
+    def _interrupted_once_up(up, whole_group=False):
+        """Scenario code that starts a thread to SIGINT the scenario's
+        Python alone, or its whole process group, once *up* exists."""
+        return f"""
+import os, signal, threading, time
+
+def interrupt():
+    deadline = time.monotonic() + 20
+    while not os.path.exists({str(up)!r}) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if {whole_group!r}:
+        os.killpg(os.getpgrp(), signal.SIGINT)
+    else:
+        os.kill(os.getpid(), signal.SIGINT)
+
+threading.Thread(target=interrupt, daemon=True).start()
+"""
+
+    @pytest.mark.parametrize("whole_group", [False, True],
+                             ids=["to-the-parent-alone", "to-the-whole-group"])
+    def test_a_ctrl_c_stops_the_command_a_worker_runs(self, whole_group, tmp_path):
+        """A SIGINT to the parent alone reached no worker: the parent's
+        SIGTERM ended the worker there and then, and the command it ran went
+        on alone, past boxman's exit (#294). The SIGTERM is a Ctrl-C to the
+        worker now, which stops its command first. A Ctrl-C at the terminal
+        reaches the worker too, which is stopping its command when the
+        parent's SIGTERM comes: taken for a second Ctrl-C, that would cut
+        the command's handler short."""
+        from tests.test_utils_shell import _running
+
+        up, after = tmp_path / "up", tmp_path / "after"
+        out = _run_scenario(self._interrupted_once_up(up, whole_group) + f"""
+import multiprocessing
+from tests.test_parallel_failures import _command_worker, _manager
+try:
+    _manager()._run_parallel([("vm01", _command_worker, ({str(up)!r}, {str(after)!r}))])
+except KeyboardInterrupt:
+    print("interrupted")
+print("active", len(multiprocessing.active_children()))
+""")
+        assert "interrupted" in out
+        assert "active 0" in out
+        assert (tmp_path / "up.sigints").read_text().splitlines() == ["SIGINT"]
+        assert (tmp_path / "up.sigint").exists()
+        assert not _running(up)
+        assert not after.exists()
+
+    def test_a_ctrl_c_stops_the_commands_the_disk_workers_run(self, tmp_path):
+        """``configure_vm_disks`` joins workers of its own: interrupted
+        there, it left them configuring disks on their own once boxman had
+        gone, and the interpreter's exit waited for them (#294)."""
+        from tests.test_utils_shell import _running
+
+        up, after = tmp_path / "up", tmp_path / "after"
+        out = _run_scenario(self._interrupted_once_up(up) + f"""
+import multiprocessing
+from unittest.mock import patch
+from boxman.providers.libvirt.session import LibVirtSession
+from tests.test_parallel_failures import _command_worker
+
+def configure(self, disk_config, workdir, disk_prefix):
+    return _command_worker({str(up)!r}, {str(after)!r}) == "ran"
+
+session = LibVirtSession(config={{"provider": {{"libvirt": {{"use_sudo": False}}}}}})
+with patch("boxman.providers.libvirt.session.DiskManager.configure_from_disk_config",
+           configure):
+    try:
+        session.configure_vm_disks(vm_name="vm01", disks=[{{"name": "disk01"}}],
+                                   workdir={str(tmp_path)!r}, disk_prefix="vm01")
+    except KeyboardInterrupt:
+        print("interrupted")
+print("active", len(multiprocessing.active_children()))
+""")
+        assert "interrupted" in out
+        assert "active 0" in out
+        assert (tmp_path / "up.sigint").exists()
+        assert not _running(up)
+        assert not after.exists()
 
 
 class TestRestoreRetryLoop:

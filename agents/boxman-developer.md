@@ -158,17 +158,28 @@ Either way, a subprocess goes through `boxman.utils.shell.run`, never
 the test runner's or CI's stdin, and `tests/test_utils_shell.py` fails on any
 `invoke.run(` outside `utils/shell.py`.
 
-The one exception is a command that must stop on a Ctrl-C: it goes through
-`boxman.utils.shell.run_stoppable` (today only the downloaders in
-`utils/http_download.py`). Plain `run` behaves as invoke does: it answers a
-Ctrl-C by writing `\x03` to the command's stdin and waiting on, so a command
-that does not read its stdin rides the interrupt out, and `run` raises no
-`KeyboardInterrupt` for it: the command's ending is reported as any other
-(its result, or `UnexpectedExit` under `warn=False` if it failed).
-`run_stoppable` `exec`s the command, so pass a
-single program and its arguments. On a Ctrl-C it sends the command SIGINT, and
-kills it after `STOP_TIMEOUT` (10 s) or at a further Ctrl-C. It raises
-`KeyboardInterrupt` only once the command has ended and been reaped.
+A Ctrl-C stops whatever command `run` is running, and `run` raises
+`KeyboardInterrupt` once the command has ended and been reaped, whatever
+`warn` says (#294); invoke itself would only write `\x03` to the command's
+stdin and wait on. With no terminal, the command runs in a session, and so a
+process group, of its own, and the group is sent SIGINT, then SIGTERM after
+`STOP_TIMEOUT` (10 s), then SIGKILL after `TERM_TIMEOUT` (2 s); a further
+Ctrl-C moves on to the next signal at once. With a terminal, the command
+stays in boxman's group, so that it can prompt there (sudo's password) and
+has the terminal's own SIGINT: it is not sent a second one, and the SIGTERM
+and SIGKILL go to its shell and every process below it. So never catch a
+`KeyboardInterrupt` without raising it again, and no bare `except:` or
+`except BaseException` that does not either: `tests/test_utils_shell.py`
+checks src for them. `run_stoppable` is `run` with the command `exec`ed (the
+downloaders in `utils/http_download.py` use it), so pass it a single program
+and its arguments. A worker process that runs commands does its work inside
+`interrupt_on_sigterm()`, and the parent stops it with `stop_workers()`: the
+SIGTERM is a Ctrl-C to the worker, which stops its command before it exits.
+
+What the stop cannot reach: a command run through `docker exec` (the docker
+runtime) goes on inside the container, as docker passes no signal on; and a
+command sudo runs as root gets the SIGINT and the SIGTERM, which sudo passes
+on, but not the SIGKILL, which only kills sudo.
 
 `pass_env` names environment variables the wrapped command needs: the local
 runtime inherits them, the docker runtime forwards each *name* with `-e`. That
