@@ -102,6 +102,15 @@ class DomainExistsError(ProvisionError):
     """
 
 
+class InstallRefusedError(ProvisionError):
+    """Raised when a direct-install VM (ISO or PXE boot) is refused before
+    anything is made for it: an install medium that is not there, a
+    ``networks:`` entry that names nothing, a path virt-install cannot be
+    given. Each is decided by the configuration and the files it names, so
+    a retry is refused the same way; the configuration has to change first.
+    """
+
+
 class SSHAccessError(ProvisionError):
     """Raised once ssh access has been set up as far as it could be, when
     the admin key pair could not be generated or a VM boxman expected to

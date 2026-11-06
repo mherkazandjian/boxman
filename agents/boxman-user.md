@@ -805,9 +805,12 @@ clusters:
   it is bootable), and the ISO stays attached until you eject it, or boxman
   does (`install_only`, below).
 - **`cdroms:` entry forms:** a bare string, `{name: <iso-name>}` (resolved from
-  `isos:`), or `{source: /abs/path.iso}` (explicit local file). The first cdrom
-  is the boot ISO; the others go to virt-install with it, so an installer
-  sees them on its first boot (a driver ISO, an answer file).
+  `isos:`), or `{source: /abs/path.iso}` (explicit local file; `~` is
+  expanded, and a relative path is taken from the directory boxman runs in).
+  The first cdrom is the boot ISO; the others go to virt-install with it, so
+  an installer sees them on its first boot (a driver ISO, an answer file).
+  One that is not there fails the VM at once, naming the path, before its
+  boot disk is made, and is not retried.
 - **`install_only: true`** on a cdroms entry (ISO-boot VMs only; refused on a
   cloned VM) marks a medium the install needs and the installed guest does
   not: an answer ISO holding a password, a driver ISO, the installer itself.

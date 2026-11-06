@@ -11,10 +11,19 @@ from boxman.exceptions import (
     PartialInstallError,
     ProvisionError,
 )
+from boxman.providers.libvirt import direct_vm
 from boxman.providers.libvirt.direct_vm import normalize_disk_size
 from boxman.providers.libvirt.iso_boot_vm import IsoBootVM
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _no_pool_refresh(monkeypatch):
+    """A create whose virt-install failed removes its boot disk and has the
+    pools holding it refreshed: through this host's libvirt, were it real."""
+    monkeypatch.setattr(direct_vm, "refresh_pools_holding",
+                        lambda virsh, paths: [])
 
 
 def _result(ok: bool = True, stderr: str = "", stdout: str = "") -> MagicMock:
@@ -26,7 +35,17 @@ def _result(ok: bool = True, stderr: str = "", stdout: str = "") -> MagicMock:
     return r
 
 
-def _make_iso_vm(tmp_path: Path, iso_path: str = "/fake/talos.iso", **info_overrides) -> IsoBootVM:
+def _iso_file(tmp_path: Path, name: str = "talos.iso") -> str:
+    """An ISO that is there: the boot ISO is looked for before the boot
+    disk is made (#294)."""
+    path = tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+    return str(path)
+
+
+def _make_iso_vm(tmp_path: Path, iso_path: str | None = None, **info_overrides) -> IsoBootVM:
+    iso_path = iso_path or _iso_file(tmp_path)
     info = dict(
         memory=2048,
         vcpus=2,
@@ -97,17 +116,18 @@ class TestIsoBootVMCreate:
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_create_success(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=True)
-        vm = _make_iso_vm(tmp_path, iso_path="/data/talos.iso")
+        vm = _make_iso_vm(tmp_path)
         assert vm.create() is True
         assert mock_run.call_count == 2
 
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_virt_install_cmd_contains_cdrom_and_boot(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=True)
-        vm = _make_iso_vm(tmp_path, iso_path="/data/talos.iso")
+        iso = _iso_file(tmp_path)
+        vm = _make_iso_vm(tmp_path, iso_path=iso)
         vm.create()
         virt_install_call = mock_run.call_args_list[1][0][0]
-        assert "--cdrom=/data/talos.iso" in virt_install_call
+        assert f"--cdrom={iso}" in virt_install_call
         # hd first so an installed disk is preferred over re-running the installer
         assert "--boot=hd,cdrom" in virt_install_call
 
@@ -123,10 +143,11 @@ class TestIsoBootVMCreate:
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_iso_path_with_space_is_shell_quoted(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=True)
-        vm = _make_iso_vm(tmp_path, iso_path="/data/my isos/talos.iso")
+        iso = _iso_file(tmp_path, "my isos/talos.iso")
+        vm = _make_iso_vm(tmp_path, iso_path=iso)
         vm.create()
         virt_install_call = mock_run.call_args_list[1][0][0]
-        assert "--cdrom='/data/my isos/talos.iso'" in virt_install_call
+        assert f"--cdrom='{iso}'" in virt_install_call
 
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_disk_size_in_qemu_img_cmd(self, mock_run, tmp_path):
@@ -145,10 +166,11 @@ class TestIsoBootVMCreate:
 
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_create_fails_on_virt_install_error(self, mock_run, tmp_path):
-        # qemu-img, virt-install, then `virsh domstate`: no domain was left
+        # qemu-img, virt-install, then `virsh domstate` and `virsh list`: no
+        # domain was left
         mock_run.side_effect = [_result(ok=True),
                                 _result(ok=False, stderr="permission denied"),
-                                _result(ok=False)]
+                                _result(ok=False), _result(ok=True)]
         vm = _make_iso_vm(tmp_path)
         assert vm.create() is False
 
@@ -236,7 +258,7 @@ class TestDeclaredButUnresolvableNetworks:
         """The refusal has to come before qemu-img, or a rejected VM still
         leaves a boot disk behind."""
         mock_run.return_value = _result(ok=True)
-        vm = _make_iso_vm(tmp_path, networks=[""], iso_path="/data/talos.iso")
+        vm = _make_iso_vm(tmp_path, networks=[""])
         with pytest.raises(ProvisionError):
             vm.create()
         assert mock_run.call_count == 0, (
@@ -253,7 +275,7 @@ class TestTheBootDiskIsDeclaredQcow2:
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_virt_install_is_told_the_driver_type(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=True)
-        vm = _make_iso_vm(tmp_path, iso_path="/data/talos.iso")
+        vm = _make_iso_vm(tmp_path)
         assert vm.create() is True
 
         cmd = " ".join(str(c.args[0]) for c in mock_run.call_args_list)
@@ -266,7 +288,7 @@ class TestTheBootDiskIsDeclaredQcow2:
         """The two have to agree: declaring qcow2 over a raw file is the same
         class of mismatch, pointing the other way."""
         mock_run.return_value = _result(ok=True)
-        vm = _make_iso_vm(tmp_path, iso_path="/data/talos.iso")
+        vm = _make_iso_vm(tmp_path)
         vm.create()
 
         qemu_img = str(mock_run.call_args_list[0].args[0])
@@ -416,7 +438,7 @@ class TestThereIsNoInstallPhase:
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_virt_install_is_told_not_to_run_one(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=True)
-        _make_iso_vm(tmp_path, iso_path="/data/talos.iso").create()
+        _make_iso_vm(tmp_path).create()
         assert "--install=no_install=yes" in mock_run.call_args_list[1][0][0]
 
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
@@ -426,9 +448,10 @@ class TestThereIsNoInstallPhase:
         media; the same ISO as a CD-ROM `--disk` lost the OS id, and with it
         Windows' localtime clock (virt-install dry run)."""
         mock_run.return_value = _result(ok=True)
-        _make_iso_vm(tmp_path, iso_path="/data/talos.iso").create()
+        iso = _iso_file(tmp_path)
+        _make_iso_vm(tmp_path, iso_path=iso).create()
         cmd = mock_run.call_args_list[1][0][0]
-        assert "--cdrom=/data/talos.iso" in cmd
+        assert f"--cdrom={iso}" in cmd
         assert "--os-variant=detect=on,require=off" in cmd
         assert "device=cdrom" not in cmd
 
@@ -488,9 +511,10 @@ class TestAFailedInstallThatLeftItsDomain:
 
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_the_domain_is_looked_up_by_the_vm_s_name(self, mock_run, tmp_path):
+        # then `virsh list`, which shows no domain by that name either
         mock_run.side_effect = [_result(ok=True),
                                 _result(ok=False, stderr=self.FAILED),
-                                _result(ok=False)]
+                                _result(ok=False), _result(ok=True)]
         # no domain: an ordinary failure, which the caller may retry
         assert _make_iso_vm(tmp_path).create() is False
         lookup = mock_run.call_args_list[2][0][0]
@@ -563,7 +587,7 @@ class TestANameTakenBeforeVirtInstallRan:
             _result(ok=True),
             _result(ok=False, stderr="ERROR    Disk /x.iso is already in "
                                      "use by other guests ['other']."),
-            _result(ok=False)]
+            _result(ok=False), _result(ok=True)]
         assert _make_iso_vm(tmp_path).create() is False
 
     def test_it_is_not_retried(self, monkeypatch):

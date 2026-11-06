@@ -1355,7 +1355,8 @@ class ImagesMixin:
         """Resolve ``cdroms:`` name references and inject ``_resolved_iso_path``.
 
         Returns a shallow copy of vm_info with:
-        - Each cdrom entry expanded to carry ``source: <local_path>``. Entries
+        - Each cdrom entry expanded to carry ``source: <local_path>``, made
+          absolute with ``~`` expanded (:func:`media_path`). Entries
           may be a plain string (an iso name), a ``{name: <iso>}`` mapping, a
           ``{source: <local path>}`` mapping, or both together — in which case
           the explicit source wins and the name is only a label; anything else
@@ -1378,24 +1379,32 @@ class ImagesMixin:
         resolved_cdroms = []
         for cdrom in cdroms:
             if isinstance(cdrom, str):
-                resolved_cdroms.append(
-                    {"name": cdrom, "source": _resolve_name(cdrom)})
+                entry = {"name": cdrom, "source": _resolve_name(cdrom)}
             elif isinstance(cdrom, dict) and cdrom.get("source"):
                 # An explicit source wins over a name. SKILL.md documents
                 # ``{name: installer, source: /iso/ubuntu.iso}``, where the
                 # name is a label rather than a lookup into ``isos:`` —
                 # checking name first rejected that documented form with
                 # "cdroms references unknown iso" (#164 FB-5).
-                resolved_cdroms.append(cdrom)
+                entry = dict(cdrom)
             elif isinstance(cdrom, dict) and cdrom.get("name"):
-                resolved_cdroms.append(
-                    {**cdrom, "source": _resolve_name(cdrom["name"])})
+                entry = {**cdrom, "source": _resolve_name(cdrom["name"])}
             else:
                 raise ValueError(
                     f"invalid cdroms entry {cdrom!r}: expected a string iso "
                     f"name, a {{name: <iso>}} mapping, or a {{source: <path>}} "
                     f"mapping"
                 )
+            # Absolute, with `~` expanded, as cdrom.py and `workspace.path`
+            # read theirs, so that every reader of the entry --
+            # virt-install's `--cdrom` and `--disk`, the configure step's
+            # attach, update's comparison, the eject of install-only media
+            # -- is handed the one path. Passed on as written, a
+            # `~/isos/x.iso` boot ISO reached `--cdrom` unexpanded, and
+            # virt-install looked for it under the current directory (#294).
+            # A relative source is still taken from the current directory.
+            entry["source"] = media_path(str(entry["source"]))
+            resolved_cdroms.append(entry)
 
         result = {**vm_info, "cdroms": resolved_cdroms}
 
