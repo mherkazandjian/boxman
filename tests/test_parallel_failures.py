@@ -209,8 +209,10 @@ def _run_scenario(code: str, timeout: float = 30):
     import signal
     import subprocess
     import sys
+
+    from tests.test_utils_shell import _SIGINT_AS_PYTHON_SETS_IT
     proc = subprocess.Popen(
-        [sys.executable, "-c", code], stdout=subprocess.PIPE,
+        [sys.executable, "-c", _SIGINT_AS_PYTHON_SETS_IT + code], stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, start_new_session=True,
         env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})
     try:

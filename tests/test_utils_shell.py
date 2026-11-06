@@ -289,6 +289,16 @@ for attempt in (1, 2, 3):
 """
 
 
+#: what each child does first: take SIGINT as Python sets it up when it
+#: starts with SIGINT not ignored. A test run started in the background of a
+#: script has SIGINT ignored, and so would every child, which then never
+#: had a KeyboardInterrupt to stop on
+_SIGINT_AS_PYTHON_SETS_IT = (
+    "import signal\n"
+    "signal.signal(signal.SIGINT, signal.default_int_handler)\n"
+)
+
+
 def _interrupt(tmp_path, script, args, signal_at, how="alone", env=None,
                release=None, typed=None):
     """Run the child *script* with *args*, and interrupt it at each point
@@ -319,7 +329,8 @@ def _interrupt(tmp_path, script, args, signal_at, how="alone", env=None,
         master, slave = os.openpty()
         env["TERMINAL"] = "1"
     child = subprocess.Popen(
-        [sys.executable, "-c", script, *map(str, args)], env=env, stdin=slave,
+        [sys.executable, "-c", _SIGINT_AS_PYTHON_SETS_IT + script, *map(str, args)],
+        env=env, stdin=slave,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         start_new_session=True)
     if slave is not None:
