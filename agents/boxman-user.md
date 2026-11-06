@@ -144,6 +144,8 @@ provider:
     virt_sysprep_timeout: 300
     sudo_skip_commands: [qemu-img]      # never sudo these, whatever use_sudo says
     force_sudo_commands: [virt-sysprep] # always sudo these, whatever use_sudo says
+    guest_clock_wait: 1                 # s, default 1: most a restore/resume waits for the
+                                        # guest agent to set the clock; 0 = ask once
 
 # Workspace-level outputs (env.sh, inventory, ansible.cfg, ssh_config)
 workspace:
@@ -198,6 +200,7 @@ clusters:
     workdir: <dir>                   # VM disks + cluster scratch (auto-derives)
     memory_snapshot_dir: <abs dir>   # optional: snapshot memory images (default: workdir)
     disk_snapshot_dir: <abs dir>     # optional: snapshot disk overlays (default: beside each disk)
+    guest_clock_wait: 0.1            # optional: overrides the provider's for this cluster's VMs
     base_image: <template-vm-name>   # cluster default; overridable per VM
     admin_user: ...
     admin_pass: file://...           # also: ${env:VAR}, or a plain literal
@@ -227,6 +230,7 @@ clusters:
                                          # and the ssh alias; defaults to <vm_name>
         base_image: <template-vm-name>   # optional; overrides cluster.base_image
         boot_order: [hd]                 # default; [network,hd]=PXE, [cdrom,hd]=ISO boot
+        guest_clock_wait: 3              # optional: overrides the cluster's and the provider's
         clone_machine_id: auto           # auto (default) | required | off — own /etc/machine-id
         clone_ssh_host_keys: auto        # auto (default) | required | off — own ssh host keys
         clone_hostname: auto             # auto (default) | required | off — guest named hostname:
@@ -1223,6 +1227,22 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
 - A VM holding a managed save (after `boxman down`) cannot be reverted to a
   snapshot that captured no memory; the restore refuses up front. Run `boxman
   up` first, or discard the saved memory with `virsh managedsave-remove`.
+- **The guest clock after a memory restore.** A guest restored from memory
+  (`snapshot restore`, `up` after `down`, `control start` of a saved VM) or
+  resumed (`control resume`, `up` of a paused VM) comes back behind the host
+  by as long as it was stopped. boxman sets it from the host's with `virsh
+  domtime --now` through the QEMU guest agent and logs `set the clock of <vm>
+  from the host's (it was N behind)`. It never makes a restore noticeably
+  slower: it reads the agent channel's state from the live definition first,
+  and a disconnected or absent one means no agent, warned about at once with
+  no wait. Otherwise it waits at most `guest_clock_wait` (seconds, default 1;
+  set in `provider.libvirt`, `boxman.yml`'s `providers.libvirt`, a cluster or
+  a VM, the most specific winning; 0 asks once), and every virsh call is cut
+  off within that and a second. Whenever the clock was not set, it warns once
+  with how far behind it is left; the restore still succeeds. A bad value
+  (not a number ≥ 0) is refused before any command runs. Disk-only snapshots
+  boot fresh and need nothing. On Linux the agent needs `/sbin/hwclock`
+  (`util-linux-extra` on Debian/Ubuntu, then restart `qemu-guest-agent`).
 - `snapshot list` is the raw libvirt list; `snapshot log [-n N] [--reverse]
   [--json] [--no-graph]` is a git-log-style aggregated view with an ASCII graph
   and a `← current` marker. Prefer `log` for a human overview.

@@ -24,7 +24,7 @@ from .destroy_vm import DestroyVM, shutdown_and_wait
 from .disk import DiskManager
 from .disk_cleanup import FilesInUse, remove_vm_disks
 from .disk_ownership import detach_disk, forget_disk
-from .guest_clock import set_guest_clock
+from .guest_clock import DEFAULT_WAIT_S, WAIT_KEY, parse_wait, set_guest_clock
 from .import_image import ImageImporter
 from .install_media import InstallMediaOutcome, eject_finished_install_media
 from .iso_boot_vm import IsoBootVM
@@ -1894,9 +1894,8 @@ class LibVirtSession(SessionConfigMixin):
             if "running" in verify_result.stdout:
                 self.logger.status(f"vm {vm_name} started successfully")
                 if saved:
-                    set_guest_clock(virsh, vm_name, stopped_at=saved_at,
-                                    came_back_from="its managed save",
-                                    logger=self.logger)
+                    self._set_guest_clock(virsh, vm_name, stopped_at=saved_at,
+                                          came_back_from="its managed save")
                 return True
             else:
                 self.logger.error(
@@ -2672,9 +2671,91 @@ class LibVirtSession(SessionConfigMixin):
                 f"memory, so its clock was not set from the host's "
                 f"({type(exc).__name__}: {exc})")
             return
-        set_guest_clock(virsh, vm_name, stopped_at=taken_at,
-                        came_back_from=f"snapshot '{snapshot_name}'",
-                        logger=self.logger)
+        self._set_guest_clock(virsh, vm_name, stopped_at=taken_at,
+                              came_back_from=f"snapshot '{snapshot_name}'")
+
+    def _set_guest_clock(self, virsh, vm_name: str, *,
+                         stopped_at: float | None = None,
+                         came_back_from: str) -> bool:
+        """:func:`set_guest_clock`, within *vm_name*'s
+        :meth:`guest_clock_wait`."""
+        return set_guest_clock(virsh, vm_name, stopped_at=stopped_at,
+                               came_back_from=came_back_from,
+                               wait=self.guest_clock_wait(vm_name),
+                               logger=self.logger)
+
+    def guest_clock_wait(self, vm_name: str) -> float:
+        """
+        How long a restore or resume of *vm_name* waits, at most, for its
+        guest agent to set its clock (#275): the ``guest_clock_wait`` its
+        VM sets, else its cluster's, else the provider's (conf.yml's
+        ``provider.libvirt`` over boxman.yml's ``providers.libvirt``), else
+        1 s. 0 looks at the agent's channel and asks once.
+
+        A bad value is refused before any command runs
+        (:meth:`validate_guest_clock_wait`); one met here all the same is
+        warned about and the default used, since nothing about the clock
+        may fail a restore.
+        """
+        settings = self._guest_clock_waits(vm_name)
+        if not settings:
+            return DEFAULT_WAIT_S
+        where, value = settings[0]
+        try:
+            return parse_wait(value, where)
+        except ConfigError as exc:
+            self.logger.warning(f"{exc}; waiting {DEFAULT_WAIT_S:g} s")
+            return DEFAULT_WAIT_S
+
+    def validate_guest_clock_wait(self) -> None:
+        """
+        Refuse a ``guest_clock_wait`` that is not a number of seconds, 0 or
+        more, wherever it is set, before any command runs.
+
+        Raises:
+            ConfigError: naming every bad one.
+        """
+        problems = []
+        for where, value in self._guest_clock_waits():
+            try:
+                parse_wait(value, where)
+            except ConfigError as exc:
+                problems.append(str(exc))
+        if problems:
+            raise ConfigError("; ".join(problems))
+
+    def _guest_clock_waits(self, vm_name: str | None = None
+                           ) -> list[tuple[str, Any]]:
+        """
+        ``(where, value)`` for each ``guest_clock_wait`` that applies to
+        *vm_name*, the most specific first: its VM's, its cluster's, the
+        provider's. Every one set anywhere when *vm_name* is None.
+        """
+        config = self.config or {}
+        prefix = f"bprj__{config.get('project')}__bprj_"
+        found = []
+        for cluster_name, cluster in (config.get('clusters') or {}).items():
+            if not isinstance(cluster, dict):
+                continue
+            vms = dict(cluster.get('vms') or {})
+            if vm_name is not None:
+                vms = {name: vm for name, vm in vms.items()
+                       if f"{prefix}{cluster_name}_{name}" == vm_name}
+                if not vms:
+                    continue        # not this cluster's VM
+            for name, vm in vms.items():
+                if isinstance(vm, dict) and WAIT_KEY in vm:
+                    found.append(
+                        (f"clusters.{cluster_name}.vms.{name}.{WAIT_KEY}",
+                         vm[WAIT_KEY]))
+            if WAIT_KEY in cluster:
+                found.append((f"clusters.{cluster_name}.{WAIT_KEY}",
+                              cluster[WAIT_KEY]))
+        if WAIT_KEY in self.provider_config:
+            found.append((f"{WAIT_KEY} in provider.libvirt (conf.yml) or "
+                          f"providers.libvirt (boxman.yml)",
+                          self.provider_config[WAIT_KEY]))
+        return found
 
     @staticmethod
     def _is_running(virsh, vm_name: str) -> bool:
@@ -2875,11 +2956,9 @@ class LibVirtSession(SessionConfigMixin):
             verify_result = virsh.execute("domstate", vm_name)
             if "running" in verify_result.stdout:
                 self.logger.info(f"the vm {vm_name} resumed successfully")
-                # its clock stood still while it was paused (#275). The
-                # agent's channel stays open through a pause, so an agent
-                # that does not answer at once is not coming: ask once.
-                set_guest_clock(virsh, vm_name, came_back_from="a pause",
-                                wait=0, logger=self.logger)
+                # its clock stood still while it was paused (#275)
+                self._set_guest_clock(virsh, vm_name,
+                                      came_back_from="a pause")
                 return True
             else:
                 self.logger.error(
@@ -3124,9 +3203,8 @@ class LibVirtSession(SessionConfigMixin):
                     return False
                 if not self._confirm_running(virsh, vm_name):
                     return False
-                set_guest_clock(virsh, vm_name, stopped_at=saved_at,
-                                came_back_from="its managed save",
-                                logger=self.logger)
+                self._set_guest_clock(virsh, vm_name, stopped_at=saved_at,
+                                      came_back_from="its managed save")
                 return True
 
             save_path = os.path.join(
@@ -3198,9 +3276,8 @@ class LibVirtSession(SessionConfigMixin):
             self._discard_quarantined_save(consuming_path)
             if not self._confirm_running(virsh, vm_name):
                 return False
-            set_guest_clock(virsh, vm_name, stopped_at=saved_at,
-                            came_back_from=f"the save file {save_path}",
-                            logger=self.logger)
+            self._set_guest_clock(virsh, vm_name, stopped_at=saved_at,
+                                  came_back_from=f"the save file {save_path}")
             return True
 
         except Exception as exc:

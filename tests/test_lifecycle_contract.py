@@ -265,9 +265,17 @@ class _FakeLibvirt:
                              return_code=0 if self.restore_ok else 1,
                              stdout='', stderr='restore failed')
 
+        if cmd == 'dumpxml':
+            # the guest agent's channel, connected, and the agent, its clock
+            # reading the host's: a restore looks, reads the time to set it
+            # from the host's, and leaves it as it is (#275)
+            return MagicMock(
+                ok=True, return_code=0, stderr='',
+                stdout="<domain><devices><channel type='unix'><target "
+                       "type='virtio' name='org.qemu.guest_agent.0' "
+                       "state='connected'/></channel></devices></domain>")
+
         if cmd == 'domtime':
-            # the guest agent, its clock reading the host's: a restore reads
-            # it to set it from the host's, and leaves it as it is (#275)
             return MagicMock(ok=True, return_code=0,
                              stdout=f'Time: {int(time.time())}\n', stderr='')
 
