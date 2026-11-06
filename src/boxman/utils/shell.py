@@ -48,10 +48,47 @@ import invoke
 #: the signals :func:`interrupt_on_signals` takes as a Ctrl-C
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 
-#: whether the stop under way was asked for by one of STOP_SIGNALS, not by a
-#: Ctrl-C at the terminal, which has reached a command in boxman's group
-#: itself: the stop takes it (see _StoppingLocal._stop)
-_asked_by_a_signal = False
+#: set once a stop has begun in this process: by a Ctrl-C, by one of
+#: STOP_SIGNALS, or by code that leaves on a KeyboardInterrupt while threads
+#: of its own run commands (stop_commands). The KeyboardInterrupt reaches the
+#: main thread alone: a runner on any other thread stops its command when
+#: this is set, and starts no other, where a scan's reads, on threads of
+#: their own, ran their commands to the end (#294 review). The main thread
+#: clears it when it starts a command again, the stop being over
+_STOPPING = threading.Event()
+
+#: whether that stop was asked for by one of STOP_SIGNALS, not by a Ctrl-C
+#: at the terminal, which has reached a command in boxman's group itself
+_stop_by_a_signal = False
+
+
+def _on_main_thread() -> bool:
+    return threading.current_thread() is threading.main_thread()
+
+
+def _begin_stop(by_a_signal: bool = False) -> None:
+    global _stop_by_a_signal
+    if by_a_signal:
+        _stop_by_a_signal = True
+    _STOPPING.set()
+
+
+def _end_stop() -> None:
+    global _stop_by_a_signal
+    _stop_by_a_signal = False
+    _STOPPING.clear()
+
+
+def stop_commands() -> None:
+    """Stop the commands that threads of this process are running, and have
+    them start no more (#294 review).
+
+    For code that leaves on a KeyboardInterrupt while threads of its own
+    run commands (a scan's pool): the KeyboardInterrupt reaches the main
+    thread alone. A Ctrl-C under :func:`interrupt_on_signals` does this
+    already.
+    """
+    _begin_stop()
 
 
 def _has_terminal() -> bool:
@@ -100,23 +137,23 @@ def _alive(pid: int, start: str) -> bool:
     return fields is not None and fields[19] == start and fields[0] != "Z"
 
 
-def _kill_from_another_group(number: int, pids: Iterable[int]) -> None:
+def _kill_from_another_group(number: int, pids: list[int]) -> bool:
     """Send signal *number* to *pids*, from a short-lived process in a
-    process group of its own.
+    process group of its own; whether that process could be run.
 
     sudo passes on no signal that comes from the process group of whatever
     started it, taking it for one the terminal sent the whole group: sent
     from boxman's, which a command run with a terminal shares, a SIGTERM
     never reached the command sudo runs as root (#294 review).
     """
-    pids = [str(pid) for pid in pids]
-    if not pids:
-        return
-    with contextlib.suppress(OSError, subprocess.SubprocessError):
+    try:
         subprocess.run(
-            ["/bin/sh", "-c", 'kill -"$0" "$@"', str(int(number)), *pids],
+            ["/bin/sh", "-c", 'kill -"$0" "$@"', str(int(number)), *map(str, pids)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
 
 
 #: the guardian: a process in a group of its own that outlives boxman only
@@ -152,13 +189,18 @@ for number in (signal.SIGTERM, signal.SIGKILL):
         time.sleep(0.05)
 """
 
-#: (the PID of the process it guards, the pipe to it), or None
-_guardian: tuple[int, int | None] | None = None
+#: (the PID of the process it guards, the guardian's PID, the pipe to it),
+#: or None
+_guardian: tuple[int, int, int] | None = None
+#: the groups this process has the guardian watch: a new guardian, started
+#: in place of one that died, is told of each
+_guarded: set[int] = set()
 _guardian_lock = threading.Lock()
+_guardian_warned = False
 
 
-def _tell_guardian(line: bytes) -> None:
-    """Pass *line* to this process's guardian, started on first use.
+def _guard(group: int, on: bool) -> None:
+    """Have this process's guardian watch *group*, or stop watching it.
 
     Without a terminal, a command runs in a process group of its own, so
     that sudo passes boxman's signals on to it: a SIGKILL, SIGHUP or SIGQUIT
@@ -166,23 +208,68 @@ def _tell_guardian(line: bytes) -> None:
     reached it, and it ran on alone (#294 review). A parent-death signal
     would reach the shell alone, not the rest of a compound command.
     """
-    global _guardian
     with _guardian_lock:
-        if _guardian is None or _guardian[0] != os.getpid():
-            _guardian = (os.getpid(), _start_guardian())
-        pipe = _guardian[1]
-    if pipe is not None:
+        if on:
+            _guarded.add(group)
+        else:
+            _guarded.discard(group)
+        line = b"%s%d\n" % (b"+" if on else b"-", group)
+        for _attempt in range(2):
+            pipe = _live_guardian()
+            if pipe is None:
+                return
+            try:
+                os.write(pipe, line)
+                return
+            except OSError:
+                # it died: the next attempt starts another, told of every group
+                _drop_guardian()
+
+
+def _live_guardian() -> int | None:
+    """The pipe to this process's guardian, started, or started again if it
+    has died, on first use; None if it cannot be started now."""
+    global _guardian, _guardian_warned
+    if _guardian is not None:
+        owner, pid, pipe = _guardian
+        if owner == os.getpid():
+            try:
+                done = os.waitpid(pid, os.WNOHANG)[0]
+            except ChildProcessError:
+                done = pid
+            if not done:
+                return pipe
+        _drop_guardian()
+    started = _start_guardian()
+    if started is None:
+        if not _guardian_warned:
+            _guardian_warned = True
+            from boxman import log
+            log.warning(
+                "boxman could not start the helper that ends its commands if it is "
+                "killed: a command run without a terminal may outlive a killed boxman")
+        return None
+    _guardian = (os.getpid(), *started)
+    with contextlib.suppress(OSError):
+        os.write(_guardian[2], b"".join(b"+%d\n" % group for group in _guarded))
+    return _guardian[2]
+
+
+def _drop_guardian() -> None:
+    global _guardian
+    if _guardian is not None:
         with contextlib.suppress(OSError):
-            os.write(pipe, line)
+            os.close(_guardian[2])
+    _guardian = None
 
 
-def _start_guardian() -> int | None:
-    """Start a guardian; return the pipe to it, or None if it cannot be."""
+def _start_guardian() -> tuple[int, int] | None:
+    """Start a guardian; return its PID and the pipe to it, or None."""
     if not sys.executable:
         return None
     read, write = os.pipe()
     try:
-        os.posix_spawn(
+        pid = os.posix_spawn(
             sys.executable,
             [sys.executable, "-I", "-S", "-c", _GUARDIAN, str(_StoppingLocal.TERM_TIMEOUT)],
             os.environ,
@@ -195,18 +282,19 @@ def _start_guardian() -> int | None:
         return None
     finally:
         os.close(read)
-    return write
+    return pid, write
 
 
 def _forget_guardian() -> None:
     """In a forked child, as a worker is: its parent's guardian is not its
     own, and holding the pipe to it would keep it from seeing the parent
-    go. The child starts a guardian of its own when it needs one."""
-    global _guardian
-    if _guardian is not None and _guardian[1] is not None:
-        with contextlib.suppress(OSError):
-            os.close(_guardian[1])
-    _guardian = None
+    go; nor are its parent's groups. The child starts a guardian of its own
+    when it needs one. The lock is a new one, as another thread of the
+    parent may have held it at the fork."""
+    global _guardian, _guarded, _guardian_lock
+    _guardian_lock = threading.Lock()
+    _drop_guardian()
+    _guarded = set()
 
 
 os.register_at_fork(after_in_child=_forget_guardian)
@@ -236,6 +324,10 @@ class _StoppingLocal(invoke.runners.Local):
     process in another group, as sudo would pass on none from boxman's. A
     command run with ``pty=True`` leads a session of its own, as invoke
     starts it, and is stopped as a group.
+
+    On a thread other than the main one, which no KeyboardInterrupt
+    reaches, the runner stops its command once a stop has begun in the
+    process (_STOPPING), and starts none after it.
     """
 
     #: how long a command has to end after its SIGINT, before its SIGTERM
@@ -243,6 +335,9 @@ class _StoppingLocal(invoke.runners.Local):
     #: how long it then has to end, before it is killed. sudo passes a
     #: SIGTERM on to the command it runs as root, which boxman cannot kill
     TERM_TIMEOUT = 2
+    #: how long a killed command's shell has to be reaped, before boxman
+    #: leaves it (a process in an uninterruptible wait ends only with it)
+    KILL_TIMEOUT = 5
     #: how often a command being stopped is looked at
     POLL = 0.02
 
@@ -258,6 +353,10 @@ class _StoppingLocal(invoke.runners.Local):
         # same. Only a Python handler is swapped, for another, which leaves
         # the command's disposition as it was; an ignored signal, or one
         # left to its default, raises nothing to hold back
+        if _STOPPING.is_set() and not _on_main_thread():
+            # a stop has begun: no new command on a thread the
+            # KeyboardInterrupt does not reach (#294 review)
+            raise KeyboardInterrupt
         held_back: list[tuple[Any, ...]] = []
         swapped: dict[int, Any] = {}
         for number in (signal.SIGINT, *STOP_SIGNALS):
@@ -302,7 +401,7 @@ class _StoppingLocal(invoke.runners.Local):
                 stdin=subprocess.PIPE, start_new_session=True)
             self.group = self.process.pid
         if self.group is not None:
-            _tell_guardian(b"+%d\n" % self.group)
+            _guard(self.group, True)
 
     @property
     def process_is_finished(self) -> bool:
@@ -319,8 +418,27 @@ class _StoppingLocal(invoke.runners.Local):
         # invoke calls this from its wait for the command, and waits on
         # afterwards without a limit: stopping it here is what gives a
         # command that ignores its SIGINT a deadline (#244 review)
+        _begin_stop()
         self.interrupted = True
         self._stop()
+
+    def wait(self) -> None:
+        # invoke's wait for the command, which on a thread other than the
+        # main one also looks for a stop that has begun: the
+        # KeyboardInterrupt reaches the main thread alone (#294 review)
+        watch = not _on_main_thread()
+        while not (self.process_is_finished or self.has_dead_threads
+                   or getattr(self, "abandoned", False)):
+            if watch and _STOPPING.is_set() and not self.interrupted:
+                self.interrupted = True
+                # it may have started after the terminal's Ctrl-C, before
+                # the main thread's handler set _STOPPING: it is sent the
+                # SIGINT itself (a scan's reads only read, and take a second
+                # one with no harm)
+                self.from_another_thread = True
+                self._stop()
+                continue
+            time.sleep(self.input_sleep)
 
     def _thread_join_timeout(self, target: Any) -> int | None:
         # once stopped, the command may have left a process holding its
@@ -362,8 +480,15 @@ class _StoppingLocal(invoke.runners.Local):
         # them by: once reaped, its PID may be another process's
         if not self.process_is_finished:
             self.signalled.update(_tree(self.process.pid))
-        _kill_from_another_group(
-            number, [pid for pid, start in self.signalled.items() if _alive(pid, start)])
+        pids = [pid for pid, start in self.signalled.items() if _alive(pid, start)]
+        # from another group, for sudo; but a SIGKILL sudo cannot pass on,
+        # and a helper that cannot be run must not leave a stop unended
+        # (#294 review)
+        if not pids or (number != signal.SIGKILL and _kill_from_another_group(number, pids)):
+            return
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, number)
 
     def _wait(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
@@ -371,8 +496,13 @@ class _StoppingLocal(invoke.runners.Local):
             time.sleep(self.POLL)
 
     def _reap(self) -> None:
-        """Wait for the command's shell, killed, to end."""
+        """Wait for the command's shell, killed, to end; or KILL_TIMEOUT,
+        and leave it, abandoned, which ends invoke's wait for it too."""
+        deadline = time.monotonic() + self.KILL_TIMEOUT
         while not self.process_is_finished:
+            if time.monotonic() >= deadline:
+                self.abandoned = True
+                return
             time.sleep(self.POLL)
 
     def _stop(self) -> None:
@@ -381,16 +511,15 @@ class _StoppingLocal(invoke.runners.Local):
         It is sent SIGINT; SIGTERM if it has not ended STOP_TIMEOUT later;
         and SIGKILL if it still has not TERM_TIMEOUT after that. One in
         boxman's group had the SIGINT from the terminal already, and is not
-        sent another, unless one of STOP_SIGNALS asked for the stop, or a
-        worker's parent did. Another Ctrl-C, at any step, moves on to the
+        sent another, unless one of STOP_SIGNALS asked for the stop, a
+        worker's parent did, or the runner is on another thread. Another Ctrl-C, at any step, moves on to the
         next at once. Either way, the command has ended, and been reaped,
         when this returns.
         """
-        global _asked_by_a_signal
         if not self._started():
             return
-        forward = self.group is not None or _asked_by_a_signal
-        _asked_by_a_signal = False
+        forward = (self.group is not None or _stop_by_a_signal
+                   or getattr(self, "from_another_thread", False))
         steps = [(signal.SIGINT if forward else None, self.STOP_TIMEOUT),
                  (signal.SIGTERM, self.TERM_TIMEOUT)]
         step = 0
@@ -415,23 +544,29 @@ class _StoppingLocal(invoke.runners.Local):
 
     def run(self, command: str, **kwargs: Any) -> invoke.runners.Result:
         self.interrupted = False
+        if _on_main_thread():
+            # a command started again: the stop, if there was one, is over
+            _end_stop()
         try:
             result = super().run(command, **kwargs)
         except invoke.exceptions.Failure:
-            # an UnexpectedExit, for one: a stopped command did not exit 0
-            if self.interrupted:
+            # an UnexpectedExit, for one: a stopped command did not exit 0;
+            # on another thread, one the terminal's Ctrl-C ended first
+            if self.interrupted or (_STOPPING.is_set() and not _on_main_thread()):
                 raise KeyboardInterrupt from None
             raise
         except KeyboardInterrupt:
             # one invoke did not pass on: it came after the command started,
             # or start() held it back until then, and before invoke began to
             # wait for it, so the command would run on without boxman
+            if _on_main_thread():
+                _begin_stop()
             self._stop()
             raise
         finally:
             # ended, or let go of (disown, asynchronous): not the guardian's
             if getattr(self, "group", None) is not None:
-                _tell_guardian(b"-%d\n" % self.group)
+                _guard(self.group, False)
         if self.interrupted:
             raise KeyboardInterrupt
         return result
@@ -467,15 +602,15 @@ def interrupt_on_signals(worker: bool = False) -> Iterator[None]:
     def on_sigint(number: int, frame: Any) -> None:
         nonlocal stopping
         stopping = True
+        _begin_stop()
         signal.default_int_handler(number, frame)
 
     def on_stop_signal(number: int, frame: Any) -> None:
-        global _asked_by_a_signal
         nonlocal stopping
         if worker and stopping:
             return
         stopping = True
-        _asked_by_a_signal = True
+        _begin_stop(by_a_signal=True)
         # whatever handles SIGINT now: on_sigint, or, while a command starts,
         # the runner, which holds it back; with SIGINT ignored, this raises
         handler = signal.getsignal(signal.SIGINT)
@@ -490,6 +625,35 @@ def interrupt_on_signals(worker: bool = False) -> Iterator[None]:
         for number, handler in handlers.items():
             if signal.getsignal(number) is not signal.SIG_IGN:
                 previous[number] = signal.signal(number, handler)
+    except ValueError:
+        # not the main thread: nothing was changed
+        yield
+        return
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, signal.SIG_DFL if handler is None else handler)
+
+
+@contextlib.contextmanager
+def default_stop_signals() -> Iterator[None]:
+    """Within it, SIGTERM, SIGHUP and SIGQUIT are left to their defaults:
+    for a program run in the foreground, attached to the terminal, whose
+    session is the user's (``boxman ssh``, ``exec``, ``run``).
+
+    Under :func:`interrupt_on_signals`, a SIGTERM to boxman raised a
+    KeyboardInterrupt in ``subprocess.run``, which killed ssh a quarter of a
+    second later, and left the terminal as ssh had set it, without echo
+    (#294 review). Now boxman ends at once, as it did, and ssh, left to end
+    on its own, puts the terminal back. One ignored on the way in stays
+    ignored; the handlers found are put back on the way out.
+    """
+    previous: dict[int, Any] = {}
+    try:
+        for number in STOP_SIGNALS:
+            if signal.getsignal(number) is not signal.SIG_IGN:
+                previous[number] = signal.signal(number, signal.SIG_DFL)
     except ValueError:
         # not the main thread: nothing was changed
         yield

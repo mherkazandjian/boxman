@@ -24,6 +24,8 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
+from boxman.utils.shell import stop_commands
+
 #: the provider setting -- ``provider.libvirt`` in conf.yml, or
 #: ``providers.libvirt`` in boxman.yml -- for how many domains a scan reads
 #: at once; 1 reads them one after another, as boxman did before
@@ -79,8 +81,9 @@ class InOrder:
     Leaving the block -- at the end, early, or on an exception, a Ctrl-C
     included -- reads no item not yet started, and waits for the reads under
     way to end: no read outlives the scan that asked for it. Reads are short
-    (one domain's commands), so the wait is too; a Ctrl-C at a terminal
-    reaches the commands themselves, which are in boxman's process group.
+    (one domain's commands), so the wait is too. On a KeyboardInterrupt,
+    which reaches the main thread alone, the commands the reads are running
+    are stopped first, and the reads start no more (#294).
 
     With one worker, or one item, nothing runs on a thread: each item is
     read when its outcome is asked for, as before the pool.
@@ -108,6 +111,8 @@ class InOrder:
 
     def __exit__(self, *exc_info: Any) -> None:
         if self._pool is not None:
+            if exc_info[0] is not None and issubclass(exc_info[0], KeyboardInterrupt):
+                stop_commands()
             self._pool.shutdown(wait=True, cancel_futures=True)
 
 

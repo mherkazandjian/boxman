@@ -11,6 +11,7 @@ Phase 2.8's follow-up fixed.
 from __future__ import annotations
 
 import contextlib
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -309,8 +310,9 @@ def _interrupt(tmp_path, script, args, signal_at, how="alone", env=None,
                release=None, typed=None, terminal=None, timings=None):
     """Run the child *script* with *args*, and interrupt it at each point
     in *signal_at*: once the file there, or every file of a tuple there, has
-    appeared, or, for a number, that many seconds on; return what it
-    printed, and how it exited.
+    appeared, or, for a number, that many seconds on; a callable there is
+    called with the child instead. Return what it printed, and how it
+    exited.
 
     *how*, the same for every point or a list with one for each: ``alone``,
     a SIGINT to its Python alone; ``group``, to its whole process group, the
@@ -333,7 +335,8 @@ def _interrupt(tmp_path, script, args, signal_at, how="alone", env=None,
     import time
     from pathlib import Path
 
-    points = [when for when in signal_at if not isinstance(when, (int, float))]
+    points = [when for when in signal_at
+              if not isinstance(when, (int, float)) and not callable(when)]
     hows = list(how) if isinstance(how, list) else [how] * len(points)
     if terminal is None:
         terminal = "terminal" in hows
@@ -358,6 +361,9 @@ def _interrupt(tmp_path, script, args, signal_at, how="alone", env=None,
         for when in signal_at:
             if isinstance(when, (int, float)):
                 time.sleep(when)
+                continue
+            if callable(when):
+                when(child)
                 continue
             files = when if isinstance(when, tuple) else (when,)
             deadline = time.monotonic() + 30
@@ -722,6 +728,19 @@ class TestRunStopsEveryCommand:
         assert answer.read_text() == "yes\n"
 
 
+def _once(path, action):
+    """A step for :func:`_interrupt`: once *path* is there, *action*, called
+    with the child."""
+    def step(child):
+        import time
+        deadline = time.monotonic() + 30
+        while not path.exists():
+            assert child.poll() is None and time.monotonic() < deadline, "not there in time"
+            time.sleep(0.05)
+        action(child)
+    return step
+
+
 def _gone_within(up, seconds) -> bool:
     """Whether the program that wrote its PID to *up* is gone within
     *seconds*."""
@@ -907,6 +926,270 @@ class TestAStopTheTerminalDidNotAskFor:
         finally:
             signal.signal(signal.SIGINT, previous)
         assert int(out.split()[1], 16) >> (signal.SIGINT - 1) & 1
+
+
+#: a child that scans as boxman does, on #304's pool: eight reads at once,
+#: each running three commands one after another, through run, each of
+#: which writes its PID to ``pid-<read>-<command>``, sleeps, and, unless
+#: stopped, creates ``done-<read>-<command>``. A failed command does not end
+#: its read (``warn``), as the reads of a scan do not all stop at one
+_SCANS_ON_THE_POOL = """
+import sys
+from boxman.providers.libvirt.scan_pool import InOrder
+from boxman.utils import shell
+marks = sys.argv[1]
+def read(item):
+    for command in range(3):
+        shell.run(f"sh -c 'echo $$ > {marks}/pid-{item}-{command}; exec sleep 5' "
+                  f"&& touch {marks}/done-{item}-{command}", hide=True, warn=True)
+    return item
+with shell.interrupt_on_signals():
+    with InOrder(read, range(8), 8) as outcomes:
+        print([outcome.result() for outcome in outcomes], flush=True)
+"""
+
+
+@pytest.mark.usefixtures("no_leftovers")
+class TestCommandsOnOtherThreads:
+    """
+    The KeyboardInterrupt reaches the main thread alone. A scan's reads run
+    their commands on #304's pool threads, which nothing stopped: without a
+    terminal, in a group of their own, the commands ran to their ends, and
+    the reads started more; and with one, the reads started more after the
+    terminal's Ctrl-C had ended the first ones (#294 review).
+    """
+
+    @pytest.mark.parametrize("how", [("group", 2), ("group", 15), "terminal"],
+                             ids=["sigint-to-the-group", "sigterm-to-the-group",
+                                  "ctrl-c-at-the-terminal"])
+    def test_a_stop_ends_the_commands_of_a_scan_and_starts_no_more(self, how, tmp_path):
+        import signal
+
+        marks = tmp_path / "marks"
+        marks.mkdir()
+        first = tuple(marks / f"pid-{item}-0" for item in range(8))
+        timings = {}
+        try:
+            out, err, code = _interrupt(
+                tmp_path, _SCANS_ON_THE_POOL, [marks], [first], how=[how], timings=timings)
+            assert code == -signal.SIGINT, err
+            assert timings["ended"] - timings["first"] < 4
+            assert sorted(path.name for path in marks.iterdir()) == sorted(
+                path.name for path in first)
+            assert not [path for path in first if _running(path)]
+        finally:
+            for path in marks.glob("pid-*"):
+                if _running(path):
+                    os.kill(int(path.read_text()), signal.SIGKILL)
+
+    def test_with_a_terminal_a_stop_ends_even_when_no_helper_can_be_started(self, tmp_path):
+        """The signals of a stop came from a helper process alone, and a
+        stop with none to be had, at a limit on processes, never ended
+        (#294 review): the SIGKILL goes straight to the command now, and the
+        others do too when the helper cannot be run."""
+        import os
+        import resource
+
+        up, after = tmp_path / "up", tmp_path / "after"
+
+        def no_more_processes(child):
+            resource.prlimit(child.pid, resource.RLIMIT_NPROC, (1, 1))
+
+        timings = {}
+        out, err, code = _interrupt(
+            tmp_path, _RUN_IN_A_CHILD,
+            [f"trap '' INT TERM; {_program(_IGNORES_SIGINT_AND_SIGTERM, up)}; touch {after}"],
+            [_once(up, no_more_processes), up], how=["terminal"], timings=timings,
+            env=dict(os.environ, RUN="run", STOP_TIMEOUT="1", TERM_TIMEOUT="1"))
+        assert (out.split(), code) == (["STOPPED"], 0), err
+        assert timings["ended"] - timings["first"] < 10
+        assert not _running(up)
+        assert not after.exists()
+
+
+#: a stand-in for ssh: it sets the terminal as ssh does, without echo or
+#: line editing, writes its PID to the file UP names, and puts the
+#: terminal back when it is told to end, by SIGTERM or SIGHUP, saying so
+#: with ``<UP>.ended``
+_SSH = """\
+import os, signal, sys, termios, time
+before = termios.tcgetattr(0)
+raw = termios.tcgetattr(0)
+raw[3] &= ~(termios.ICANON | termios.ECHO)
+termios.tcsetattr(0, termios.TCSANOW, raw)
+def end(*_):
+    termios.tcsetattr(0, termios.TCSANOW, before)
+    open(os.environ["UP"] + ".ended", "w").close()
+    sys.exit(0)
+signal.signal(signal.SIGTERM, end)
+signal.signal(signal.SIGHUP, end)
+with open(os.environ["UP"] + ".tmp", "w") as up:
+    up.write(str(os.getpid()))
+os.replace(os.environ["UP"] + ".tmp", os.environ["UP"])
+time.sleep(60)
+end()
+"""
+
+
+@pytest.mark.usefixtures("no_leftovers")
+class TestInteractiveSessions:
+    """
+    ``boxman ssh``, ``exec`` and ``run`` hand the terminal to the program.
+    Under the handlers ``main()`` has, a SIGTERM to boxman raised a
+    KeyboardInterrupt in ``subprocess.run``, which killed ssh a quarter of a
+    second later: ssh could not put the terminal back, and left it without
+    echo (#294 review).
+    """
+
+    def test_a_sigterm_to_boxman_leaves_ssh_to_put_the_terminal_back(self, tmp_path):
+        import os
+        import signal
+        import subprocess
+        import sys
+        import termios
+        import time
+        from pathlib import Path
+
+        bindir, workspace, up = tmp_path / "bin", tmp_path / "ws", tmp_path / "up"
+        bindir.mkdir()
+        workspace.mkdir()
+        (bindir / "ssh").write_text(f"#!{sys.executable}\n" + _SSH)
+        (bindir / "ssh").chmod(0o755)
+        conf = tmp_path / "conf.yml"
+        conf.write_text(
+            "version: '1.0'\nproject: ssh_term\n"
+            f"workspace:\n  path: {workspace}\n  gateway_host: localhost\n"
+            f"clusters:\n  c1:\n    workdir: {workspace}\n    vms:\n      node01: {{}}\n")
+        env = dict(os.environ, UP=str(up), HOME=str(tmp_path), TERM="xterm",
+                   PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}",
+                   PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+        master, slave = os.openpty()
+        boxman = subprocess.Popen(
+            [sys.executable, "-c", _SIGINT_AS_PYTHON_SETS_IT + _THE_PTY_AS_ITS_TERMINAL
+             + "from boxman.scripts.app import main\nmain()",
+             "--conf", str(conf), "ssh", "node01"],
+            env=env, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+        os.close(slave)
+        try:
+            deadline = time.monotonic() + 30
+            while not up.exists():
+                assert boxman.poll() is None and time.monotonic() < deadline
+                time.sleep(0.05)
+            boxman.send_signal(signal.SIGTERM)
+            boxman.wait(timeout=10)
+            # boxman has gone, at once, as before; ssh, not killed, ends on
+            # its own (the terminal's hangup, here, as boxman led its
+            # session) and puts the terminal back
+            assert boxman.returncode == -signal.SIGTERM
+            if _running(up):
+                os.kill(int(up.read_text()), signal.SIGTERM)
+            assert _gone_within(up, 5)
+            assert (tmp_path / "up.ended").exists()
+            line_editing = termios.tcgetattr(master)[3]
+            assert line_editing & termios.ICANON and line_editing & termios.ECHO
+        finally:
+            if boxman.poll() is None:
+                os.killpg(boxman.pid, signal.SIGKILL)
+                boxman.wait()
+            if _running(up):
+                os.kill(int(up.read_text()), signal.SIGKILL)
+            os.close(master)
+
+
+@pytest.mark.usefixtures("no_leftovers")
+class TestTheGuardianAndTheStopState:
+
+    def test_a_guardian_that_died_is_replaced(self, tmp_path):
+        """A guardian killed, or crashed, was taken for there to the end,
+        and nothing ended the commands of a boxman killed after it (#294
+        review)."""
+        import os
+        import signal
+
+        up, go, gone = tmp_path / "up", tmp_path / "go", tmp_path / "guardian-gone"
+
+        def kill_the_guardian(child):
+            for name in os.listdir("/proc"):
+                try:
+                    with open(f"/proc/{name}/stat") as stat:
+                        parent = int(stat.read().rsplit(")", 1)[1].split()[1])
+                    with open(f"/proc/{name}/cmdline", "rb") as cmdline:
+                        guardian = parent == child.pid and b"groups = set()" in cmdline.read()
+                except (OSError, ValueError, IndexError):
+                    continue
+                if guardian:
+                    os.kill(int(name), signal.SIGKILL)
+                    gone.touch()
+            go.touch()
+
+        out, err, code = _interrupt(tmp_path, f"""
+import os, sys, time
+from boxman.utils import shell
+shell.run("true", hide=True)
+open({str(tmp_path / 'ran')!r}, "w").close()
+while not os.path.exists({str(go)!r}):
+    time.sleep(0.05)
+shell.run(sys.argv[1], hide=True, warn=True)
+""", [f"{_program(_TRAPS_SIGINT, up)}; true"],
+            [_once(tmp_path / "ran", kill_the_guardian), up],
+            how=[("group", signal.SIGKILL)])
+        assert gone.exists(), err
+        assert code == -signal.SIGKILL, err
+        assert _gone_within(up, 5)
+
+    def test_a_guardian_that_could_not_start_is_tried_again_and_warned_of_once(
+            self, monkeypatch):
+        import os
+
+        from boxman import log
+        from boxman.utils import shell
+
+        warned, starts = [], []
+        real_start = shell._start_guardian
+
+        def start():
+            starts.append(True)
+            return None if len(starts) == 1 else real_start()
+
+        monkeypatch.setattr(shell, "_guardian", None)
+        monkeypatch.setattr(shell, "_guarded", set())
+        monkeypatch.setattr(shell, "_guardian_warned", False)
+        monkeypatch.setattr(shell, "_start_guardian", start)
+        monkeypatch.setattr(log, "warning", lambda message, *a, **k: warned.append(message))
+        try:
+            assert shell._live_guardian() is None
+            assert shell._live_guardian() is None or len(starts) == 2
+            pipe = shell._live_guardian()
+            assert pipe is not None and shell._guardian[0] == os.getpid()
+            assert len(warned) == 1
+        finally:
+            shell._drop_guardian()
+
+    def test_a_stop_signal_from_before_a_run_sends_its_command_no_second_sigint(
+            self, tmp_path):
+        """A SIGTERM outside any run left its mark for the next stop: with a
+        terminal, a Ctrl-C there then had the command sent a second SIGINT,
+        as if a signal had asked for the stop (#294 review)."""
+        import os
+
+        up, sleeping = tmp_path / "up", tmp_path / "sleeping"
+        out, err, code = _interrupt(tmp_path, f"""
+import sys, time
+from boxman.utils import shell
+with shell.interrupt_on_signals():
+    try:
+        open({str(sleeping)!r}, "w").close()
+        time.sleep(30)
+    except KeyboardInterrupt:
+        pass
+    try:
+        shell.run(sys.argv[1], hide=True, warn=True)
+    except KeyboardInterrupt:
+        print("STOPPED", flush=True)
+""", [_program(_TRAPS_SIGINT, up)], [sleeping, up], how=["sigterm", "terminal"],
+            env=dict(os.environ))
+        assert (out.split(), code) == (["STOPPED"], 0), err
+        assert (tmp_path / "up.sigints").read_text().splitlines() == ["SIGINT"]
 
 
 class TestNoHandlerSwallowsACtrlC:

@@ -166,7 +166,8 @@ process group, of its own, and the group is sent SIGINT, then SIGTERM after
 `STOP_TIMEOUT` (10 s), then SIGKILL after `TERM_TIMEOUT` (2 s); a further
 Ctrl-C moves on to the next signal at once. A guardian, a helper process in a
 group of its own, ends the groups boxman leaves behind if boxman is killed
-(SIGTERM, then SIGKILL). With a terminal, the command stays in boxman's
+(SIGTERM, then SIGKILL); one that died is replaced. With a terminal, the
+command stays in boxman's
 group, so that it can prompt there (sudo's password) and has the terminal's
 own SIGINT: it is not sent a second one, unless a signal other than the
 terminal's asked for the stop, and the signals go to its shell and every
@@ -185,6 +186,16 @@ inside `interrupt_on_signals(worker=True)`, and the parent stops it with
 `stop_workers()`: the SIGTERM is a Ctrl-C to the worker, which stops its
 command before it exits 130, and changes nothing if the worker had the
 terminal's Ctrl-C already.
+
+The KeyboardInterrupt reaches the main thread alone. A stop that begins sets
+a process-wide flag, and a runner on any other thread (a scan's reads on the
+`scan_pool` threads) stops its command when it sees it, and starts no more;
+code that leaves on a KeyboardInterrupt while threads of its own run
+commands calls `stop_commands()`, as `InOrder` does. The main thread clears
+the flag when it starts a command again. A program that takes over the
+terminal for the user (`boxman ssh`, `exec`, `run`) runs inside
+`default_stop_signals()`: a SIGTERM ends boxman at once, as before, and the
+program ends on its own and puts the terminal back.
 
 What the stop cannot reach: a command run through `docker exec` (the docker
 runtime) goes on inside the container, as docker passes no signal on; a
