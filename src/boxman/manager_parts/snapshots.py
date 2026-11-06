@@ -1106,11 +1106,15 @@ class SnapshotsMixin:
         guest that was running switched off. Both diagnostics survive
         when the collapse and the restart fail together.
         """
+        from boxman.providers.libvirt.session import LibVirtSession
         from boxman.providers.libvirt.snapshot import SnapshotManager
         from boxman.providers.libvirt.storage import StorageManager
 
         snapshot_mgr = SnapshotManager(provider_config)
         storage = StorageManager(provider_config)
+        # what every domain's snapshots record, asked once the collapse has
+        # dropped its snapshots: a memory image another one records stays
+        session = LibVirtSession({'provider': {'libvirt': provider_config}})
 
         if dry_run:
             # collapse_to() returns False for a target that does not
@@ -1152,7 +1156,9 @@ class SnapshotsMixin:
         collapse_error = None
         restart_error = None
         try:
-            if snapshot_mgr.collapse_to(full_vm_name, target, dry_run=False):
+            if snapshot_mgr.collapse_to(
+                    full_vm_name, target, dry_run=False,
+                    recorded_in_use=session.memory_images_recorded):
                 log.info(
                     f"collapse ok: {full_vm_name} — runs on '{target}' now; "
                     f"every other snapshot kept")

@@ -196,6 +196,13 @@ def sm() -> SnapshotManager:
     return SnapshotManager(provider_config={"use_sudo": False, "uri": "qemu:///system"})
 
 
+def _nothing_else_records() -> FilesInUse:
+    """The scan a delete asks once its snapshots are gone
+    (``LibVirtSession.memory_images_recorded``), naming nothing: no other
+    snapshot records their memory images."""
+    return FilesInUse()
+
+
 class TestInit:
 
     def test_defaults_when_no_config(self):
@@ -2546,11 +2553,13 @@ class TestDeleteSnapshot:
                 return _result(ok=False,
                                stderr="deletion of external snapshots is not supported")
             return _result()
+        scan = MagicMock()
         with patch.object(sm.virsh, "execute", side_effect=fake), \
              patch.object(sm, "_delete_external_snapshot",
                           return_value=True) as ext:
-            assert sm.delete_snapshot("vm01", "snap1") is True
-        ext.assert_called_once_with("vm01", "snap1")
+            assert sm.delete_snapshot("vm01", "snap1",
+                                      recorded_in_use=scan) is True
+        ext.assert_called_once_with("vm01", "snap1", recorded_in_use=scan)
 
     def test_the_oldest_with_snapshots_on_it_names_them_and_no_collapse(
             self, sm: SnapshotManager):
@@ -2582,23 +2591,29 @@ class TestDeleteSnapshot:
 
     def test_external_only_snapshot_uses_blockcommit(
             self, sm: SnapshotManager):
+        scan = MagicMock()
         with patch.object(sm, "_snapshot_tree", return_value={"snap1": None}), \
              patch.object(sm, "get_latest_snapshot", return_value="snap1"), \
              patch.object(sm, "_collapse_only_external_snapshot_online",
                           return_value=True) as collapse_only:
-            assert sm._delete_external_snapshot("vm01", "snap1") is True
-        collapse_only.assert_called_once_with("vm01", "snap1")
+            assert sm._delete_external_snapshot(
+                "vm01", "snap1", recorded_in_use=scan) is True
+        collapse_only.assert_called_once_with("vm01", "snap1",
+                                              recorded_in_use=scan)
 
     def test_external_most_recent_with_parent_calls_collapse_to(
             self, sm: SnapshotManager):
+        scan = MagicMock()
         with patch.object(sm, "_snapshot_tree",
                           return_value={"snap1": None, "snap2": "snap1", "snap3": "snap2"}), \
              patch.object(sm, "get_latest_snapshot", return_value="snap3"), \
              patch.object(sm, "collapse_to", return_value=True) as collapse:
             # Deleting snap3 (most-recent) collapses everything newer than
             # its parent (snap2) into the head — i.e. just drops snap3.
-            assert sm._delete_external_snapshot("vm01", "snap3") is True
-        collapse.assert_called_once_with("vm01", "snap2", dry_run=False)
+            assert sm._delete_external_snapshot(
+                "vm01", "snap3", recorded_in_use=scan) is True
+        collapse.assert_called_once_with("vm01", "snap2", dry_run=False,
+                                         recorded_in_use=scan)
 
 
 class TestDeleteOnlyExternalSnapshot:
@@ -2884,7 +2899,9 @@ class TestCollapseTo:
                           return_value=True) as strip, \
              patch.object(sm, "_memory_path_from_xml",
                           side_effect=lambda _vm, snap: str(tmp_path / f"vm01_snapshot_{snap}.raw")):
-            assert sm.collapse_to("vm01", "snap1") is True
+            assert sm.collapse_to(
+                "vm01", "snap1",
+                recorded_in_use=_nothing_else_records) is True
 
         # Rebased the head onto snap1's overlay
         rebase.assert_called_once_with(str(head), str(snap1_overlay))
@@ -3099,7 +3116,8 @@ class TestCollapseKeepsTheLiveDisk:
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs()):
-            assert sm.collapse_to("vm01", "s1") is True
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is True
 
         assert head.is_file(), "the live disk was removed"
         assert _chain(head) == [str(head), str(overlays["s1"]), str(base)]
@@ -3120,7 +3138,8 @@ class TestCollapseKeepsTheLiveDisk:
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs()):
-            assert sm.collapse_to("vm01", "s1") is True
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is True
 
         assert head.is_file(), "the live disk was removed"
         # rebased past s2, with s2's writes merged into the head
@@ -3141,7 +3160,8 @@ class TestCollapseKeepsTheLiveDisk:
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs()):
-            assert sm.delete_snapshot("vm01", "s3") is True
+            assert sm.delete_snapshot("vm01", "s3",
+                                      recorded_in_use=_nothing_else_records) is True
 
         assert head.is_file(), "the live disk was removed"
         assert _chain(head) == [str(head), str(overlays["s2"]),
@@ -3170,7 +3190,8 @@ class TestCollapseKeepsTheLiveDisk:
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs()), \
              patch.object(sm.logger, "error") as error:
-            assert sm.collapse_to("vm01", "s1") is False
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is False
 
         assert "['s2']" in str(error.call_args.args[0])
         assert overlays["s2"].exists() and memory["s2"].exists()
@@ -3202,7 +3223,8 @@ class TestCollapseKeepsTheLiveDisk:
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs()):
-            assert sm.collapse_to("vm01", "s1") is True
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is True
 
         assert head.is_file()
         assert _chain(head) == [str(head), str(overlays["s1"]), str(base)]
@@ -3240,7 +3262,8 @@ class TestCollapseKeepsTheLiveDisk:
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs(calls)):
-            assert sm.collapse_to("vm01", "s3") is True
+            assert sm.collapse_to("vm01", "s3",
+                                  recorded_in_use=_nothing_else_records) is True
 
         assert not any("qemu-img rebase" in c for c in calls)
         assert head.is_file()
@@ -3272,7 +3295,8 @@ class TestCollapseKeepsTheLiveDisk:
              patch.object(sm.virsh, "execute_shell", side_effect=shell), \
              patch.object(sm, "_qemu_img_rebase",
                           return_value=True) as rebase:
-            assert sm.collapse_to("vm01", "s1") is True
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is True
 
         rebase.assert_called_once_with(str(head), str(overlays["s1"]))
 
@@ -3311,7 +3335,8 @@ class TestCollapseKeepsTheLiveDisk:
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs(calls)):
-            assert sm.collapse_to("vm01", "s3") is True
+            assert sm.collapse_to("vm01", "s3",
+                                  recorded_in_use=_nothing_else_records) is True
 
         assert not any("qemu-img rebase" in c for c in calls)
         assert _chain(s3) == [str(s3), str(reverted), str(base)]
@@ -3352,7 +3377,8 @@ class TestCollapseKeepsTheLiveDisk:
              patch.object(sm.virsh, "execute_shell", side_effect=shell), \
              patch.object(sm, "_qemu_img_rebase",
                           return_value=True) as rebase:
-            assert sm.collapse_to("vm01", "s1") is False
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is False
 
         rebase.assert_not_called()
         assert all(p.exists() for p in [*overlays.values(), *data.values()])
@@ -3453,7 +3479,8 @@ class TestCollapseKeepsTheLiveDisk:
              patch.object(sm.virsh, "execute_shell", side_effect=shell), \
              patch.object(sm, "_qemu_img_rebase",
                           return_value=True) as rebase:
-            assert sm.collapse_to("vm01", "s1") is False
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is False
 
         rebase.assert_not_called()
         assert all(p.exists() for p in overlays.values())
@@ -3475,7 +3502,8 @@ class TestCollapseKeepsTheLiveDisk:
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs()):
-            assert sm.collapse_to("vm01", "s1") is False
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is False
 
         assert _chain(head) == [str(head), str(base)]
         assert all(p.exists() for p in overlays.values())
@@ -3512,7 +3540,8 @@ class TestCollapseKeepsTheLiveDisk:
                           side_effect=_shell_that_runs()), \
              patch.object(sm.logger, "info") as info:
             assert sm.collapse_to("vm01", "s1", dry_run=True) is True
-            assert sm.collapse_to("vm01", "s1") is True
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is True
 
         assert any(f"would rebase {head} onto {base}" in str(c.args[0])
                    for c in info.call_args_list)
@@ -3580,7 +3609,8 @@ class TestCollapseKeepsTheLiveDisk:
                           side_effect=_shell_that_runs()), \
              patch.object(sm, "_qemu_img_rebase", return_value=True), \
              patch.object(sm.logger, "info") as info:
-            assert sm.collapse_to("vm01", "s1") is True
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is True
 
         assert taken_on.is_file()
         assert any("builds on it" in str(c.args[0])
@@ -3623,7 +3653,8 @@ class TestCollapseKeepsTheLiveDisk:
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs()), \
              patch.object(sm, "_qemu_img_rebase", return_value=True):
-            assert sm.collapse_to("vm01", "s1") is True
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is True
 
         assert overlays["s2"].is_file(), "the live disk was removed"
         assert not memory["s2"].exists()
@@ -3647,7 +3678,8 @@ class TestCollapseKeepsTheLiveDisk:
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs()), \
              patch.object(sm, "_qemu_img_rebase", return_value=True):
-            assert sm.collapse_to("vm01", "s1") is True
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is True
 
         assert overlays["s1"].is_file()
         assert head.is_file()
@@ -3677,7 +3709,8 @@ class TestCollapseKeepsTheLiveDisk:
              patch.object(sm, "_qemu_img_rebase", return_value=True), \
              patch.object(sm.logger, "warning") as warning, \
              patch("os.stat", side_effect=stat):
-            assert sm.collapse_to("vm01", "s1") is True
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is True
 
         assert overlays["s2"].is_file(), "the live disk was removed"
         warned = " ".join(str(c.args[0]) for c in warning.call_args_list)
@@ -3721,7 +3754,8 @@ class TestCollapseKeepsTheLiveDisk:
              patch.object(sm, "_qemu_img_rebase", return_value=True), \
              patch.object(sm.logger, "warning") as warning, \
              patch("os.stat", side_effect=stat):
-            assert sm.collapse_to("vm01", "s1") is True
+            assert sm.collapse_to("vm01", "s1",
+                                  recorded_in_use=_nothing_else_records) is True
 
         assert overlays["s1"].is_file(), "what the head stands on was removed"
         warned = " ".join(str(c.args[0]) for c in warning.call_args_list)
@@ -3903,11 +3937,16 @@ class _RevertingLibvirt:
       Either way its children become its parent's, the parent's
       ``<revertDisks>``, if it has any, become its ``<disks>``
       (``qemuSnapshotDeleteUpdateParent``), and a current one leaves its
-      parent current (``qemuSnapshotDiscardMetadata``). With
-      :attr:`native_delete` off it refuses external snapshots, as libvirt
-      before 9.0 did, and ``blockcommit`` is run;
-    * a take of the running VM saves its memory in the workdir, and the
-      snapshot records that file; one of the shut-off VM records none;
+      parent current (``qemuSnapshotDiscardMetadata``). It unlinks the
+      memory file the snapshot records, and not the ``.raw.zst`` that
+      ``--compress-memory`` leaves in its place, which it does not know of
+      (measured on libvirt 10.10, #274). With :attr:`native_delete` off it
+      refuses external snapshots, as libvirt before 9.0 did, and
+      ``blockcommit`` is run; with :attr:`fail_delete` or
+      :attr:`fail_metadata_delete` the delete fails with that error;
+    * a take of the running VM saves its memory where ``--memspec`` says,
+      in the workdir when the double is driven by hand, and the snapshot
+      records that file; one of the shut-off VM records none;
     * ``define`` sets the persistent definition's disks, and
       ``qemu-img rebase`` the chain in :attr:`backing`, as a collapse does;
     * QMP ``query-block`` tells what qemu holds in the drive
@@ -3965,6 +4004,9 @@ class _RevertingLibvirt:
         #: (target, the overlay, the image it was committed into)
         self.commits: list[tuple] = []
         self.native_delete = True
+        #: the error its own delete, or a ``--metadata`` one, fails with
+        self.fail_delete = None
+        self.fail_metadata_delete = None
         #: what qemu holds in sda, None for an empty drive
         self.medium: str | None = self.iso
         self.fail_after_removal = None
@@ -3976,11 +4018,12 @@ class _RevertingLibvirt:
 
     # --- what boxman did before -------------------------------------------
 
-    def take(self, name: str) -> None:
+    def take(self, name: str, memory: str | None = None) -> None:
         """``snapshot take``: the CDROM left out (``snapshot=no``), every
         other disk on a new overlay, named as libvirt names it, beside the
         disk or in :attr:`disk_dir`; the domain saved as it is now, and
-        disk-only when it is shut off. The current snapshot's
+        disk-only when it is shut off, else its memory in *memory* (the
+        ``--memspec`` file) or the workdir. The current snapshot's
         ``<revertDisks>`` are cleared first, as libvirt clears them."""
         saved = dict(self.live if self.active else self.config)
         disks: dict[str, str | None] = {}
@@ -3996,10 +4039,11 @@ class _RevertingLibvirt:
             disks[target] = overlay
         if self.current in self.snapshots:
             self.snapshots[self.current]["revert_disks"] = None
-        memory = None
         if self.active:
-            memory = str(self.workdir / f"vm01_snapshot_{name}.raw")
+            memory = memory or str(self.workdir / f"vm01_snapshot_{name}.raw")
             Path(memory).write_bytes(f"{name}'s memory".encode())
+        else:
+            memory = None
         self.snapshots[name] = {
             "parent": self.current, "disks": disks, "revert_disks": None,
             "domain": saved, "memory": memory,
@@ -4030,6 +4074,35 @@ class _RevertingLibvirt:
         for path in others:
             used[path] = "other01"
         return used
+
+    def compress(self, name: str) -> str:
+        """What ``--compress-memory`` leaves of snapshot *name*'s memory:
+        the ``.raw.zst``, the ``.raw`` gone, the record unchanged."""
+        raw = Path(self.snapshots[name]["memory"])
+        zst = Path(f"{raw}.zst")
+        zst.write_bytes(b"zstd " + raw.read_bytes())
+        raw.unlink()
+        return str(zst)
+
+    def recorded(self, others=None) -> FilesInUse:
+        """``memory_images_recorded``: the memory image each snapshot
+        records, with the ``.raw.zst`` beside it, by resolved path and by
+        identity, as the scan of every domain maps them -- and *others*,
+        ``{path: domain}``, what another domain's snapshots record."""
+        recorded = FilesInUse()
+        mine = [(path, self.VM) for snap in self.snapshots.values()
+                if snap.get("memory")
+                for path in (snap["memory"], f"{snap['memory']}.zst")]
+        for path, domain in [*mine, *(others or {}).items()]:
+            recorded.setdefault(os.path.realpath(path), domain)
+            if os.path.exists(path):
+                st = os.stat(path)
+                recorded.identities.setdefault((st.st_dev, st.st_ino), domain)
+        return recorded
+
+    def memory_files(self) -> list[str]:
+        """Every memory image under :attr:`root`, either form."""
+        return sorted(str(p) for p in self.root.rglob("*_snapshot_*.raw*"))
 
     # --- qemu-img -----------------------------------------------------------
 
@@ -4171,7 +4244,9 @@ class _RevertingLibvirt:
         if verb == "snapshot-create-as":
             if self.fail_take:
                 return _result(ok=False, stderr=self.fail_take)
-            self.take(args[args.index("--name") + 1])
+            memspec = next((a.split("=", 1)[1] for a in args
+                            if a.startswith("--memspec=")), None)
+            self.take(args[args.index("--name") + 1], memory=memspec)
             return _result()
         if verb == "qemu-monitor-command" and "query-block" in args[2]:
             inserted = {"inserted": {"file": self.medium}} if self.medium else {}
@@ -4304,6 +4379,10 @@ class _RevertingLibvirt:
         snap = self.snapshots[name]
         children = [n for n, s in self.snapshots.items() if s["parent"] == name]
         records = {t: p for t, p in snap["disks"].items() if p}
+        if not metadata and self.fail_delete:
+            return _result(ok=False, stderr=self.fail_delete)
+        if metadata and self.fail_metadata_delete:
+            return _result(ok=False, stderr=self.fail_metadata_delete)
         if not metadata and not self.native_delete:
             return _result(ok=False, stderr=(
                 "error: unsupported configuration: deletion of 1 "
@@ -4345,6 +4424,9 @@ class _RevertingLibvirt:
             for target in records:
                 if self._records_disk_above(name, target):
                     Path(snap["domain"][target]).unlink(missing_ok=True)
+        if not metadata and snap.get("memory"):
+            # the file the record names; a .raw.zst beside it is not one
+            Path(snap["memory"]).unlink(missing_ok=True)
         for child in children:
             self.snapshots[child]["parent"] = snap["parent"]
         parent = self.snapshots.get(snap["parent"])
@@ -5346,7 +5428,8 @@ class TestACollapseInASnapshotTree:
         with execute, shell, \
              patch.object(sm.logger, "error") as error, \
              patch.object(sm.logger, "info") as info:
-            done = sm.collapse_to(vm.VM, target, dry_run=dry_run)
+            done = sm.collapse_to(vm.VM, target, dry_run=dry_run,
+                                  recorded_in_use=vm.recorded)
         return (done, " ".join(str(c.args[0]) for c in error.call_args_list),
                 [str(c.args[0]) for c in info.call_args_list])
 
@@ -5354,7 +5437,7 @@ class TestACollapseInASnapshotTree:
     def _delete(sm, vm, name):
         execute, shell = _restoring(sm, vm)
         with execute, shell, patch.object(sm.logger, "error") as error:
-            done = sm.delete_snapshot(vm.VM, name)
+            done = sm.delete_snapshot(vm.VM, name, recorded_in_use=vm.recorded)
         return done, " ".join(str(c.args[0]) for c in error.call_args_list)
 
     @staticmethod
@@ -5620,6 +5703,358 @@ class TestACollapseInASnapshotTree:
         assert all(p.exists() for p in [*overlays.values(), *memory.values()])
 
 
+class TestADeleteTakesItsCompressedMemoryImageWithIt:
+    """#274: ``--compress-memory`` leaves a snapshot's memory image as a
+    ``.raw.zst`` in place of the ``.raw`` libvirt records, which libvirt
+    does not know of. Its own delete unlinks the ``.raw`` alone, and boxman
+    returned as soon as that delete went through: the ``.raw.zst`` stayed
+    until ``destroy``. Every delete -- libvirt's own, boxman's blockcommit,
+    the collapse it falls back to, a collapse that drops snapshots, and
+    ``take --force`` -- now removes the image in both forms, from wherever
+    the snapshot recorded it, once no other snapshot, of this domain or
+    another, records it (#253). What cannot be told is kept, and named."""
+
+    REPLICA = "vm01_snapshot_replica"
+
+    @staticmethod
+    def _vm(tmp_path, where="workdir", **kw):
+        """The double, and where its memory images go: the workdir, or a
+        memory_snapshot_dir outside it."""
+        vm = _RevertingLibvirt(tmp_path, **kw)
+        if where == "workdir":
+            return vm, vm.workdir
+        memory_dir = tmp_path / "memory-snapshots"
+        memory_dir.mkdir()
+        return vm, memory_dir
+
+    @staticmethod
+    def _takes(vm, memory_dir, *names, compressed=()):
+        for name in names:
+            vm.take(name, memory=str(memory_dir / f"vm01_snapshot_{name}.raw"))
+            if name in compressed:
+                vm.compress(name)
+
+    @staticmethod
+    def _delete(sm, vm, name, recorded_in_use=None):
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, patch.object(sm.logger, "warning") as warning:
+            done = sm.delete_snapshot(
+                vm.VM, name, recorded_in_use=recorded_in_use or vm.recorded)
+        return done, " ".join(str(c.args[0]) for c in warning.call_args_list)
+
+    @staticmethod
+    def _collapse(sm, vm, target, recorded_in_use=None):
+        """``collapse_to`` with the VM shut down first, as the manager does."""
+        vm.active = False
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, patch.object(sm.logger, "warning") as warning:
+            done = sm.collapse_to(
+                vm.VM, target, recorded_in_use=recorded_in_use or vm.recorded)
+        return done, " ".join(str(c.args[0]) for c in warning.call_args_list)
+
+    # --- libvirt's own delete -------------------------------------------------
+
+    @pytest.mark.parametrize("where", ["workdir", "memory_snapshot_dir"])
+    def test_deleting_newest_first_leaves_no_memory_image(
+            self, sm, tmp_path, where):
+        """The issue's sequence: take s1, s2 --compress-memory, s3, then
+        delete s3, s2 and s1. s2's ``.raw.zst`` was left behind."""
+        vm, memory_dir = self._vm(tmp_path, where)
+        self._takes(vm, memory_dir, "s1", "s2", "s3", compressed=["s2"])
+        assert [os.path.dirname(p) for p in vm.memory_files()] == [
+            str(memory_dir)] * 3
+
+        for name in ("s3", "s2", "s1"):
+            assert self._delete(sm, vm, name)[0] is True, name
+
+        assert vm.snapshots == {}
+        assert vm.memory_files() == []
+
+    def test_one_another_domains_snapshot_records_is_kept_and_named(
+            self, sm, tmp_path):
+        """#253: vm01's snapshot ``replica_snapshot_s1`` and ``s1`` of
+        ``vm01_snapshot_replica`` name one file where their images share a
+        directory."""
+        vm, memory_dir = self._vm(tmp_path, "memory_snapshot_dir")
+        self._takes(vm, memory_dir, "s1", compressed=["s1"])
+        [zst] = vm.memory_files()
+
+        done, warned = self._delete(
+            sm, vm, "s1", lambda: vm.recorded({zst: self.REPLICA}))
+
+        assert done is True and "s1" not in vm.snapshots
+        assert vm.memory_files() == [zst]
+        assert (f"not removing {zst}, the memory image of deleted snapshot "
+                f"'s1' of vm01: a snapshot of domain {self.REPLICA} still "
+                f"records it") in warned
+
+    def test_one_recorded_under_another_name_is_kept(self, sm, tmp_path):
+        vm, memory_dir = self._vm(tmp_path)
+        self._takes(vm, memory_dir, "s1", compressed=["s1"])
+        [zst] = vm.memory_files()
+        other = tmp_path / "elsewhere" / "replica_s1.raw.zst"
+        other.parent.mkdir()
+        os.link(zst, other)
+
+        done, warned = self._delete(
+            sm, vm, "s1", lambda: vm.recorded({str(other): "vm02"}))
+
+        assert done is True
+        assert os.path.exists(zst)
+        assert "a snapshot of domain vm02 still records it, under another " \
+               "name" in warned
+
+    @pytest.mark.parametrize("scan", [
+        lambda: None,
+        MagicMock(side_effect=RuntimeError("virsh went away")),
+    ], ids=["records-unread", "scan-raises"])
+    def test_with_the_records_unknown_it_is_kept_and_named(
+            self, sm, tmp_path, scan):
+        vm, memory_dir = self._vm(tmp_path)
+        self._takes(vm, memory_dir, "s1", compressed=["s1"])
+        [zst] = vm.memory_files()
+
+        done, warned = self._delete(sm, vm, "s1", scan)
+
+        assert done is True
+        assert vm.memory_files() == [zst]
+        assert f"not removing {zst}" in warned
+        assert "whether another snapshot records it could not be checked" \
+            in warned
+
+    def test_without_a_scan_it_is_kept(self, sm, tmp_path):
+        vm, memory_dir = self._vm(tmp_path)
+        self._takes(vm, memory_dir, "s1", compressed=["s1"])
+        [zst] = vm.memory_files()
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            assert sm.delete_snapshot(vm.VM, "s1") is True
+
+        assert vm.memory_files() == [zst]
+
+    def test_a_delete_libvirt_fails_removes_nothing(self, sm, tmp_path):
+        """In libvirt 10.10's words, on the snapshot a collapse left."""
+        vm, memory_dir = self._vm(tmp_path)
+        self._takes(vm, memory_dir, "s1", "s2", compressed=["s1", "s2"])
+        held = vm.memory_files()
+        vm.fail_delete = (
+            "error: Failed to delete snapshot s2\nerror: operation failed: "
+            "snapshot VM disk source and parent disk source are not the same")
+        scan = MagicMock(side_effect=vm.recorded)
+
+        assert self._delete(sm, vm, "s2", scan)[0] is False
+
+        assert sorted(vm.snapshots) == ["s1", "s2"]
+        assert vm.memory_files() == held
+        scan.assert_not_called()
+
+    def test_a_delete_boxman_refuses_removes_nothing(self, sm, tmp_path):
+        """libvirt before 9.0 refuses s2, with s3 built on it, and so does
+        boxman."""
+        vm, memory_dir = self._vm(tmp_path)
+        self._takes(vm, memory_dir, "s1", "s2", "s3", compressed=["s2"])
+        held = vm.memory_files()
+        vm.native_delete = False
+        scan = MagicMock(side_effect=vm.recorded)
+
+        assert self._delete(sm, vm, "s2", scan)[0] is False
+
+        assert vm.memory_files() == held
+        scan.assert_not_called()
+
+    def test_a_disk_only_snapshot_has_none_and_asks_nothing(
+            self, sm, tmp_path):
+        vm, memory_dir = self._vm(tmp_path, state="shutoff")
+        self._takes(vm, memory_dir, "s1")
+        assert vm.snapshots["s1"]["memory"] is None
+        scan = MagicMock(side_effect=vm.recorded)
+
+        assert self._delete(sm, vm, "s1", scan)[0] is True
+
+        scan.assert_not_called()
+
+    # --- boxman's blockcommit, and the collapse a delete falls back to ------
+
+    @pytest.mark.parametrize("where", ["workdir", "memory_snapshot_dir"])
+    def test_boxmans_blockcommit_removes_both_forms(self, sm, tmp_path, where):
+        """The only snapshot, which libvirt before 9.0 refuses to delete:
+        boxman commits it into the base, and its memory image goes once
+        its record has, the ``.raw`` a revert left beside the ``.raw.zst``
+        too."""
+        vm, memory_dir = self._vm(tmp_path, where)
+        self._takes(vm, memory_dir, "s1", compressed=["s1"])
+        raw = vm.snapshots["s1"]["memory"]
+        Path(raw).write_bytes(b"decompressed for a revert")
+        vm.native_delete = False
+
+        assert self._delete(sm, vm, "s1")[0] is True
+
+        assert [t for t, _o, _b in vm.commits] == ["vda"]
+        assert vm.snapshots == {} and vm.memory_files() == []
+
+    def test_boxmans_blockcommit_keeps_one_another_snapshot_records(
+            self, sm, tmp_path):
+        vm, memory_dir = self._vm(tmp_path)
+        self._takes(vm, memory_dir, "s1", compressed=["s1"])
+        [zst] = vm.memory_files()
+        vm.native_delete = False
+
+        done, warned = self._delete(
+            sm, vm, "s1", lambda: vm.recorded({zst: self.REPLICA}))
+
+        assert done is True and vm.snapshots == {}
+        assert vm.memory_files() == [zst]
+        assert f"a snapshot of domain {self.REPLICA} still records it" in warned
+
+    def test_boxmans_blockcommit_keeps_it_while_the_record_stays(
+            self, sm, tmp_path):
+        """The metadata delete that ends the blockcommit fails: the
+        snapshot still records its memory image, which stays."""
+        vm, memory_dir = self._vm(tmp_path)
+        self._takes(vm, memory_dir, "s1", compressed=["s1"])
+        [zst] = vm.memory_files()
+        vm.native_delete = False
+        vm.fail_metadata_delete = "error: failed to remove snapshot metadata"
+
+        done, warned = self._delete(sm, vm, "s1")
+
+        assert done is True and "s1" in vm.snapshots
+        assert vm.memory_files() == [zst]
+        assert "its memory image is kept" in warned
+
+    @pytest.mark.parametrize("where", ["workdir", "memory_snapshot_dir"])
+    def test_the_collapse_a_delete_falls_back_to_removes_it(
+            self, sm, tmp_path, where):
+        """libvirt before 9.0 refuses to delete s2, the current one, built
+        on s1: boxman collapses it onto s1."""
+        vm, memory_dir = self._vm(tmp_path, where)
+        self._takes(vm, memory_dir, "s1", "s2", compressed=["s1", "s2"])
+        s1_zst = f"{vm.snapshots['s1']['memory']}.zst"
+        vm.native_delete = False
+
+        assert self._delete(sm, vm, "s2")[0] is True
+
+        assert sorted(vm.snapshots) == ["s1"]
+        assert vm.memory_files() == [s1_zst]
+
+    def test_the_collapse_a_delete_falls_back_to_keeps_one_recorded(
+            self, sm, tmp_path):
+        vm, memory_dir = self._vm(tmp_path)
+        self._takes(vm, memory_dir, "s1", "s2", compressed=["s2"])
+        s2_zst = f"{vm.snapshots['s2']['memory']}.zst"
+        vm.native_delete = False
+
+        done, warned = self._delete(
+            sm, vm, "s2", lambda: vm.recorded({s2_zst: self.REPLICA}))
+
+        assert done is True and sorted(vm.snapshots) == ["s1"]
+        assert os.path.exists(s2_zst)
+        assert f"a snapshot of domain {self.REPLICA} still records it" in warned
+
+    # --- a collapse that drops snapshots ------------------------------------
+
+    def test_a_collapse_removes_each_it_drops_but_one_recorded_elsewhere(
+            self, sm, tmp_path):
+        vm, memory_dir = self._vm(tmp_path, "memory_snapshot_dir")
+        self._takes(vm, memory_dir, "s1", "s2", "s3", compressed=["s2", "s3"])
+        s1_raw = vm.snapshots["s1"]["memory"]
+        s3_zst = f"{vm.snapshots['s3']['memory']}.zst"
+
+        done, warned = self._collapse(
+            sm, vm, "s1", lambda: vm.recorded({s3_zst: self.REPLICA}))
+
+        assert done is True and sorted(vm.snapshots) == ["s1"]
+        assert vm.memory_files() == sorted([s1_raw, s3_zst])
+        assert (f"not removing {s3_zst}, the memory image of deleted "
+                f"snapshot 's3'") in warned
+
+    def test_a_collapse_keeps_the_image_of_one_whose_record_stays(
+            self, sm, tmp_path):
+        vm, memory_dir = self._vm(tmp_path)
+        self._takes(vm, memory_dir, "s1", "s2", compressed=["s2"])
+        held = vm.memory_files()
+        vm.fail_metadata_delete = "error: failed to remove snapshot metadata"
+
+        done, warned = self._collapse(sm, vm, "s1")
+
+        assert done is True and "s2" in vm.snapshots
+        assert vm.memory_files() == held
+        assert "its memory image is kept" in warned
+
+    def test_a_collapse_with_the_records_unknown_keeps_what_it_drops(
+            self, sm, tmp_path):
+        vm, memory_dir = self._vm(tmp_path)
+        self._takes(vm, memory_dir, "s1", "s2", compressed=["s2"])
+        held = vm.memory_files()
+
+        done, warned = self._collapse(sm, vm, "s1", lambda: None)
+
+        assert done is True and sorted(vm.snapshots) == ["s1"]
+        assert vm.memory_files() == held
+        assert "could not be checked" in warned
+
+    # --- take --force ---------------------------------------------------------
+
+    def test_take_force_removes_it_where_the_snapshot_recorded_it(
+            self, sm, tmp_path):
+        """The memory_snapshot_dir changed since s1 was taken: --force
+        deletes s1, whose ``.raw.zst`` neither libvirt's delete nor the
+        leftover clear, which looks in the new directory, removed."""
+        vm, old = self._vm(tmp_path, "memory_snapshot_dir")
+        new = tmp_path / "new-memory-snapshots"
+        new.mkdir()
+        self._takes(vm, old, "s1", compressed=["s1"])
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            assert sm.create_snapshot(
+                vm.VM, str(new), "s1", "again", force=True,
+                paths_in_use=vm.in_use, recorded_in_use=vm.recorded) is True
+
+        assert vm.memory_files() == [str(new / "vm01_snapshot_s1.raw")]
+
+    def test_take_force_keeps_one_another_snapshot_records_and_refuses(
+            self, sm, tmp_path):
+        """The retake would write its image where another domain's snapshot
+        records one: the image stays, and the take is refused."""
+        vm, memory_dir = self._vm(tmp_path)
+        self._takes(vm, memory_dir, "s1", compressed=["s1"])
+        [zst] = vm.memory_files()
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, patch.object(sm.logger, "error") as error:
+            assert sm.create_snapshot(
+                vm.VM, str(memory_dir), "s1", "again", force=True,
+                paths_in_use=vm.in_use,
+                recorded_in_use=lambda: vm.recorded(
+                    {zst: self.REPLICA})) is False
+
+        assert vm.memory_files() == [zst]
+        assert f"a snapshot of domain {self.REPLICA} records it" in " ".join(
+            str(c.args[0]) for c in error.call_args_list)
+
+    # --- the session hands each its scan -------------------------------------
+
+    def test_the_session_hands_the_delete_and_the_collapse_its_scan(self):
+        session = LibVirtSession(
+            config={'provider': {'libvirt': {'virsh_cmd': 'false'}}})
+        with patch.object(SnapshotManager, "delete_snapshot",
+                          return_value=True) as delete, \
+             patch.object(SnapshotManager, "collapse_to",
+                          return_value=True) as collapse:
+            session.snapshot_delete("vm01", "s1")
+            session.snapshot_collapse("vm01", "s1")
+
+        for call in (delete.call_args, collapse.call_args):
+            assert call.kwargs["recorded_in_use"] == (
+                session.memory_images_recorded)
+        with patch.object(session, "snapshot_files_in_use",
+                          return_value="scan") as scan:
+            assert session.memory_images_recorded() == "scan"
+        scan.assert_called_once_with(overlays_too=False)
+
+
 class TestFlattenCdromOverlays:
     """Before a take, a CDROM left on an overlay of its ISO goes back on the
     ISO, the way a restore puts it back (#273): through update-device with
@@ -5883,13 +6318,16 @@ class TestForceClearForRetake:
 
     def test_live_snapshot_deleted_first(self, sm: SnapshotManager,
                                          tmp_path: Path):
+        """... handed the scan of what other snapshots record, which the
+        delete asks before it removes the memory image (#274)."""
+        scan = MagicMock(return_value=FilesInUse())
         with patch.object(sm.virsh, "execute", return_value=_result(ok=True)), \
              patch.object(sm, "delete_snapshot", return_value=True) as dele, \
              patch.object(sm, "_data_disk_targets", return_value=[]), \
              patch.object(sm.virsh, "execute_shell", return_value=_result()):
             assert sm._force_clear_for_retake(
-                "vm01", str(tmp_path), "snapX") is True
-        dele.assert_called_once_with("vm01", "snapX")
+                "vm01", str(tmp_path), "snapX", recorded_in_use=scan) is True
+        dele.assert_called_once_with("vm01", "snapX", recorded_in_use=scan)
 
     def test_live_snapshot_delete_failure_aborts(self, sm: SnapshotManager,
                                                  tmp_path: Path):

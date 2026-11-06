@@ -13,12 +13,13 @@ Three separate defects are pinned here:
   on a misspelled snapshot name, the one thing it is asked to check.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 
 from boxman.exceptions import SnapshotError
 from boxman.manager_parts.snapshots import SnapshotsMixin
+from boxman.providers.libvirt.session import LibVirtSession
 
 pytestmark = pytest.mark.unit
 
@@ -196,7 +197,23 @@ class TestCollapseWorkerRefusesBeforeTheShutdown:
 
         snapshot_mgr.collapse_drops.assert_called_once_with("vm1", "snap1")
         snapshot_mgr.collapse_to.assert_called_once_with(
-            "vm1", "snap1", dry_run=False)
+            "vm1", "snap1", dry_run=False, recorded_in_use=ANY)
+
+    def test_the_collapse_asks_what_every_domains_snapshots_record(
+            self, managers):
+        """A dropped snapshot's memory image stays where another snapshot
+        records it (#253, #274): the worker hands the collapse the session's
+        scan, built on the same provider config."""
+        snapshot_mgr, storage = managers
+        storage.is_running.return_value = False
+        snapshot_mgr.collapse_drops.return_value = ["snap2"]
+        snapshot_mgr.collapse_to.return_value = True
+
+        _collapse(provider_config={"uri": "qemu:///system"})
+
+        scan = snapshot_mgr.collapse_to.call_args.kwargs["recorded_in_use"]
+        assert scan.__func__ is LibVirtSession.memory_images_recorded
+        assert scan.__self__.provider_config == {"uri": "qemu:///system"}
 
 
 class TestCollapseWorkerDryRun:

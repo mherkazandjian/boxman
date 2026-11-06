@@ -439,7 +439,7 @@ class TestForceKeepsWhatItCannotReplace:
         domain = _Retaking(own, {"s2": own})
         scan = MagicMock(return_value=None)
 
-        def delete(_vm, _name):
+        def delete(_vm, _name, **_kw):
             own.unlink()                    # libvirt's delete merges it away
             return True
 
@@ -450,7 +450,7 @@ class TestForceKeepsWhatItCannotReplace:
                 recorded_in_use=scan, disk_dir=str(overlays))
 
         assert ok is True
-        deleted.assert_called_once_with(VM, "s2")
+        deleted.assert_called_once_with(VM, "s2", recorded_in_use=scan)
         scan.assert_not_called()
 
 

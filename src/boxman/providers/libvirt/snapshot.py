@@ -1253,7 +1253,11 @@ class SnapshotManager:
             self.logger.info(
                 f"--force: removing existing snapshot '{snapshot_name}' on "
                 f"{vm_name} before re-taking")
-            if not self.delete_snapshot(vm_name, snapshot_name):
+            # its memory image goes with it, wherever it was recorded -- a
+            # memory_snapshot_dir set otherwise since, say -- unless another
+            # snapshot records it, which the leftover check below refuses
+            if not self.delete_snapshot(vm_name, snapshot_name,
+                                        recorded_in_use=recorded_in_use):
                 self.logger.error(
                     f"--force: could not remove existing snapshot "
                     f"'{snapshot_name}' on {vm_name}; refusing to overwrite")
@@ -1383,15 +1387,20 @@ class SnapshotManager:
             "snapshot-dumpxml", vm_name, snapshot_name, warn=True)
         if not result.ok:
             return None
+        return self._memory_file_in(result.stdout)
+
+    @staticmethod
+    def _memory_file_in(xml_text: str | None) -> str | None:
+        """The memory file a snapshot's XML records, or None: a disk-only
+        snapshot records none, and XML that does not parse names none."""
         try:
-            root = ET.fromstring(result.stdout)
+            root = ET.fromstring(xml_text or "")
         except ET.ParseError:
             return None
         memory_elem = root.find("memory")
         if memory_elem is None:
             return None
-        path = memory_elem.get("file")
-        return path or None
+        return memory_elem.get("file") or None
 
     def memory_images(self, vm_name: str) -> dict[str, str] | None:
         """
@@ -3177,9 +3186,116 @@ class SnapshotManager:
             self.logger.warning(
                 f"could not re-compress memory file after revert: {mem_path}")
 
-    def delete_snapshot(self, vm_name: str, snapshot_name: str) -> bool:
+    def _remove_memory_images(self, vm_name: str,
+                              images: dict[str, str | None],
+                              recorded_in_use=None) -> None:
         """
-        Delete a snapshot.
+        Remove the memory image of each snapshot in *images* -- ``{snapshot:
+        the memory file it recorded}``, read before it was deleted -- in both
+        forms: the ``.raw`` libvirt records, and the ``.raw.zst`` that
+        ``--compress-memory`` leaves in its place, which libvirt does not
+        know of (#274). From wherever the snapshot recorded it: a
+        memory_snapshot_dir, or the workdir. A disk-only snapshot recorded
+        none, and has none to remove.
+
+        Asked only once those snapshots are deleted, and only for the ones
+        whose delete went through: a delete that fails removes nothing.
+
+        Not an image another snapshot still records, of this domain or of
+        another (#253): VM ``v``'s snapshot ``r_snapshot_s1`` and ``s1`` of
+        VM ``v_snapshot_r`` name one file where their images share a
+        directory. *recorded_in_use*
+        (``LibVirtSession.memory_images_recorded``) maps what every domain's
+        snapshots record, by resolved path and by identity; asked after the
+        delete, it no longer counts the deleted one. Fails closed: with no
+        scan, a scan that fails, or a file that cannot be inspected, the
+        image is kept and a warning names it.
+        """
+        # {snapshot: (image, {file there: its identity, or None}, why kept)}
+        found: dict[str, tuple] = {}
+        for snap, image in images.items():
+            if not image:
+                continue
+            files: dict[str, tuple[int, int] | None] = {}
+            why = None
+            for path in (image, f"{image}.zst"):
+                try:
+                    st = os.stat(path)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    files[path] = None
+                    why = why or f"{path} could not be inspected ({exc})"
+                    continue
+                if stat.S_ISREG(st.st_mode):
+                    files[path] = (st.st_dev, st.st_ino)
+            if files:
+                found[snap] = (image, files, why)
+        if not found:
+            return
+
+        try:
+            recorded = (recorded_in_use() if recorded_in_use is not None
+                        else None)
+        except Exception as exc:
+            self.logger.warning(
+                f"the check of what other snapshots record failed on "
+                f"{vm_name} ({type(exc).__name__}: {exc})")
+            recorded = None
+
+        for snap, (image, files, why) in found.items():
+            why = why or self._why_a_memory_image_stays(image, files, recorded)
+            if why:
+                self.logger.warning(
+                    f"not removing {', '.join(files)}, the memory image of "
+                    f"deleted snapshot '{snap}' of {vm_name}: {why}. Remove "
+                    f"it by hand once no snapshot records it.")
+                continue
+            for path in files:
+                result = self.virsh.execute_shell(
+                    f"rm -f -- {shlex.quote(path)}", warn=True)
+                if result.ok:
+                    self.logger.info(
+                        f"removed {path}, the memory image of deleted "
+                        f"snapshot '{snap}' of {vm_name}")
+                else:
+                    self.logger.warning(
+                        f"could not remove {path}, the memory image of "
+                        f"deleted snapshot '{snap}' of {vm_name}: "
+                        f"{(result.stderr or '').strip()}")
+
+    @staticmethod
+    def _why_a_memory_image_stays(image: str, files: dict,
+                                  recorded) -> str | None:
+        """
+        Why the memory image *image* -- *files*, its forms there, each with
+        its identity -- has to stay: *recorded*, the scan of what every
+        domain's snapshots record, cannot tell (None), or names it, by
+        resolved path (a recorded image counts with its ``.raw.zst``) or by
+        identity (one file under another name). None when nothing does.
+        """
+        if recorded is None:
+            return "whether another snapshot records it could not be checked"
+        for path in (image, f"{image}.zst"):
+            domain = recorded.get(os.path.realpath(path))
+            if domain:
+                return f"a snapshot of domain {domain} still records it"
+        identities = getattr(recorded, "identities", {})
+        for identity in files.values():
+            domain = identities.get(identity)
+            if domain:
+                return (f"a snapshot of domain {domain} still records it, "
+                        f"under another name")
+        return None
+
+    def delete_snapshot(self, vm_name: str, snapshot_name: str,
+                        recorded_in_use=None) -> bool:
+        """
+        Delete a snapshot, and then its memory image, in both forms, unless
+        another snapshot records it (:meth:`_remove_memory_images`, asking
+        *recorded_in_use*): libvirt's own delete removes the ``.raw`` its
+        record names and leaves the ``.raw.zst`` that ``--compress-memory``
+        put in its place (#274).
 
         Internal (libvirt-native) snapshots are removed by ``virsh
         snapshot-delete`` directly. External snapshots — which is what
@@ -3241,11 +3357,17 @@ class SnapshotManager:
                 f"rewritten")
             return False
 
+        # read before the delete, which takes the record with it
+        image = self._memory_file_in(snapshots.get(snapshot_name))
+
         # Try the native delete first — works for internal snapshots.
         simple = self.virsh.execute(
             "snapshot-delete", vm_name, snapshot_name, warn=True)
         if simple.ok:
             self.logger.info(f"snapshot '{snapshot_name}' deleted from vm {vm_name}")
+            # libvirt unlinked the .raw its record names, not the .raw.zst
+            self._remove_memory_images(vm_name, {snapshot_name: image},
+                                       recorded_in_use)
             return True
 
         err_lower = (simple.stderr or "").lower()
@@ -3255,11 +3377,13 @@ class SnapshotManager:
             return False
 
         # External snapshot — needs the rebase/blockcommit dance.
-        return self._delete_external_snapshot(vm_name, snapshot_name)
+        return self._delete_external_snapshot(
+            vm_name, snapshot_name, recorded_in_use=recorded_in_use)
 
     def _delete_external_snapshot(self,
                                   vm_name: str,
-                                  snapshot_name: str) -> bool:
+                                  snapshot_name: str,
+                                  recorded_in_use=None) -> bool:
         """
         Delete an external snapshot libvirt refused to delete itself:
         before 9.0 it refuses every one, and later ones refuse a snapshot
@@ -3271,7 +3395,9 @@ class SnapshotManager:
         children are read from the snapshot tree, not from chain order:
         after a restore and a take two snapshots can share a parent, and
         the snapshot before this one in that order can be its sibling, the
-        snapshot after it one on another branch (#291).
+        snapshot after it one on another branch (#291). Either way its
+        memory image goes as :meth:`_remove_memory_images` says, asking
+        *recorded_in_use*.
         """
         parents = self._snapshot_tree(vm_name)
         if parents is None:
@@ -3321,24 +3447,31 @@ class SnapshotManager:
                 return False
             # Only snapshot in the chain — collapse it back to base online.
             return self._collapse_only_external_snapshot_online(
-                vm_name, snapshot_name)
+                vm_name, snapshot_name, recorded_in_use=recorded_in_use)
 
         # the current leaf, built on another: collapse_to(parent) drops just
         # this one, and refuses where another branch is built on the parent
-        return self.collapse_to(vm_name, parent, dry_run=False)
+        return self.collapse_to(vm_name, parent, dry_run=False,
+                                recorded_in_use=recorded_in_use)
 
     def _collapse_only_external_snapshot_online(self,
                                                 vm_name: str,
-                                                snapshot_name: str) -> bool:
+                                                snapshot_name: str,
+                                                recorded_in_use=None) -> bool:
         """
         Online deletion of the only external snapshot via
         ``virsh blockcommit --active --pivot``. After this, the chain is
         a single base qcow2 again.
+
+        Its memory image goes once its metadata is gone, as
+        :meth:`_remove_memory_images` says, asking *recorded_in_use*: while
+        the snapshot is still recorded, so is the image.
         """
         disks = self._data_disk_targets(vm_name)
         if not disks:
             self.logger.error(f"no data disks found for vm {vm_name}")
             return False
+        image = self._memory_path_from_xml(vm_name, snapshot_name)
 
         for disk_target, _src in disks:
             commit = self.virsh.execute(
@@ -3357,18 +3490,16 @@ class SnapshotManager:
             if overlay and os.path.isfile(overlay):
                 self.virsh.execute_shell(f"rm -f '{overlay}'", warn=True)
 
-        mem_path = self._memory_path_from_xml(vm_name, snapshot_name)
-        if mem_path:
-            for path in (mem_path, f"{mem_path}.zst"):
-                if os.path.isfile(path):
-                    self.virsh.execute_shell(f"rm -f '{path}'", warn=True)
-
         meta = self.virsh.execute(
             "snapshot-delete", vm_name, snapshot_name, "--metadata", warn=True)
-        if not meta.ok:
+        if meta.ok:
+            self._remove_memory_images(vm_name, {snapshot_name: image},
+                                       recorded_in_use)
+        else:
             self.logger.warning(
-                f"files cleaned for {snapshot_name} but metadata delete "
-                f"failed: {meta.stderr.strip()}")
+                f"overlays cleaned for {snapshot_name} but metadata delete "
+                f"failed: {meta.stderr.strip()}; its memory image is kept, "
+                f"as the snapshot still records it")
         self.logger.info(
             f"external snapshot '{snapshot_name}' deleted from vm {vm_name}")
         return True
@@ -3811,7 +3942,8 @@ class SnapshotManager:
     def collapse_to(self,
                     vm_name: str,
                     target_name: str,
-                    dry_run: bool = False) -> bool:
+                    dry_run: bool = False,
+                    recorded_in_use=None) -> bool:
         """
         Collapse the snapshots between *target_name* and the current one
         into the live head (:meth:`collapse_drops`, which refuses when
@@ -3821,8 +3953,10 @@ class SnapshotManager:
         Workflow per disk: ``qemu-img rebase`` the head onto the target
         snapshot's overlay so the rebased head's read-alone view equals
         what the full chain produced. Then strip ``<backingStore>``
-        cache, ``virsh define``, delete the dropped snapshots' overlay
-        and memory files, and clear their libvirt metadata.
+        cache, ``virsh define``, delete the dropped snapshots' overlays,
+        clear their libvirt metadata, and then remove their memory images,
+        ``.raw`` and ``.raw.zst``, as :meth:`_remove_memory_images` says,
+        asking *recorded_in_use*: not one another snapshot still records.
 
         A dropped overlay that is still live -- usually the newest one,
         which is the head itself -- is kept, and so is anything the kept
@@ -3936,6 +4070,7 @@ class SnapshotManager:
         if not self._strip_backing_store_cache(vm_name):
             return False
 
+        images: dict[str, str | None] = {}
         for snap in drop_set:
             for disk_target, _ in disks:
                 overlay = self._overlay_path_for_snapshot(
@@ -3956,18 +4091,19 @@ class SnapshotManager:
                     continue
                 self.virsh.execute_shell(
                     f"rm -f '{overlay}'", warn=True)
-            mem_path = self._memory_path_from_xml(vm_name, snap)
-            if mem_path:
-                for path in (mem_path, f"{mem_path}.zst"):
-                    if os.path.isfile(path):
-                        self.virsh.execute_shell(
-                            f"rm -f '{path}'", warn=True)
+            # read before its record goes; removed once every dropped one's
+            # has, so the scan no longer counts them (_remove_memory_images)
+            image = self._memory_path_from_xml(vm_name, snap)
             meta = self.virsh.execute(
                 "snapshot-delete", vm_name, snap, "--metadata", warn=True)
-            if not meta.ok:
+            if meta.ok:
+                images[snap] = image
+            else:
                 self.logger.warning(
                     f"could not clear metadata for snapshot '{snap}' on "
-                    f"{vm_name}: {meta.stderr.strip()}")
+                    f"{vm_name}: {meta.stderr.strip()}; its memory image is "
+                    f"kept, as the snapshot still records it")
+        self._remove_memory_images(vm_name, images, recorded_in_use)
 
         self.logger.info(
             f"collapsed {len(drop_set)} snapshot(s) on vm {vm_name}; "
