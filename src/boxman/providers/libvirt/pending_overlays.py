@@ -17,7 +17,9 @@ One record per chain -- the overlays a CD-ROM read, top first, and the
 image under them -- in boxman's per-user cache dir, read when called. Each
 record holds the identity, ``(st_dev, st_ino)``, of every overlay as it was
 when recorded: a file that has taken the name since is not removed. A
-record that cannot be read is named, and never removed.
+record that cannot be read is named, and never removed. Each is kept under
+its connection too (:func:`ledger_scope`): a VM of one name on another
+libvirt is not this one.
 """
 
 from __future__ import annotations
@@ -45,6 +47,19 @@ def ledger_dir() -> str:
                         "pending-iso-overlays")
 
 
+def ledger_scope(provider_config: dict | None) -> str:
+    """
+    Which libvirt a record is of: the runtime boxman reaches it through,
+    the container for the docker-compose runtime, and the connection URI.
+    Domain names are unique on one libvirt only.
+    """
+    config = provider_config or {}
+    runtime = config.get("runtime") or "local"
+    container = config.get("runtime_container")
+    return " ".join(part for part in (
+        runtime, container, config.get("uri") or "qemu:///system") if part)
+
+
 def identity_of(path: str) -> tuple[int, int] | None:
     """``(st_dev, st_ino)`` of *path* itself, a link not followed; None when
     it cannot be read."""
@@ -68,45 +83,58 @@ class PendingChain:
     path: str
     #: when it was recorded, seconds since the epoch
     recorded: float = 0.0
+    #: the libvirt it is of (:func:`ledger_scope`)
+    scope: str = ""
 
     def identity(self, layer: str) -> tuple[int, int] | None:
         return self.identities[self.layers.index(layer)]
 
 
 class PendingOverlays:
-    """The records, in *directory* (:func:`ledger_dir` when not given)."""
+    """The records of the libvirt *scope* names (:func:`ledger_scope`), in
+    *directory* (:func:`ledger_dir` when not given)."""
 
-    def __init__(self, directory: str | None = None) -> None:
+    def __init__(self, directory: str | None = None,
+                 scope: str | None = None) -> None:
         self.directory = directory or ledger_dir()
+        self.scope = scope if scope is not None else ledger_scope(None)
         #: ``{record file: why}`` for each record :meth:`chains` could not
         #: read, from its last call
         self.unreadable: dict[str, str] = {}
 
     def _path(self, vm: str, top: str) -> str:
-        digest = hashlib.sha256(f"{vm}\0{top}".encode()).hexdigest()[:32]
+        digest = hashlib.sha256(
+            f"{self.scope}\0{vm}\0{top}".encode()).hexdigest()[:32]
         return os.path.join(self.directory, f"{digest}.json")
 
-    def record(self, vm: str, chains: list[tuple[list[str], str]]) -> None:
+    def record(self, vm: str, chains: list[tuple[list[str], str]]) -> list[str]:
         """
         Record each of *chains* -- ``(overlays top first, the image under
         them)`` -- for *vm*, with the identity of each overlay read now; a
         layer that is not there is left out, and a chain left with none is
         not recorded. A record of the same top replaces the one there.
 
+        Returns:
+            The top of each chain recorded.
+
         Raises:
             OSError: a record could not be written. Those written before it
                 stay.
         """
         os.makedirs(self.directory, exist_ok=True)
+        written = []
         for layers, iso in chains:
             present = [layer for layer in layers if os.path.lexists(layer)]
             if not present:
                 continue
             self._write(self._path(vm, present[0]), {
-                "version": VERSION, "vm": vm, "iso": iso, "layers": present,
+                "version": VERSION, "scope": self.scope, "vm": vm,
+                "iso": iso, "layers": present,
                 "identities": [list(i) if (i := identity_of(layer)) else UNREAD
                                for layer in present],
                 "recorded": time.time()})
+            written.append(present[0])
+        return written
 
     def _write(self, path: str, data: dict) -> None:
         fd, staging = mkstemp_in(self.directory, prefix=".record.",
@@ -123,19 +151,34 @@ class PendingOverlays:
             except OSError:
                 pass
             raise
+        self._sync_directory()
+
+    def _sync_directory(self) -> None:
+        """fsync the directory, so a rename or an unlink in it outlasts a
+        crash of the host as the data does."""
+        fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def forget(self, vm: str, tops) -> None:
         """Remove the record of each chain of *vm* topped by one of
         *tops*, where there is one."""
+        removed = False
         for top in tops:
             try:
                 os.unlink(self._path(vm, top))
+                removed = True
             except FileNotFoundError:
                 pass
+        if removed:
+            self._sync_directory()
 
     def chains(self, vm: str | None = None) -> list[PendingChain]:
-        """Every record of *vm*, every record at all when it is None,
-        oldest first. One that cannot be read is in :attr:`unreadable`."""
+        """Every record of *vm* on this libvirt, every record of this
+        libvirt when it is None, oldest first. One that cannot be read is
+        in :attr:`unreadable`."""
         self.unreadable = {}
         try:
             names = sorted(os.listdir(self.directory))
@@ -156,7 +199,7 @@ class PendingOverlays:
             except (OSError, ValueError) as exc:
                 self.unreadable[path] = str(exc)
                 continue
-            if vm is None or chain.vm == vm:
+            if chain.scope == self.scope and vm in (None, chain.vm):
                 found.append(chain)
         return sorted(found, key=lambda c: (c.recorded, c.path))
 
@@ -167,8 +210,10 @@ class PendingOverlays:
         if not isinstance(data, dict) or data.get("version") != VERSION:
             raise ValueError("not a record this boxman writes")
         vm, iso = data.get("vm"), data.get("iso")
+        scope = data.get("scope")
         layers, identities = data.get("layers"), data.get("identities")
-        if (not isinstance(vm, str) or not vm or not isinstance(iso, str)
+        if (not isinstance(vm, str) or not vm or not isinstance(scope, str)
+                or not isinstance(iso, str)
                 or not os.path.isabs(iso) or not isinstance(layers, list)
                 or not layers or not isinstance(identities, list)
                 or len(identities) != len(layers)
@@ -188,7 +233,8 @@ class PendingOverlays:
         recorded = data.get("recorded")
         return PendingChain(
             vm=vm, iso=iso, layers=layers, identities=read, path=path,
-            recorded=recorded if isinstance(recorded, (int, float)) else 0.0)
+            recorded=recorded if isinstance(recorded, (int, float)) else 0.0,
+            scope=scope)
 
     def settle(self, vm: str) -> None:
         """
@@ -209,9 +255,11 @@ class PendingOverlays:
                     os.unlink(chain.path)
                 except FileNotFoundError:
                     pass
+                self._sync_directory()
             elif len(left) != len(chain.layers):
                 self._write(chain.path, {
-                    "version": VERSION, "vm": chain.vm, "iso": chain.iso,
+                    "version": VERSION, "scope": chain.scope,
+                    "vm": chain.vm, "iso": chain.iso,
                     "layers": [layer for layer, _i in left],
                     "identities": [list(i) for _l, i in left],
                     "recorded": chain.recorded})

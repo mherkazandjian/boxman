@@ -252,11 +252,15 @@ class TestTheOverlaysItsRestoresLeftForLater:
 
     @staticmethod
     def _removing(t):
-        def remove(vm, scan, gone=False):
+        """``LibVirtSession.remove_pending_iso_overlays``, asking which
+        files are in use of the *scan* the teardown hands it."""
+        def remove(vm, scan=None, gone=False):
             sm = SnapshotManager({})
             with patch.object(sm, '_remove_file',
                               side_effect=lambda p: os.unlink(p) or True):
-                sm.remove_pending_iso_overlays(vm, scan, gone=gone)
+                sm.remove_pending_iso_overlays(
+                    vm, lambda paths: disk_cleanup.FilesInUse(
+                        scan()).reasons(paths), gone=gone)
         t.session.remove_pending_iso_overlays.side_effect = remove
 
     def test_they_go_with_it_on_the_scan_its_storage_was_removed_by(
@@ -271,8 +275,8 @@ class TestTheOverlaysItsRestoresLeftForLater:
         assert not overlay.exists() and iso.read_bytes() == b'the ISO'
         assert PendingOverlays().chains(VM) == []
         t.session.disk_paths_in_use.assert_called_once_with()
-        assert t.session.remove_pending_iso_overlays.call_args.kwargs == {
-            'gone': True}
+        assert t.session.remove_pending_iso_overlays.call_args.kwargs[
+            'gone'] is True
 
     def test_one_another_domain_uses_stays_on_record_and_is_named(
             self, tmp_path):
@@ -290,6 +294,22 @@ class TestTheOverlaysItsRestoresLeftForLater:
             [str(overlay)]]
         assert f'domain {OTHER} uses it' in ' '.join(
             str(c.args[0]) for c in log.warning.call_args_list)
+
+    def test_they_go_though_the_storage_removal_raises(self, tmp_path):
+        """No later command asks for an undefined VM's records by its
+        name: a teardown that fails part-way still removes them."""
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        _iso, overlay = self._left(tmp_path)
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+        self._removing(t)
+
+        with patch('boxman.manager_parts.vms.remove_vm_storage',
+                   side_effect=OSError(5, 'Input/output error')), \
+             pytest.raises(OSError):
+            t.deprovision()
+
+        assert not overlay.exists()
+        assert PendingOverlays().chains(VM) == []
 
     def test_a_removal_that_raises_does_not_fail_the_teardown(self, tmp_path):
         boot = _file(tmp_path / f'{VM}.qcow2')

@@ -13,10 +13,12 @@ from pathlib import Path
 import pytest
 
 from boxman import config_cache
+from boxman.providers.libvirt import pending_overlays
 from boxman.providers.libvirt.pending_overlays import (
     PendingOverlays,
     identity_of,
     ledger_dir,
+    ledger_scope,
 )
 
 pytestmark = pytest.mark.unit
@@ -84,6 +86,50 @@ class TestTheRecords:
         ledger.forget(VM, [top, "/never/recorded"])
         assert ledger.chains(VM) == []
 
+    def test_what_was_recorded_is_said(self, iso):
+        top, gone = _overlay(iso, 2), str(iso.with_name("nixos.1"))
+        ledger = PendingOverlays()
+        assert ledger.record(VM, [([top], str(iso)), ([gone], str(iso))]) == [
+            top]
+
+    def test_the_directory_is_synced_after_each_rename_and_unlink(
+            self, iso, monkeypatch):
+        """A record a crash of the host loses is an overlay nothing names
+        again: the rename that publishes it, and the unlink that drops it,
+        are made durable as the data is."""
+        synced: list[bool] = []
+        fsync = os.fsync
+
+        def recording(fd):
+            synced.append(os.path.isdir(f"/proc/self/fd/{fd}"))
+            return fsync(fd)
+        monkeypatch.setattr(pending_overlays.os, "fsync", recording)
+        top = _overlay(iso, 1)
+        ledger = PendingOverlays()
+
+        ledger.record(VM, [([top], str(iso))])
+        assert synced == [False, True]     # the file, then its directory
+        ledger.forget(VM, [top])
+        assert synced == [False, True, True]
+
+    def test_another_libvirts_records_are_not_this_ones(self, iso):
+        """Domain names are unique on one libvirt only."""
+        top = _overlay(iso, 1)
+        PendingOverlays(scope="local qemu:///session").record(
+            VM, [([top], str(iso))])
+        assert PendingOverlays(scope="local qemu:///system").chains(VM) == []
+        assert len(PendingOverlays(scope="local qemu:///session").chains(
+            VM)) == 1
+
+    def test_the_scope_is_the_runtime_its_container_and_the_uri(self):
+        assert ledger_scope(None) == "local qemu:///system"
+        assert ledger_scope({"runtime": "local", "uri": "qemu:///session"}) \
+            == "local qemu:///session"
+        assert ledger_scope({"runtime": "docker-compose",
+                             "runtime_container": "boxman-libvirt",
+                             "uri": "qemu:///system"}) == (
+            "docker-compose boxman-libvirt qemu:///system")
+
     def test_nothing_is_left_half_written(self, iso):
         ledger = PendingOverlays()
         ledger.record(VM, [([_overlay(iso, 1)], str(iso))])
@@ -96,13 +142,19 @@ class TestOneThatCannotBeRead:
     @pytest.mark.parametrize("text", [
         "{not json",
         json.dumps({"version": 99}),
-        json.dumps({"version": 1, "vm": VM, "iso": "relative.iso",
-                    "layers": ["/a"], "identities": [None]}),
+        json.dumps({"version": 1, "scope": "local qemu:///system", "vm": VM,
+                    "iso": "relative.iso", "layers": ["/a"],
+                    "identities": [None]}),
+        json.dumps({"version": 1, "scope": "local qemu:///system", "vm": VM,
+                    "iso": "/x.iso", "layers": ["/a", "/b"],
+                    "identities": [[1, 2]]}),
+        json.dumps({"version": 1, "scope": "local qemu:///system", "vm": VM,
+                    "iso": "/x.iso", "layers": ["/a"],
+                    "identities": [[1, True]]}),
         json.dumps({"version": 1, "vm": VM, "iso": "/x.iso",
-                    "layers": ["/a", "/b"], "identities": [[1, 2]]}),
-        json.dumps({"version": 1, "vm": VM, "iso": "/x.iso",
-                    "layers": ["/a"], "identities": [[1, True]]}),
-    ], ids=["not-json", "another-version", "relative", "short", "bool"])
+                    "layers": ["/a"], "identities": [[1, 2]]}),
+    ], ids=["not-json", "another-version", "relative", "short", "bool",
+            "no-scope"])
     def test_is_named_and_left_alone(self, text):
         ledger = PendingOverlays()
         os.makedirs(ledger.directory)

@@ -279,11 +279,55 @@ class TestTheOverlaysOfCdromImagesLeftForLater:
         assert "(domain other01 uses it)" in capsys.readouterr().out
 
     def test_another_projects_are_not_listed(self, project, capsys):
-        _iso, overlay = self._left(project, vm="bprj__else__bprj_c1_vm01")
+        _iso, overlay = self._left(project, vm="other01")
 
         project.prune()
 
         assert overlay not in capsys.readouterr().out
+
+    def test_one_left_for_a_vm_with_no_domain_any_more_is_named(
+            self, project, capsys):
+        """A VM removed outside boxman has no take or destroy to come:
+        nothing removes what its restores left, so whichever project's
+        prune runs names it."""
+        gone = "bprj__else__bprj_c1_vm01"
+        _iso, overlay = self._left(project, vm=gone)
+
+        project.prune()
+
+        out = capsys.readouterr().out
+        assert (f"note: {overlay} was left for removal by a restore of "
+                f"{gone}, which has no domain any more: nothing removes it"
+                ) in out
+
+    def test_another_libvirts_records_are_not_this_ones(self, project,
+                                                        capsys):
+        isodir = project.tmp / "image-cache"
+        isodir.mkdir()
+        iso = project.file("nixos.iso", b"the ISO", where=isodir)
+        overlay = project.file("nixos.7", b"QFI\xfb", where=isodir)
+        PendingOverlays(scope="local qemu:///session").record(
+            VM, [([overlay], iso)])
+
+        project.prune()
+
+        assert overlay not in capsys.readouterr().out
+
+    def test_an_interrupted_restores_backup_beside_the_iso_is_named(
+            self, project, capsys):
+        """Prune scans no image's directory; a restore left a .preserve
+        there, of a CD-ROM overlay it backed up, and refuses while it is
+        there."""
+        iso, overlay = self._left(project)
+        backup = project.file(f"{os.path.basename(overlay)}.preserve",
+                              b"QFI\xfb", where=project.tmp / "image-cache")
+
+        project.prune()
+
+        out = capsys.readouterr().out
+        assert (f"note: {backup} is an interrupted restore's backup of "
+                f"{overlay}, an overlay of {iso} for a CD-ROM of {VM}, which "
+                f"is in place") in out
 
 
 class TestTheLockProbe:

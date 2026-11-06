@@ -84,49 +84,80 @@ class TestTheLock:
         assert not os.path.exists(revert_locks.lock_dir())
 
     def test_a_new_lock_waits_for_nothing(self, clock):
-        with RevertLock(["/cache/nixos"]):
-            pass
+        with RevertLock(["/cache/nixos"]) as lock:
+            lock.reverting()
         assert clock.waits == []
 
     def test_the_next_holder_waits_for_the_second_after_the_last_left(
             self, clock):
-        with RevertLock(["/cache/nixos"]):
-            pass
-        # left at .25 past the second: the next may start at the next one
-        with RevertLock(["/cache/nixos"]):
-            assert clock.time() == 1793626527.0
+        with RevertLock(["/cache/nixos"]) as lock:
+            lock.reverting()
+            clock.now += 2.0          # the revert takes two seconds
+        # left at .25 past the second: the next reverts at the next one,
+        # its preparation done meanwhile
+        with RevertLock(["/cache/nixos"]) as lock:
+            assert clock.waits == []
+            lock.reverting()
+            assert clock.time() == 1793626529.0
         assert clock.waits == [0.75]
 
     def test_a_holder_a_second_later_waits_for_nothing(self, clock):
-        with RevertLock(["/cache/nixos"]):
-            pass
+        with RevertLock(["/cache/nixos"]) as lock:
+            lock.reverting()
+            clock.now += 2.0
         clock.now += 1.0
-        with RevertLock(["/cache/nixos"]):
-            pass
+        with RevertLock(["/cache/nixos"]) as lock:
+            lock.reverting()
         assert clock.waits == []
 
     def test_another_key_does_not_wait(self, clock):
+        with RevertLock(["/cache/nixos"]) as lock:
+            lock.reverting()
+        with RevertLock(["/cache/guix"]) as lock:
+            lock.reverting()
+        assert clock.waits == []
+
+    def test_a_holder_that_never_reverted_leaves_the_stamp_it_found(
+            self, clock):
+        """A restore refused before its revert keeps no one waiting."""
         with RevertLock(["/cache/nixos"]):
             pass
-        with RevertLock(["/cache/guix"]):
-            pass
+        with RevertLock(["/cache/nixos"]) as lock:
+            lock.reverting()
         assert clock.waits == []
+
+    def test_a_holder_killed_during_its_revert_still_keeps_the_next_off(
+            self, clock):
+        """A SIGKILL runs no release: the stamp written as the revert
+        started is what the next holder finds, while libvirtd may still be
+        finishing that revert, naming its overlays in that second or the
+        next."""
+        lock = RevertLock(["/cache/nixos"]).__enter__()
+        lock.reverting()
+        for _key, fd, _found in lock._held:
+            os.close(fd)              # the process dies: the flock goes
+        with RevertLock(["/cache/nixos"], timeout=1) as lock:
+            lock.reverting()
+            assert clock.time() == 1793626528.0
+        assert clock.waits == [1.75]
 
     def test_a_stamp_that_does_not_read_as_one_waits_a_second(self, clock):
         os.makedirs(revert_locks.lock_dir())
         with open(RevertLock.path_for("/cache/nixos"), "w") as fh:
             fh.write("garbled")
-        with RevertLock(["/cache/nixos"]):
-            pass
+        with RevertLock(["/cache/nixos"]) as lock:
+            lock.reverting()
         assert clock.waits == [0.75]
 
-    def test_a_clock_set_back_waits_a_second_at_most(self, clock):
-        with RevertLock(["/cache/nixos"]):
-            pass
+    def test_a_clock_set_back_waits_two_seconds_at_most(self, clock):
+        """Two: a stamp is at most that far ahead of the revert that wrote
+        it (:meth:`RevertLock.reverting`)."""
+        with RevertLock(["/cache/nixos"]) as lock:
+            lock.reverting()
         clock.now -= 3600
-        with RevertLock(["/cache/nixos"]):
-            pass
-        assert clock.waits == [1.0]
+        with RevertLock(["/cache/nixos"]) as lock:
+            lock.reverting()
+        assert clock.waits == [2.0]
 
     def test_a_lock_held_elsewhere_is_waited_for(self, clock):
         """Two holders never hold one key at once: the restore workers of
@@ -183,11 +214,21 @@ class TestTheLock:
             thread.join(30)
         assert errors == [] and not any(t.is_alive() for t in threads)
 
+    def test_its_own_last_revert_is_waited_for_too(self, clock):
+        """A retry of the revert names its overlays in a second of its own
+        as well."""
+        with RevertLock(["/cache/nixos"]) as lock:
+            lock.reverting()
+            lock.reverting()
+        assert clock.waits == [1.75]
+
     def test_a_stamp_that_cannot_be_written_is_waited_out_by_the_holder(
             self, clock, monkeypatch):
         def no_space(*_a):
             raise OSError(28, "No space left on device")
         lock = RevertLock(["/cache/nixos"]).__enter__()
+        lock.reverting()
+        clock.now += 2.0
         monkeypatch.setattr(revert_locks.os, "pwrite", no_space)
         lock.__exit__(None, None, None)
         assert clock.waits == [0.75]

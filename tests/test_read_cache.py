@@ -344,7 +344,8 @@ class TestARestoreKeepsItsReads:
     def test_a_restore_keeps_its_reads_and_forgets_them_after(self, shell):
         session = LibVirtSession(config={"provider": {"libvirt": {}}})
 
-        def restore(manager, vm_name, snapshot_name, paths_in_use=None):
+        def restore(manager, vm_name, snapshot_name, paths_in_use=None,
+                    after_media=None, files_in_use=None):
             manager.virsh.execute("snapshot-list", vm_name, "--name",
                                   warn=True)
             manager.virsh.execute("snapshot-list", vm_name, "--name",

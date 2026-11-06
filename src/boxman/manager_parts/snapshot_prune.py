@@ -5,6 +5,7 @@ them (``--dry-run``); removing them comes in a later one."""
 from __future__ import annotations
 
 import os
+import re
 import time
 
 from boxman.exceptions import ConfigError, SnapshotError
@@ -19,6 +20,7 @@ from boxman.providers.libvirt.disk_ownership import disk_logical_name
 from boxman.providers.libvirt.pending_overlays import (
     PendingOverlays,
     identity_of,
+    ledger_scope,
 )
 from boxman.providers.libvirt.snapshot import SnapshotManager
 from boxman.providers.libvirt.snapshot_prune import (
@@ -142,7 +144,8 @@ class SnapshotPruneMixin:
                           references, bool(getattr(cli_args, 'show_all',
                                                    False)),
                           waiting=self._pending_iso_overlay_notes(
-                              selected, held, references))
+                              selected, held, references, domains,
+                              ledger_scope(session.provider_config)))
         failed = scan_failures(listing, scans)
         if failed:
             raise SnapshotError("nothing was pruned: " + "; ".join(failed))
@@ -344,17 +347,24 @@ class SnapshotPruneMixin:
 
     @staticmethod
     def _pending_iso_overlay_notes(selected: set[str], held: Held | None,
-                                   references: References | None
-                                   ) -> list[str]:
+                                   references: References | None,
+                                   domains: list[tuple[str, str]] | None,
+                                   scope: str) -> list[str]:
         """
-        A line for each overlay libvirt made of a CD-ROM image of one of
-        *selected* that a restore left beside the image for later removal
-        (``pending_overlays``), and for each record of them that cannot be
-        read. They are not in the table: the image's directory is no
-        snapshot directory, and the VM's next ``snapshot take``, or its
-        destroy, removes them once nothing uses them. What would keep one
-        now is said: a domain uses it (G1), a snapshot names it (G2), or
-        another file has taken its name since.
+        Lines for what restores left beside CD-ROM images, which the table
+        does not list: an image's directory is no snapshot directory.
+
+        - each overlay libvirt made of a CD-ROM image of one of *selected*
+          that a restore recorded for later removal (``pending_overlays``),
+          and what would keep it now: a domain uses it (G1), a snapshot
+          names it (G2), or another file has taken its name since. The VM's
+          next ``snapshot take``, or its destroy, removes it;
+        - each one recorded for a VM that has no domain on this connection
+          any more, of any project: nothing will remove it;
+        - each record that cannot be read;
+        - an interrupted restore's backup of such an overlay, ``.preserve``,
+          its scratch copy or a reservation scaffold, beside one of those
+          images or a CD-ROM image of one of *selected*.
         """
         def who(scan, path: str, identity) -> str | None:
             if scan is None:
@@ -362,16 +372,28 @@ class SnapshotPruneMixin:
             return (scan.get(path) or scan.get(os.path.realpath(path))
                     or (scan.identities.get(identity) if identity else None))
 
-        ledger = PendingOverlays()
+        ledger = PendingOverlays(scope=scope)
+        defined = ({name for name, _uuid in domains}
+                   if domains is not None else None)
         lines = []
+        isos = {}
         for chain in ledger.chains():
-            if chain.vm not in selected:
+            orphan = defined is not None and chain.vm not in defined
+            if chain.vm not in selected and not orphan:
                 continue
+            isos[chain.iso] = chain.vm
             for layer, recorded in zip(chain.layers, chain.identities,
                                        strict=True):
                 if not os.path.lexists(layer):
                     continue
                 identity = identity_of(layer)
+                if orphan:
+                    lines.append(
+                        f"{layer} was left for removal by a restore of "
+                        f"{chain.vm}, which has no domain any more: nothing "
+                        f"removes it. Check that no domain uses it, then "
+                        f"remove it and its record, {chain.path}")
+                    continue
                 why = []
                 if recorded is None or identity != recorded:
                     why.append("another file has taken its name since: it "
@@ -393,6 +415,41 @@ class SnapshotPruneMixin:
                   f"removal, cannot be read ({why}): check the overlays it "
                   f"names by hand, then remove it"
                   for path, why in sorted(ledger.unreadable.items())]
+        for path, domain in (held.media.items() if held is not None else ()):
+            if domain in selected:
+                isos.setdefault(path, domain)
+        lines += SnapshotPruneMixin._preserves_beside(isos)
+        return lines
+
+    @staticmethod
+    def _preserves_beside(isos: dict[str, str]) -> list[str]:
+        """A line for each restore's leftover backup of an overlay of one
+        of *isos* -- ``{image: a VM it is a CD-ROM of}`` -- beside it: an
+        interrupted restore leaves them, and a restore refuses on one."""
+        lines = []
+        seen = set()
+        for iso in sorted(isos):
+            directory = os.path.dirname(iso)
+            stem = re.escape(os.path.splitext(os.path.basename(iso))[0])
+            left = re.compile(stem + r"\.[0-9]+\.preserve(\.copy)?"
+                              r"(\.[0-9]+\.[0-9a-f]{12})?")
+            try:
+                names = sorted(os.listdir(directory))
+            except OSError:
+                continue
+            for name in names:
+                path = os.path.join(directory, name)
+                if path in seen or not left.fullmatch(name):
+                    continue
+                seen.add(path)
+                overlay = path[:path.index(".preserve")]
+                state = ("which is in place" if os.path.lexists(overlay)
+                         else f"which is missing: mv -fT {path} {overlay}")
+                lines.append(
+                    f"{path} is an interrupted restore's backup of {overlay}, "
+                    f"an overlay of {iso} for a CD-ROM of {isos[iso]}, "
+                    f"{state}. A restore of the VM refuses while it is "
+                    f"there: check it, then remove it")
         return lines
 
     @staticmethod

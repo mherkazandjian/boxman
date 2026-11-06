@@ -578,7 +578,8 @@ def _session(provider: dict | None = None, clusters: dict | None = None
 def _reverting(restored=True):
     """``SnapshotManager.snapshot_restore`` answering *restored*: a revert
     that worked calls what follows the CDROMs' put-back, the clock."""
-    def revert(_self, _vm, _snapshot, paths_in_use=None, after_media=None):
+    def revert(_self, _vm, _snapshot, paths_in_use=None, after_media=None,
+               files_in_use=None):
         if restored and after_media is not None:
             after_media()
         return restored
