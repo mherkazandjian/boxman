@@ -19,7 +19,7 @@ from boxman.exceptions import (
 )
 
 from ..session_base import SessionConfigMixin
-from . import net_reconcile
+from . import net_reconcile, read_cache
 from .cdrom import CDROMManager, cdroms_awaiting_boot, explicit_cdrom_targets
 from .clone_vm import CloneVM
 from .commands import LibVirtCommandBase, VirshCommand
@@ -1124,6 +1124,7 @@ class LibVirtSession(SessionConfigMixin):
         destroyer = DestroyVM(name=name, provider_config=self.provider_config)
         return destroyer.confirm_absent()
 
+    @read_cache.fresh
     def disk_paths_in_use(self, media: dict[str, str] | None = None
                           ) -> FilesInUse | None:
         """
@@ -2657,6 +2658,7 @@ class LibVirtSession(SessionConfigMixin):
         """
         return SnapshotManager(self.provider_config).overlay_files(vm_name)
 
+    @read_cache.fresh
     def snapshot_files_in_use(self,
                               overlays_too: bool = True) -> FilesInUse | None:
         """
@@ -2744,11 +2746,17 @@ class LibVirtSession(SessionConfigMixin):
                 _merge_in_use(recorded, found)
         return recorded
 
+    @read_cache.keeping
     def snapshot_restore(self, vm_name, snapshot_name=None):
         """
         Restore a VM to a specific snapshot.
 
         If snapshot_name is None, the current (latest) snapshot is used.
+
+        It keeps its reads of the VM's snapshots and persistent definition
+        (:mod:`.read_cache`): one made again with nothing run in between is
+        answered from the first, the snapshots' XML after the revert, say,
+        read for the backup's inventory and again for the CD-ROM put-back.
 
         Args:
             vm_name (str): Name of the VM to revert
@@ -3020,6 +3028,7 @@ class LibVirtSession(SessionConfigMixin):
                                 warn=True)
         return _listed_domains(listing.stdout) if listing.ok else None
 
+    @read_cache.fresh
     def snapshot_references(self) -> References | None:
         """
         G2 of ``snapshot prune``: every file a snapshot of any domain on the
@@ -3246,6 +3255,7 @@ class LibVirtSession(SessionConfigMixin):
             scan.identities.setdefault(identity, who)
         return True
 
+    @read_cache.fresh
     def files_held(self) -> Held | None:
         """
         G1 of ``snapshot prune``: what every domain uses

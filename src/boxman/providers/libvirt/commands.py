@@ -9,6 +9,8 @@ from boxman.exceptions import ConfigError, ProvisionError
 from boxman.runtime.docker_compose import docker_exec_wrap
 from boxman.utils.shell import run as _shell_run
 
+from . import read_cache
+
 
 class LibVirtCommandBase:
     """
@@ -138,10 +140,32 @@ class LibVirtCommandBase:
 
         Raises:
             RuntimeError: If the command fails and warn is False
+
+        Within an operation that keeps its reads (:func:`read_cache.keeping`),
+        a read of a domain's snapshots or persistent definition may be
+        answered from the same read made earlier, while nothing else has run
+        since; any command that is not a read drops those
+        (:mod:`.read_cache`).
         """
         command = self.build_command(*args, **kwargs)
         command = self._wrap_for_runtime(command)
+        what = self._read_kind(args, kwargs)
+        if what == read_cache.KEPT and not hide:
+            what = read_cache.READ      # shown as it runs: run it
+        return read_cache.through(
+            command, what,
+            lambda: self._execute_built(command, hide, warn, timeout))
 
+    def _read_kind(self, args: tuple, kwargs: dict) -> str:
+        """What running *args* through :meth:`execute` is, to
+        :mod:`.read_cache`: here a command of another tool, which may change
+        anything."""
+        return read_cache.CHANGE
+
+    def _execute_built(self, command: str, hide: bool, warn: bool,
+                       timeout: int | None) -> invoke.runners.Result:
+        """:meth:`execute` of *command*, built and wrapped for the
+        runtime."""
         if self.verbose:
             self.logger.info(f"executing: {command}")
 
@@ -267,6 +291,7 @@ class LibVirtCommandBase:
             return False
         return not self._runs_as_root()
 
+    @read_cache.changes
     def execute_shell(self, command: str, hide: bool = True, warn: bool = False,
                       force_sudo: bool = False,
                       privileged: bool = False) -> invoke.runners.Result:
@@ -432,6 +457,11 @@ class VirshCommand(LibVirtCommandBase):
                     f"--{key.replace('_', '-')}={shlex.quote(str(value))}")
 
         return " ".join(command_parts)
+
+    def _read_kind(self, args: tuple, kwargs: dict) -> str:
+        """What ``virsh <args>`` is, to :mod:`.read_cache`
+        (:func:`read_cache.kind`)."""
+        return read_cache.kind(args[0], args[1:], kwargs)
 
     def execute(self, cmd: str, *args, **kwargs) -> invoke.runners.Result:
         """
