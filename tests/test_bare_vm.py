@@ -95,12 +95,16 @@ class TestBareVMCreate:
     def test_create_fails_on_virt_install_error(self, mock_run, tmp_path):
         ok_result = _result(ok=True)
         fail_result = _result(ok=False, stderr="virt-install error")
-        # then `virsh domstate`, which finds no domain left behind
-        mock_run.side_effect = [ok_result, fail_result, _result(ok=False)]
+        # then `virsh domstate` and `virsh list`, which find no domain left
+        # behind; the boot disk then goes, and the pools holding it are
+        # refreshed (through this host's libvirt, were it real)
+        mock_run.side_effect = [ok_result, fail_result, _result(ok=False),
+                                _result(ok=True)]
         vm = _make_bare_vm(tmp_path)
-        result = vm.create()
+        with patch('boxman.providers.libvirt.direct_vm.refresh_pools_holding'):
+            result = vm.create()
         assert result is False
-        assert mock_run.call_count == 3
+        assert mock_run.call_count == 4
 
     @patch('boxman.providers.libvirt.direct_vm._shell_run')
     def test_qemu_img_command_contains_disk_path(self, mock_run, tmp_path):

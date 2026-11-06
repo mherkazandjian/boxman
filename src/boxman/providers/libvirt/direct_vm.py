@@ -16,6 +16,7 @@ from typing import Any
 from boxman import log
 from boxman.exceptions import (
     DomainExistsError,
+    InstallRefusedError,
     PartialInstallError,
     ProvisionError,
 )
@@ -23,6 +24,8 @@ from boxman.utils.shell import run as _shell_run
 
 from .commands import VirshCommand, VirtInstallCommand, virt_install_path
 from .disk import create_image_exclusive, libvirt_disk_source
+from .disk_cleanup import remove_if_unchanged
+from .storage_pools import refresh_pools_holding
 
 #: The virtio-serial port name the QEMU guest agent listens on.
 GUEST_AGENT_CHANNEL = "org.qemu.guest_agent.0"
@@ -38,11 +41,13 @@ BOOT_DISK_REMEDY = ("If it is stale, remove or rename it and run the "
 
 #: ``{path: descriptor}`` of the boot disks this process made, each held
 #: open. A clone is retried in the same process
-#: (``_clone_with_retry``), and an attempt whose virt-install failed leaves
-#: its image behind: the next attempt uses that image rather than refusing
-#: it as someone else's. The open descriptor is what makes that safe: it
-#: keeps the image's inode from being freed, so its number cannot be reused
-#: by a file that replaced it (ext4 reuses a freed inode number at once).
+#: (``_clone_with_retry``). An attempt whose virt-install failed removes
+#: its image once libvirt shows no domain by the VM's name; when that
+#: cannot be told, it leaves the image, and the next attempt uses it rather
+#: than refusing it as someone else's. The open descriptor is what makes
+#: both safe: it keeps the image's inode from being freed, so its number
+#: cannot be reused by a file that replaced it (ext4 reuses a freed inode
+#: number at once).
 _boot_disks_made: dict[str, int] = {}
 
 
@@ -167,7 +172,8 @@ class DirectInstallVM:
         return [spec["name"] for spec in self._network_specs()]
 
     # ── creation ──────────────────────────────────────────────────────────
-    def _make_boot_disk(self, disk_path: str, disk_size: str) -> bool:
+    def _make_boot_disk(self, disk_path: str,
+                        disk_size: str) -> tuple[int, int] | None:
         """
         Create the empty boot disk, never over anything already at its path
         (:func:`~boxman.providers.libvirt.disk.create_image_exclusive`,
@@ -175,7 +181,8 @@ class DirectInstallVM:
         made there (:data:`_boot_disks_made`).
 
         Returns:
-            True when the disk is in place, False when ``qemu-img`` failed.
+            ``(st_dev, st_ino)`` of the disk now in place; None when
+            ``qemu-img`` failed.
 
         Raises:
             DiskPathOccupiedError: something else is at *disk_path*.
@@ -193,7 +200,7 @@ class DirectInstallVM:
                 if (there.st_dev, there.st_ino) == (ours.st_dev, ours.st_ino):
                     self.logger.info(
                         f"using the boot disk {path} an earlier attempt made")
-                    return True
+                    return (ours.st_dev, ours.st_ino)
 
         def run(cmd: str):
             return _shell_run(self.virsh._wrap_for_runtime(cmd),
@@ -202,9 +209,9 @@ class DirectInstallVM:
         made = create_image_exclusive(disk_path, disk_size, "qcow2", run=run,
                                       remedy=BOOT_DISK_REMEDY)
         if made is None:
-            return False
+            return None
         self._pin(path, made)
-        return True
+        return made
 
     @staticmethod
     def _pin(path: str, made: tuple[int, int]) -> None:
@@ -225,28 +232,88 @@ class DirectInstallVM:
             os.close(earlier)
         _boot_disks_made[path] = fd
 
+    @staticmethod
+    def _unpin(path: str) -> None:
+        """Let go of the image held open for *path*, if one is."""
+        fd = _boot_disks_made.pop(path, None)
+        if fd is not None:
+            os.close(fd)
+
+    def _remove_boot_disk(self, path: str, made: tuple[int, int]) -> None:
+        """
+        Remove the boot disk at *path* -- the image *made* names, which
+        this run made or took over -- once virt-install failed without
+        defining the domain that would have used it.
+
+        Left behind, it outlived the run: the next one, another process,
+        cannot know it for its own (:data:`_boot_disks_made`), and refused
+        it as something already at the path (DiskPathOccupiedError, #294).
+        Only that very file goes (:func:`remove_if_unchanged`), and while
+        it is still held open: a file put at *path* since is left as it is,
+        and named.
+        """
+        try:
+            outcome, where = remove_if_unchanged(path, made)
+        except OSError as exc:
+            # still held open, so a retry uses it
+            self.logger.warning(
+                f"could not remove the boot disk {path}, which virt-install "
+                f"did not use: {exc}. {BOOT_DISK_REMEDY}")
+            return
+        self._unpin(path)
+        if outcome == "removed":
+            self.logger.info(
+                f"removed the boot disk {path}: virt-install defined no "
+                f"domain to use it")
+            refresh_pools_holding(self.virsh, [path])
+        elif outcome in ("restored", "stranded"):
+            self.logger.warning(
+                f"left {path} in place: it is not the boot disk this run "
+                f"made, which something replaced after virt-install failed"
+                + (f" (it is at {where})" if where else ""))
+
     def create(self) -> bool:
-        """Create the VM (empty boot disk + ``virt-install`` define)."""
-        # Resolved first, and deliberately before qemu-img: an unusable
-        # `networks:` used to be discovered after the boot disk had already
-        # been written, leaving a stray image behind on a refusal (#171 A4).
-        network_specs = self._network_specs()
-        # likewise install media that cannot be attached (a cdroms: source
-        # that does not exist)
-        media_args = self._media_args()
-        # absolute, so qemu-img and virt-install name the same file wherever
-        # they run (the docker-compose runtime's container has another cwd)
-        disk_path = libvirt_disk_source(
-            os.path.join(self.workdir, f"{self.vm_name}.qcow2"))
-        # likewise a boot-disk path virt-install cannot be given (a workdir
-        # holding a quote): refused before qemu-img writes the image there
-        disk_value = virt_install_path(disk_path, self.vm_name)
+        """Create the VM (empty boot disk + ``virt-install`` define).
+
+        Raises:
+            InstallRefusedError: the configuration names something the VM
+                cannot be made with; nothing was made.
+            DiskPathOccupiedError, DomainExistsError, PartialInstallError:
+                see :meth:`_make_boot_disk` and the classes.
+        """
+        try:
+            # Resolved first, and deliberately before qemu-img: an unusable
+            # `networks:` used to be discovered after the boot disk had
+            # already been written, leaving a stray image behind on a
+            # refusal (#171 A4).
+            network_specs = self._network_specs()
+            # likewise install media that cannot be attached (a cdroms:
+            # source that does not exist)
+            media_args = self._media_args()
+            # absolute, so qemu-img and virt-install name the same file
+            # wherever they run (the docker-compose runtime's container has
+            # another cwd)
+            disk_path = libvirt_disk_source(
+                os.path.join(self.workdir, f"{self.vm_name}.qcow2"))
+            # likewise a boot-disk path virt-install cannot be given (a
+            # workdir holding a quote): refused before qemu-img writes the
+            # image there
+            disk_value = virt_install_path(disk_path, self.vm_name)
+        except InstallRefusedError:
+            raise
+        except ProvisionError as exc:
+            # Each of these is decided by the configuration and the files
+            # it names, and nothing has been made yet. Raised as they were,
+            # a missing ISO was retried four more times, to be refused the
+            # same way each time (#294).
+            raise InstallRefusedError(str(exc)) from exc
         disk_size = self._boot_disk_size()
         # `or` (not .get default) so an explicit null in YAML still falls back
         memory = self.info.get("memory") or 2048
         vcpus = self.info.get("vcpus") or 2
 
-        if not self._make_boot_disk(disk_path, disk_size):
+        made = self._make_boot_disk(disk_path, disk_size)
+        if made is None:
             return False
 
         parts = []
@@ -305,6 +372,9 @@ class DirectInstallVM:
                              (result.stdout, result.stderr) if text)
             refusal = _NAME_IN_USE.search(said)
             if refusal:
+                # virt-install checks the name before it defines anything,
+                # so no domain of this run uses the disk it made
+                self._remove_boot_disk(disk_path, made)
                 # the refusal only: what virt-install prints after it is its
                 # advice for a failed install, to start the domain, and the
                 # domain may be another run's
@@ -323,6 +393,13 @@ class DirectInstallVM:
                     f"which is left as it is: its console shows how far the "
                     f"install got. Remove it (boxman destroy) before running "
                     f"again. virt-install said:\n{said}")
+            if self._domain_absent():
+                self._remove_boot_disk(disk_path, made)
+            else:
+                self.logger.warning(
+                    f"left the boot disk {disk_path} in place: whether "
+                    f"virt-install defined {self._describe()}, whose disk it "
+                    f"would be, could not be told")
             return False
 
         self.logger.info(f"{self._describe()} created")
@@ -338,3 +415,20 @@ class DirectInstallVM:
         result = _shell_run(self.virsh._wrap_for_runtime(cmd),
                             hide=True, warn=True)
         return bool(result.ok)
+
+    def _domain_absent(self) -> bool:
+        """
+        Whether libvirt is known to have no domain by this VM's name: a
+        listing that succeeded and does not show it.
+
+        Unlike :meth:`_domain_exists`, a query that fails is not taken for
+        an answer (see ``DestroyVM.confirm_absent``): what is decided here
+        is whether the boot disk can go.
+        """
+        cmd = self.virsh.build_command("list", "--all", "--name")
+        result = _shell_run(self.virsh._wrap_for_runtime(cmd),
+                            hide=True, warn=True)
+        if not result.ok:
+            return False
+        names = {line.strip() for line in (result.stdout or "").splitlines()}
+        return self.vm_name not in names

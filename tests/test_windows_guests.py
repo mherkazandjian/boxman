@@ -1095,9 +1095,11 @@ class TestTheClock:
 
     def _virt_install(self, tmp_path, **info):
         from boxman.providers.libvirt.iso_boot_vm import IsoBootVM
+        iso = tmp_path / 'win.iso'
+        iso.write_bytes(b'')
         vm = IsoBootVM('win01', {'memory': 4096, 'vcpus': 2, **info},
                        {'use_sudo': False, 'uri': 'qemu:///system'},
-                       str(tmp_path), '/iso/win.iso')
+                       str(tmp_path), str(iso))
         with patch('boxman.providers.libvirt.direct_vm._shell_run') as run:
             run.return_value = types.SimpleNamespace(ok=True, stdout='',
                                                      stderr='')

@@ -2,6 +2,7 @@
 
 import os
 import shlex
+import stat
 from typing import Any
 
 from boxman.exceptions import ProvisionError
@@ -9,6 +10,7 @@ from boxman.exceptions import ProvisionError
 from .cdrom import CDROMManager
 from .commands import virt_install_path
 from .direct_vm import DirectInstallVM
+from .install_media import media_path
 
 
 class IsoBootVM(DirectInstallVM):
@@ -43,14 +45,16 @@ class IsoBootVM(DirectInstallVM):
         iso_path: str,
     ):
         super().__init__(vm_name, info, provider_config, workdir)
-        self.iso_path = iso_path
+        # spelt as the manager resolves every cdroms: source, so that the
+        # boot ISO is told from the other entries by the one path
+        self.iso_path = media_path(iso_path)
 
     def _extra_cdroms(self) -> list[dict[str, Any]]:
         """The resolved ``cdroms:`` entries other than the boot ISO."""
         extra = []
         for entry in self.info.get("cdroms") or []:
             source = entry.get("source") if isinstance(entry, dict) else None
-            if source == self.iso_path:
+            if source and media_path(source) == self.iso_path:
                 continue
             if not source:
                 raise ProvisionError(
@@ -79,16 +83,14 @@ class IsoBootVM(DirectInstallVM):
         # there, and a quote in any of them reach the domain as another
         # file. `--cdrom` is a whole value, which virt-install does not
         # split.
-        iso = virt_install_path(self.iso_path, self.vm_name, sub_option=False)
+        iso = virt_install_path(self._medium(self.iso_path, "the boot ISO"),
+                                self.vm_name, sub_option=False)
         args = [f"--cdrom={shlex.quote(iso)}",
                 "--install=no_install=yes"]
         for entry in self._extra_cdroms():
-            source = os.path.abspath(os.path.expanduser(entry["source"]))
-            if not os.path.isfile(source):
-                raise ProvisionError(
-                    f"vm {self.vm_name}: cdrom "
-                    f"'{entry.get('name') or entry['source']}': ISO file does "
-                    f"not exist: {source}")
+            source = self._medium(
+                entry["source"],
+                f"the ISO of cdrom '{entry.get('name') or entry['source']}'")
             disk = (f"path={virt_install_path(source, self.vm_name)},"
                     f"device=cdrom,readonly=on")
             target = entry.get("target")
@@ -97,6 +99,42 @@ class IsoBootVM(DirectInstallVM):
                          f"target.bus={CDROMManager._bus_for_target(target)}")
             args.append(f"--disk={shlex.quote(disk)}")
         return args
+
+    def _medium(self, source: str, what: str) -> str:
+        """
+        *source* as virt-install is given it -- absolute, with ``~``
+        expanded (:func:`media_path`) -- once something a CD-ROM can read
+        is there.
+
+        Asked before the boot disk is made, of the boot ISO as of the
+        others. The boot ISO went to virt-install unasked, and one that was
+        not there failed it only once the disk was written; the disk
+        outlived the failure (#294).
+
+        A path that cannot be looked up for another reason -- a directory
+        this user may not search -- is left for virt-install to open: it
+        may run as root.
+
+        Raises:
+            ProvisionError: nothing is there, or a directory is; naming the
+                VM, *what*, and the path.
+        """
+        path = media_path(source)
+        try:
+            st = os.stat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            raise ProvisionError(
+                f"vm {self.vm_name}: {what} does not exist: {path}. Correct "
+                f"its source under the VM's cdroms: and run the command "
+                f"again; nothing was made for the VM.") from None
+        except OSError:
+            return path
+        if stat.S_ISDIR(st.st_mode):
+            raise ProvisionError(
+                f"vm {self.vm_name}: {what} is a directory, not an ISO file: "
+                f"{path}. Correct its source under the VM's cdroms: and run "
+                f"the command again; nothing was made for the VM.")
+        return path
 
     def _describe(self) -> str:
         return f"ISO-boot VM '{self.vm_name}'"

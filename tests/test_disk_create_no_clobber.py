@@ -635,8 +635,13 @@ class TestADirectInstallBootDisk:
     @pytest.fixture(autouse=True)
     def _no_domain_is_left(self, monkeypatch: pytest.MonkeyPatch):
         """The virt-install stub defines nothing, so a failed one leaves no
-        domain; asking the real virsh would only ask this host."""
+        domain; asking the real virsh would only ask this host. Whether
+        none is left is not told either: these are the tests of the image
+        a failed attempt then leaves for the next (the removal of one that
+        is known to be no one's is tested in test_iso_boot_media_paths)."""
         monkeypatch.setattr(direct_vm.DirectInstallVM, "_domain_exists",
+                            lambda self: False)
+        monkeypatch.setattr(direct_vm.DirectInstallVM, "_domain_absent",
                             lambda self: False)
 
     @staticmethod
