@@ -17,6 +17,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from xml.etree import ElementTree as ET
@@ -24,6 +25,7 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from boxman.exceptions import SnapshotError, SnapshotRecoveryError
+from boxman.providers.libvirt import revert_locks
 from boxman.providers.libvirt.cdrom import CDROMManager
 from boxman.providers.libvirt.commands import LibVirtCommandBase, VirshCommand
 from boxman.providers.libvirt.disk_cleanup import FilesInUse
@@ -85,6 +87,18 @@ def _not_running(sm: SnapshotManager):
     TestTheGuestHoldsStillWhileCopying for the pause itself.
     """
     return patch.object(sm, "_pause_for_backup", return_value=False)
+
+
+def _no_shared_images(sm: SnapshotManager):
+    """No disk of the snapshot reads an image another VM's revert can name
+    an overlay after, so the revert takes no lock (#303).
+
+    For tests that are not about that lock, whose ``virsh`` double answers
+    no snapshot XML: the restore reads the target's to know
+    (``_revert_lock_keys``). See TestRevertsOfVmsSharingAnImage for the
+    lock itself.
+    """
+    return patch.object(sm, "_revert_lock_keys", return_value={})
 
 
 def _no_hard_links(sm: SnapshotManager):
@@ -1517,7 +1531,7 @@ class TestOwnershipSurvivesFailures:
             calls.append(cmd)
             return _result()
 
-        with _not_running(sm), \
+        with _not_running(sm), _no_shared_images(sm), \
              patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=[(str(tmp_path / "o.qcow2"),
                                          str(backup))]), \
@@ -1642,7 +1656,7 @@ class TestRoundSevenGaps:
         backup = tmp_path / "o.qcow2.preserve"
         backup.write_bytes(b"the only copy")
 
-        with _not_running(sm), \
+        with _not_running(sm), _no_shared_images(sm), \
              patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=[(str(overlay), str(backup))]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
@@ -1665,7 +1679,7 @@ class TestRoundSevenGaps:
         backup = tmp_path / "o.qcow2.preserve"
         backup.write_bytes(b"the only copy")
 
-        with _not_running(sm), \
+        with _not_running(sm), _no_shared_images(sm), \
              patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=[(str(overlay), str(backup))]), \
              patch.object(sm, "_memory_path_from_xml",
@@ -1705,6 +1719,9 @@ class TestTheGuestHoldsStillWhileCopying:
                 return _result(ok=False, stderr="domain is not running")
             if args[0] == "snapshot-revert" and not revert_ok:
                 return _result(ok=False, stderr="bad name")
+            if args[0] == "snapshot-dumpxml":
+                return _result(stdout="<domainsnapshot><name>s1</name>"
+                                      "</domainsnapshot>")
             return _result()
         return execute
 
@@ -1979,7 +1996,7 @@ class TestBackupIsAPrecondition:
         was at risk" and "the copy failed", and the revert ran on either."""
         overlay = tmp_path / "s1.qcow2"
         overlay.write_bytes(b"x")
-        with _not_running(sm), \
+        with _not_running(sm), _no_shared_images(sm), \
              _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute_shell",
@@ -2126,7 +2143,7 @@ class TestBackupIsAPrecondition:
         backup = tmp_path / "o.qcow2.preserve"
         backup.write_bytes(b"x")
 
-        with _not_running(sm), \
+        with _not_running(sm), _no_shared_images(sm), \
              patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=[(str(overlay), str(backup))]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
@@ -2228,7 +2245,7 @@ class TestSnapshotRestore:
         self, sm: SnapshotManager
     ):
         preserved_pairs = [("/overlays/a", "/overlays/a.preserve")]
-        with _not_running(sm), \
+        with _not_running(sm), _no_shared_images(sm), \
              patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=preserved_pairs) as preserve, \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
@@ -2245,7 +2262,7 @@ class TestSnapshotRestore:
         restore.assert_called_once_with(preserved_pairs, vm_name="vm01")
 
     def test_restore_called_even_when_revert_fails(self, sm: SnapshotManager):
-        with _not_running(sm), \
+        with _not_running(sm), _no_shared_images(sm), \
              patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute",
@@ -2262,7 +2279,7 @@ class TestSnapshotRestore:
             _result(ok=False, stderr="unable to acquire write lock"),
             _result(ok=True),
         ]
-        with _not_running(sm), \
+        with _not_running(sm), _no_shared_images(sm), \
              patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=results), \
@@ -2272,7 +2289,7 @@ class TestSnapshotRestore:
             assert sm.snapshot_restore("vm01", "snap1") is True
 
     def test_does_not_retry_on_non_lock_error(self, sm: SnapshotManager):
-        with _not_running(sm), \
+        with _not_running(sm), _no_shared_images(sm), \
              patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute",
@@ -2284,7 +2301,7 @@ class TestSnapshotRestore:
         assert execute.call_count == 1  # no retries on non-lock errors
 
     def test_exception_still_calls_restore(self, sm: SnapshotManager):
-        with _not_running(sm), \
+        with _not_running(sm), _no_shared_images(sm), \
              patch.object(sm, "_preserve_snapshot_overlays", return_value=[("a", "b")]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=RuntimeError("x")), \
@@ -2581,7 +2598,7 @@ class TestSnapshotRestoreCompressed:
         zst = tmp_path / "vm01_snapshot_s.raw.zst"
         zst.write_bytes(b"x")
         raw = str(tmp_path / "vm01_snapshot_s.raw")
-        with _not_running(sm), \
+        with _not_running(sm), _no_shared_images(sm), \
              patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_restore_preserved_overlays",
                           return_value=[]), \
@@ -2598,7 +2615,7 @@ class TestSnapshotRestoreCompressed:
                                                   tmp_path: Path):
         raw_path = tmp_path / "vm01_snapshot_s.raw"
         raw_path.write_bytes(b"x")
-        with _not_running(sm), \
+        with _not_running(sm), _no_shared_images(sm), \
              patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_restore_preserved_overlays",
                           return_value=[]), \
@@ -4020,8 +4037,10 @@ class _RevertingLibvirt:
     * every disk with media gets a new qcow2 overlay, the CDROM included
       whatever the snapshot says of it: ``<source without its suffix>.
       <epoch>``, beside the disk's source in the snapshot's saved
-      definition, the epoch one later at each revert
-      (``qemuSnapshotRevertExternalPrepare``);
+      definition, the epoch one later at each revert, or the second of
+      :attr:`clock` when one is set (``qemuSnapshotRevertExternalPrepare``).
+      One that is there already fails the revert, as the second of two
+      reverts of VMs booted from one ISO failed in the same second (#303);
     * the current snapshot's recorded overlays are deleted, its
       ``<revertDisks>`` if it has any, else its ``<disks>``; and the new
       ones are recorded as the reverted-to snapshot's, under
@@ -4148,6 +4167,9 @@ class _RevertingLibvirt:
         self.fail_take = None
         #: every shell command :meth:`qemu_img` was handed
         self.shell: list[str] = []
+        #: the host's clock, whose second a revert names its overlays
+        #: after; None counts them one up from :attr:`EPOCH`
+        self.clock = None
 
     # --- what boxman did before -------------------------------------------
 
@@ -4417,8 +4439,18 @@ class _RevertingLibvirt:
                     f"internal error: process exited while connecting to "
                     f"monitor: Could not open backing file: Could not open "
                     f"'{missing}': No such file or directory"))
-        self.epoch += 1
+        self.epoch = (int(self.clock()) if self.clock is not None
+                      else self.epoch + 1)
         made = {}
+        for source in snap["domain"].values():
+            overlay = f"{os.path.splitext(source)[0]}.{self.epoch}"
+            if os.path.exists(overlay):
+                # another domain's, made in the same second (#303)
+                return _result(ok=False, stderr=(
+                    f"error: Failed to revert snapshot {name}\nerror: "
+                    f"internal error: unable to execute QEMU command "
+                    f"'blockdev-add': Could not reopen qcow2 layer: Image "
+                    f"is not in qcow2 format"))
         for target, source in snap["domain"].items():
             overlay = f"{os.path.splitext(source)[0]}.{self.epoch}"
             Path(overlay).write_bytes(b"qcow2 overlay")
@@ -7745,3 +7777,212 @@ class TestTheClockIsSetRightAfterTheCdromsGoBack:
             after_media()
         clock.assert_called_once()
 
+
+# ---------------------------------------------------------------------------
+# #303: one revert at a time of the VMs booted from one ISO
+# ---------------------------------------------------------------------------
+
+class _Clock:
+    """The host's clock, which libvirt names a revert's overlays by and the
+    revert locks stamp; it moves only when something waits on it."""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+        self._lock = threading.Lock()
+
+    def time(self) -> float:
+        with self._lock:
+            return self.now
+
+    def sleep(self, seconds: float) -> None:
+        with self._lock:
+            self.now += max(seconds, 0.0)
+
+
+class _Host:
+    """Domains on one libvirt, each a :class:`_RevertingLibvirt`: a command
+    goes to the double of the domain it names, ``list`` to every one. Each
+    revert waits at *barrier*, when one is set, for another to reach its own:
+    restores that may revert at once do."""
+
+    def __init__(self, *vms: _RevertingLibvirt) -> None:
+        self.vms = {vm.VM: vm for vm in vms}
+        self.barrier: threading.Barrier | None = None
+        self.active = 0
+        self.most = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, *args, **kw):
+        if args[0] == "list":
+            names = [n for vm in self.vms.values()
+                     for n in vm(*args, **kw).stdout.split("\n") if n]
+            return _result(stdout="".join(f"{n}\n" for n in names) + "\n")
+        vm = self.vms[args[1]]
+        if args[0] != "snapshot-revert":
+            return vm(*args, **kw)
+        with self._lock:
+            self.active += 1
+            self.most = max(self.most, self.active)
+        try:
+            if self.barrier is not None:
+                with contextlib.suppress(threading.BrokenBarrierError):
+                    self.barrier.wait()
+            return vm(*args, **kw)
+        finally:
+            with self._lock:
+                self.active -= 1
+
+    def shell(self, command: str, *a, **kw):
+        path = shlex.split(command)[-1] if command.startswith(
+            "qemu-img info") else None
+        for vm in self.vms.values():
+            if path is None or path in vm.backing:
+                return vm.qemu_img(command, *a, **kw)
+        return next(iter(self.vms.values())).qemu_img(command, *a, **kw)
+
+
+class TestRevertsOfVmsSharingAnImage:
+    """#303: libvirt names the overlay a revert builds of a disk after the
+    image the snapshot saved it on and the time in whole seconds, so VMs
+    booted from one ISO restored at once were given one overlay of it: one
+    revert failed, its VM left on the other's overlay. Their reverts take
+    turns, a second apart; VMs that share no image still revert at once."""
+
+    @pytest.fixture
+    def clock(self, monkeypatch) -> _Clock:
+        clock = _Clock(1793626526.25)
+        monkeypatch.setattr(revert_locks, "_now", clock.time)
+        monkeypatch.setattr(revert_locks, "_wait", clock.sleep)
+        return clock
+
+    @staticmethod
+    def _vms(tmp_path: Path, clock: _Clock, shared: bool):
+        first = _RevertingLibvirt(tmp_path / "a")
+        second = _RevertingLibvirt(tmp_path / "b")
+        second.VM = "vm02"
+        if shared:
+            second.iso = first.iso
+            second.backing[first.iso] = ("raw", None)
+            second.live["sda"] = second.config["sda"] = first.iso
+            second.medium = first.iso
+        for vm in (first, second):
+            vm.clock = clock.time
+            vm.take("s1")
+        return first, second
+
+    @staticmethod
+    def _restore_both(host: _Host, *vms: _RevertingLibvirt) -> dict:
+        done: dict = {}
+
+        def restore(vm):
+            sm = SnapshotManager({"use_sudo": False})
+            done[vm.VM] = sm.snapshot_restore(vm.VM, "s1",
+                                              paths_in_use=vm.in_use)
+        with patch.object(VirshCommand, "execute", side_effect=host), \
+             patch.object(LibVirtCommandBase, "execute_shell",
+                          side_effect=host.shell):
+            threads = [threading.Thread(target=restore, args=(vm,))
+                       for vm in vms]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+        return done
+
+    @pytest.fixture
+    def tmp_root(self, tmp_path: Path) -> Path:
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        return tmp_path
+
+    def test_two_vms_booted_from_one_iso_never_revert_at_once(
+            self, tmp_root, clock):
+        first, second = self._vms(tmp_root, clock, shared=True)
+        host = _Host(first, second)
+        host.barrier = threading.Barrier(2, timeout=0.5)
+
+        done = self._restore_both(host, first, second)
+
+        assert done == {"vm01": True, "vm02": True}
+        assert host.most == 1
+        # a second apart: two overlays of the ISO, one each
+        assert first.epoch != second.epoch
+        assert first.live["sda"] == second.live["sda"] == first.iso
+        assert sorted(_waiting(first) + _waiting(second)) == sorted(
+            f"{os.path.splitext(first.iso)[0]}.{vm.epoch}"
+            for vm in (first, second))
+
+    def test_vms_that_share_no_image_still_revert_at_once(
+            self, tmp_root, clock):
+        first, second = self._vms(tmp_root, clock, shared=False)
+        host = _Host(first, second)
+        # both have to be in their reverts together to get past it
+        host.barrier = threading.Barrier(2, timeout=10)
+
+        done = self._restore_both(host, first, second)
+
+        assert done == {"vm01": True, "vm02": True}
+        assert host.most == 2
+        assert not host.barrier.broken
+
+    def test_the_next_revert_waits_for_the_second_after_the_last(
+            self, tmp_root, clock):
+        first, second = self._vms(tmp_root, clock, shared=True)
+        host = _Host(first, second)
+
+        assert self._restore_both(host, first) == {"vm01": True}
+        assert self._restore_both(host, second) == {"vm02": True}
+
+        assert second.epoch == first.epoch + 1
+
+    def test_the_lock_is_named_after_what_the_snapshot_saved(
+            self, sm, tmp_path):
+        """A revert builds on the definition the snapshot saved, not on
+        what the domain reads now: a CDROM, a read-only or shareable disk
+        there; a VM's own disks take none."""
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            keys = sm._revert_lock_keys(vm.VM, "s1")
+        assert keys == {revert_locks.overlay_key(vm.iso): vm.iso}
+
+    def test_a_snapshot_that_cannot_be_read_refuses_before_the_revert(
+            self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        vm.take("s2")
+        real = vm.snapshot_xml
+        reads = []
+
+        def unreadable_once_inventoried(name):
+            reads.append(name)
+            # the strict inventory reads each; the lock's read is the next
+            if len(reads) > len(vm.snapshots) + 1:
+                return "<domainsnapshot"
+            return real(name)
+        vm.snapshot_xml = unreadable_once_inventoried
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, pytest.raises(SnapshotError,
+                                           match="does not parse"):
+            sm.snapshot_restore(vm.VM, "s1", paths_in_use=vm.in_use)
+        assert "snapshot-revert" not in [c[0] for c in vm.calls]
+        assert vm.paused is False
+        assert not list(tmp_path.rglob("*.preserve*"))
+
+    def test_a_lock_held_too_long_refuses_and_resumes_the_guest(
+            self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        vm.take("s2")
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, patch.object(
+                revert_locks.RevertLock, "__enter__",
+                side_effect=revert_locks.RevertLockTimeoutError(
+                    "/image-cache/nixos-minimal", 600)):
+            with pytest.raises(SnapshotError, match="revert lock"):
+                sm.snapshot_restore(vm.VM, "s1", paths_in_use=vm.in_use)
+        assert "snapshot-revert" not in [c[0] for c in vm.calls]
+        assert vm.paused is False
+        assert not list(tmp_path.rglob("*.preserve*"))
+        assert _waiting(vm) == []

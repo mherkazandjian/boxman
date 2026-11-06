@@ -74,6 +74,7 @@ class TestSnapshotOverlayPreservation057eb7d:
         with patch.object(sm, "_preserve_snapshot_overlays",
                           side_effect=record_preserve), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
+             patch.object(sm, "_revert_lock_keys", return_value={}), \
              patch.object(sm.virsh, "execute", side_effect=record_execute), \
              patch.object(sm, "_restore_preserved_overlays",
                           side_effect=record_restore):

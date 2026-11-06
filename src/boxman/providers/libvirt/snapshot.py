@@ -20,6 +20,7 @@ from boxman.exceptions import SnapshotError, SnapshotRecoveryError
 from .cdrom import CDROMManager, media_disk_xml
 from .commands import VirshCommand
 from .pending_overlays import PendingOverlays, identity_of
+from .revert_locks import RevertLock, RevertLockTimeoutError, overlay_key
 from .virsh_parse import parse_domblklist
 
 #: one ``<disk>`` element of a snapshot's XML, as libvirt formats it: an
@@ -3511,6 +3512,12 @@ class SnapshotManager:
         QEMU races to acquire an exclusive lock while creating the new disk
         overlay for the post-revert state.
 
+        One revert at a time of the VMs whose disks read one image, the next
+        a second later (:mod:`.revert_locks`, #303): libvirt names the
+        overlay a revert builds of a disk after the image and the time in
+        whole seconds, so two VMs booted from one ISO reverted in the same
+        second were given one overlay of it.
+
         CDROMs: the revert builds a qcow2 overlay of each one's ISO beside
         the ISO, although the snapshot left them out, and moves the CDROM
         onto it. After a revert that worked, each is put back on its ISO and
@@ -3538,7 +3545,8 @@ class SnapshotManager:
 
         Raises:
             SnapshotError: the overlay backup could not be made or
-                reserved, so no revert was attempted.
+                reserved, or the revert lock could not be taken, so no
+                revert was attempted.
             SnapshotRecoveryError: the revert ran, but an overlay it deleted
                 could not be put back. Never retry this one — the retry
                 would revert a second time.
@@ -3572,6 +3580,9 @@ class SnapshotManager:
         # redundant.
         mem_path, decompressed_for_revert = None, False
         try:
+            # after the backup, whose strict inventory has read every
+            # snapshot: what refuses there is said first
+            keys = self._revert_lock_keys(vm_name, snapshot_name)
             # Just-in-time decompress if the memory file was zstd'd.
             mem_path = self._memory_path_from_xml(vm_name, snapshot_name)
             if mem_path and not os.path.isfile(mem_path) and os.path.isfile(f"{mem_path}.zst"):
@@ -3601,6 +3612,33 @@ class SnapshotManager:
 
         for attempt in range(1, max_retries + 1):
             try:
+                lock = self._revert_lock(vm_name, keys).__enter__()
+            except BaseException as exc:
+                if attempt > 1:
+                    # a revert has been attempted: what it left is put
+                    # back, as after any revert that failed
+                    if not isinstance(exc, Exception):
+                        self._report_pause_after_failed_revert(vm_name,
+                                                               paused)
+                        self._forget_intended(vm_name, ledger, before,
+                                              intended)
+                        self._finish_restore(preserved, mem_path,
+                                             decompressed_for_revert)
+                        raise
+                    last_stderr = f"the revert lock could not be taken ({exc})"
+                    break
+                # nothing reverted: every original is in place
+                self._reap_preserve_files([b for _o, b in preserved])
+                self._resume_after_backup(vm_name, paused)
+                self._undo_decompression(mem_path, decompressed_for_revert)
+                if isinstance(exc, (RevertLockTimeoutError, OSError)):
+                    raise SnapshotError(
+                        f"could not take the revert lock of {vm_name} "
+                        f"({exc}); refusing to revert while a VM whose disk "
+                        f"reads the same image may revert in the same second "
+                        f"(#303)") from exc
+                raise
+            try:
                 if not intended:
                     # what the CDROMs are on now, recorded for later
                     # removal before the revert leaves it unused
@@ -3608,6 +3646,7 @@ class SnapshotManager:
                 result = self.virsh.execute(
                     "snapshot-revert", vm_name, snapshot_name, warn=True)
             except Exception as exc:
+                lock.__exit__(None, None, None)
                 self.logger.error(
                     f"error reverting vm {vm_name} to snapshot '{snapshot_name}': {exc}")
                 self._report_pause_after_failed_revert(vm_name, paused)
@@ -3615,6 +3654,7 @@ class SnapshotManager:
                 self._finish_restore(
                     preserved, mem_path, decompressed_for_revert)
                 return False
+            lock.__exit__(None, None, None)
 
             if result.ok:
                 self.logger.info(f"vm {vm_name} reverted to snapshot '{snapshot_name}'")
@@ -3687,6 +3727,61 @@ class SnapshotManager:
         if intended and before:
             self._forget_pending(vm_name, ledger,
                                  [layers[0] for layers, _iso in before])
+
+    def _revert_lock_keys(self, vm_name: str,
+                          snapshot_name: str) -> dict[str, str]:
+        """
+        ``{key: image}`` for each overlay name (:func:`overlay_key`) a
+        revert of *vm_name* to *snapshot_name* builds that another VM's
+        revert can build too: of each CDROM or floppy of the snapshot's
+        saved definitions with media, and of each disk there that is
+        read-only or shareable. libvirt builds the revert's overlays on what
+        those definitions name (``qemuSnapshotRevertExternalPrepare``), not
+        on what the domain reads now. A VM's own disks give names of its
+        own, and take no lock.
+
+        Raises:
+            SnapshotError: the snapshot's XML cannot be read: whether the
+                revert may collide cannot be told, and the strict inventory
+                read it a moment ago.
+        """
+        refusal = ("refusing to revert without knowing which images its "
+                   "overlays are named after (#303)")
+        result = self.virsh.execute("snapshot-dumpxml", vm_name,
+                                    snapshot_name, warn=True)
+        if not result.ok:
+            raise SnapshotError(
+                f"cannot read snapshot '{snapshot_name}' of {vm_name} "
+                f"({(result.stderr or '').strip()}); {refusal}")
+        try:
+            root = ET.fromstring(result.stdout)
+        except ET.ParseError as exc:
+            raise SnapshotError(
+                f"the metadata of snapshot '{snapshot_name}' of {vm_name} "
+                f"does not parse ({exc}); {refusal}") from exc
+        keys: dict[str, str] = {}
+        for section in root:
+            if section.tag not in ("domain", "inactiveDomain"):
+                continue
+            for disk in section.iter("disk"):
+                if (disk.get("device") not in ("cdrom", "floppy")
+                        and disk.find("readonly") is None
+                        and disk.find("shareable") is None):
+                    continue
+                source = disk.find("source")
+                path = source.get("file") if source is not None else None
+                if path:
+                    keys.setdefault(overlay_key(path), path)
+        return keys
+
+    def _revert_lock(self, vm_name: str, keys: dict[str, str]) -> RevertLock:
+        """The :class:`RevertLock` of *keys*, saying when it waits."""
+        def waiting(key: str) -> None:
+            self.logger.info(
+                f"{vm_name}: waiting for the revert of another VM whose disk "
+                f"reads {keys[key]}: reverted in the same second, the two "
+                f"would be given one overlay of it (#303)")
+        return RevertLock(keys, on_wait=waiting)
 
     def _recompress_after_revert(self,
                                  mem_path: str | None,
