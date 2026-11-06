@@ -282,18 +282,20 @@ The big-reclaim hammer when bloat lives in **older overlays** that
 long-lived snapshots taken while a daemon was writing continuously.
 
 `qemu-img rebase` walks the chain and merges every cluster from the
-snapshots between `<name>` and the live head into a new active overlay
-whose backing is `<name>`'s overlay — or, when the live disk was built
-after a restore of `<name>`, the disk `<name>` was taken on, which is
-what the live disk stands on then. Where intermediates wrote zero
-clusters (RAID5 sync, mkfs, etc.), rebase writes sparse holes — so the
-reclaim is often dramatic with little wall time.
+snapshots between `<name>` and the live head, and from `<name>`'s own
+overlay, into the live head, whose backing becomes the disk `<name>` was
+taken on. `<name>` is then redefined to record the head as its overlay,
+and its old overlay is removed: the layout libvirt's own delete of the
+dropped snapshots leaves, which its delete of `<name>` afterwards
+requires. Where intermediates wrote zero clusters (RAID5 sync, mkfs,
+etc.), rebase writes sparse holes — so the reclaim is often dramatic
+with little wall time.
 
 What survives:
 
-- **`<name>` and older snapshots remain revertable** — their overlays
-  are untouched, and the rebased head has `<name>`'s overlay, or the
-  disk `<name>` was taken on, as its backing.
+- **`<name>` and older snapshots remain revertable** — the disks they
+  were taken on are untouched, and the rebased head has the disk
+  `<name>` was taken on as its backing.
 - **The live state of the VM** — semantically unchanged, just stored in
   a different file layout.
 

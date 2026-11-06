@@ -3002,7 +3002,8 @@ class _Libvirt:
     ``domblklist --details`` names *heads*; a plain ``snapshot-delete``
     refuses an external snapshot, and ``--metadata`` forgets it, moving
     its children to its parent and, when it was current, leaving that
-    current.
+    current. ``snapshot-create --redefine`` replaces what a snapshot
+    records under ``<disks>``.
 
     *records* maps snapshot -> {disk target: recorded overlay}; *parents*
     defaults to a linear chain in the order given, and *current* to the
@@ -3022,6 +3023,8 @@ class _Libvirt:
             n: (names[i - 1] if i else None) for i, n in enumerate(names)})
         self.snapshots = names
         self.current = current or names[-1]
+        #: the snapshot each redefine named
+        self.redefined: list[str] = []
 
     def _taken_on(self, name: str, parent: str | None, target: str) -> str:
         if target in self.taken_on.get(name, {}):
@@ -3092,6 +3095,22 @@ class _Libvirt:
             return _result(ok=False, stderr=(
                 "error: unsupported configuration: deletion of 1 external "
                 "disk snapshots not supported yet"))
+        if verb == "snapshot-create":
+            assert "--redefine" in args and "--current" not in args
+            root = ET.fromstring(Path(args[2]).read_text())
+            name = root.findtext("name")
+            # what its children were taken on stays what it recorded
+            for child, parent in self.parents.items():
+                if parent == name:
+                    self.taken_on.setdefault(child, {}).update({
+                        t: p for t, p in self.records[name].items()
+                        if t not in self.taken_on.get(child, {})})
+            self.records[name] = {
+                d.get("name"): d.find("source").get("file")
+                for d in root.findall("disks/disk")
+                if d.get("snapshot") == "external"}
+            self.redefined.append(name)
+            return _result()
         raise AssertionError(f"unexpected virsh call: {args}")
 
 
@@ -3111,7 +3130,8 @@ class TestCollapseKeepsTheLiveDisk:
         base, overlays, memory = _take_external(tmp_path, ["s1", "s2"])
         head = overlays["s2"]
         virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
-                         {"vda": str(head)}, memory)
+                         {"vda": str(head)}, memory,
+                         taken_on={"s1": {"vda": str(base)}})
 
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
@@ -3120,8 +3140,11 @@ class TestCollapseKeepsTheLiveDisk:
                                   recorded_in_use=_nothing_else_records) is True
 
         assert head.is_file(), "the live disk was removed"
-        assert _chain(head) == [str(head), str(overlays["s1"]), str(base)]
+        # on the disk s1 was taken on, s1's own overlay merged in with s2
+        assert _chain(head) == [str(head), str(base)]
         assert all(_reads(head, era) for era in (0, 1, 2))
+        assert virsh.records["s1"] == {"vda": str(head)}
+        assert not overlays["s1"].exists()
         # the rest of the drop still happens
         assert not memory["s2"].exists()
         assert memory["s1"].exists()
@@ -3133,7 +3156,8 @@ class TestCollapseKeepsTheLiveDisk:
         base, overlays, memory = _take_external(tmp_path, ["s1", "s2", "s3"])
         head = overlays["s3"]
         virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
-                         {"vda": str(head)}, memory)
+                         {"vda": str(head)}, memory,
+                         taken_on={"s1": {"vda": str(base)}})
 
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
@@ -3142,20 +3166,24 @@ class TestCollapseKeepsTheLiveDisk:
                                   recorded_in_use=_nothing_else_records) is True
 
         assert head.is_file(), "the live disk was removed"
-        # rebased past s2, with s2's writes merged into the head
-        assert _chain(head) == [str(head), str(overlays["s1"]), str(base)]
+        # rebased past s2 and s1's overlay, their writes merged into the head
+        assert _chain(head) == [str(head), str(base)]
         assert all(_reads(head, era) for era in (0, 1, 2, 3))
-        assert not overlays["s2"].exists()
+        assert not overlays["s2"].exists() and not overlays["s1"].exists()
         assert not memory["s2"].exists() and not memory["s3"].exists()
-        assert overlays["s1"].exists() and memory["s1"].exists()
+        assert memory["s1"].exists()
+        assert virsh.records["s1"] == {"vda": str(head)}
         assert virsh.snapshots == ["s1"]
+        # what s1 was taken with is untouched
+        assert _reads(base, 0) and _reads(base, 1, pattern="0")
 
     @needs_qemu
     def test_deleting_the_newest_snapshot_keeps_the_head(self, sm, tmp_path):
         base, overlays, memory = _take_external(tmp_path, ["s1", "s2", "s3"])
         head = overlays["s3"]
         virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
-                         {"vda": str(head)}, memory)
+                         {"vda": str(head)}, memory,
+                         taken_on={"s1": {"vda": str(base)}})
 
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
@@ -3164,9 +3192,12 @@ class TestCollapseKeepsTheLiveDisk:
                                       recorded_in_use=_nothing_else_records) is True
 
         assert head.is_file(), "the live disk was removed"
-        assert _chain(head) == [str(head), str(overlays["s2"]),
-                                str(overlays["s1"]), str(base)]
+        # on the disk s2 was taken on, s1's overlay, which s1 still records
+        assert _chain(head) == [str(head), str(overlays["s1"]), str(base)]
         assert all(_reads(head, era) for era in (0, 1, 2, 3))
+        assert not overlays["s2"].exists()
+        assert virsh.records["s2"] == {"vda": str(head)}
+        assert virsh.records["s1"] == {"vda": str(overlays["s1"])}
         assert not memory["s3"].exists()
         assert virsh.snapshots == ["s1", "s2"]
 
@@ -3218,7 +3249,8 @@ class TestCollapseKeepsTheLiveDisk:
         _write(head, 5)
         virsh = _Libvirt({"s1": {"vda": str(overlays["s1"])},
                           "s2": {"vda": str(head)}},
-                         {"vda": str(head)}, memory)
+                         {"vda": str(head)}, memory,
+                         taken_on={"s1": {"vda": str(base)}})
 
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
@@ -3227,9 +3259,11 @@ class TestCollapseKeepsTheLiveDisk:
                                   recorded_in_use=_nothing_else_records) is True
 
         assert head.is_file()
-        assert _chain(head) == [str(head), str(overlays["s1"]), str(base)]
+        assert _chain(head) == [str(head), str(base)]
         assert all(_reads(head, era) for era in (0, 1, 5))
         assert _reads(head, 2, pattern="0")
+        assert virsh.records["s1"] == {"vda": str(head)}
+        assert not overlays["s1"].exists()
         assert not memory["s2"].exists() and memory["s1"].exists()
         assert virsh.snapshots == ["s1"]
 
@@ -3549,6 +3583,7 @@ class TestCollapseKeepsTheLiveDisk:
         assert all(_reads(head, era) for era in (0, 5, 6))
         assert _reads(head, 1, pattern="0")
         assert virsh.snapshots == ["s1"] and virsh.current == "s1"
+        assert virsh.records["s1"] == {"vda": str(head)}
         assert not memory["s3"].exists() and memory["s1"].exists()
 
     def test_a_dry_run_that_would_stop_says_so_and_fails(self, sm, tmp_path):
@@ -3913,11 +3948,16 @@ class _RevertingLibvirt:
       live media change fails "Tray of device 'sata0-0-0' is not open"
       unless the tray was opened through QMP first. A live change that
       puts an image behind the wrong driver type fails as qemu fails it;
-    * its own delete of the current snapshot block-commits each overlay the
-      snapshot records into the image under it, which the domain then
-      reads (``qemuSnapshotDeleteExternalPrepare``) -- and fails "failed to
-      find parent disk source in backing chain" for one the domain no
-      longer reads. Of one that is not current (#289):
+    * its own delete of the current snapshot, a leaf, takes the domain's
+      disk for the snapshot's, not what the snapshot records, and
+      block-commits it into the image under it, which the domain then reads
+      (``qemuSnapshotExternalGetSnapDiskSrc``,
+      ``qemuSnapshotDeleteExternalPrepareData``). It fails "failed to find
+      parent disk source in backing chain" where that disk is built on
+      nothing, and "snapshot VM disk source and parent disk source are not
+      the same" where the image under it is not the disk the snapshot was
+      taken on: the shape a collapse left on a line of takes, the head on
+      the target's overlay. Of one that is not current (#289):
 
       - a leaf merges nothing and deletes the image its saved definition is
         built on, where an older snapshot records that disk
@@ -4410,14 +4450,23 @@ class _RevertingLibvirt:
             for target, top, below in merges:
                 self._merge(name, target, top, below)
         elif not metadata and name == self.current:
-            if any(self.disks_now()[t] != p for t, p in records.items()):
-                return _result(ok=False, stderr=(
-                    f"error: Failed to delete snapshot {name}\nerror: "
-                    f"operation failed: failed to find parent disk source in "
-                    f"backing chain"))
-            for target, overlay in records.items():
-                self._commit(target, overlay)
-                Path(overlay).unlink(missing_ok=True)
+            for target in records:
+                below = self.backing.get(self.disks_now()[target],
+                                         (None, None))[1]
+                if below is None:
+                    return _result(ok=False, stderr=(
+                        f"error: Failed to delete snapshot {name}\nerror: "
+                        f"operation failed: failed to find parent disk source "
+                        f"in backing chain"))
+                if below != snap["domain"][target]:
+                    return _result(ok=False, stderr=(
+                        f"error: Failed to delete snapshot {name}\nerror: "
+                        f"operation failed: snapshot VM disk source and "
+                        f"parent disk source are not the same"))
+            for target in records:
+                head = self.disks_now()[target]
+                self._commit(target, head)
+                Path(head).unlink(missing_ok=True)
         elif not metadata:
             # a revert away from it deleted its overlays, as libvirt sees
             # it: what is left of it is the image its definition is built on
@@ -5112,8 +5161,8 @@ class TestARestoreKeepsWhatTheCurrentSnapshotRecords:
     def test_a_delete_boxman_carries_out_by_collapsing(self, sm, tmp_path):
         """libvirt before 9.0 refuses to delete an external snapshot, and
         boxman collapses it away instead: the metadata delete that ends the
-        collapse makes the parent current all the same, and its overlay,
-        the one the live disk is built on, is what a revert deletes."""
+        collapse makes the parent current all the same, and it records the
+        live disk, which is what a revert deletes."""
         vm = _RevertingLibvirt(tmp_path)
         vm.take("s1")
         vm.take("s2")
@@ -5121,7 +5170,9 @@ class TestARestoreKeepsWhatTheCurrentSnapshotRecords:
 
         assert self._delete(sm, vm, "s2") is True
         assert "s2" not in vm.snapshots and vm.current == "s1"
-        assert vm.backing[vm.live["vda"]][1] == vm.snapshots["s1"]["disks"]["vda"]
+        s1 = vm.snapshots["s1"]
+        assert s1["disks"]["vda"] == vm.live["vda"]
+        assert vm.backing[vm.live["vda"]][1] == s1["domain"]["vda"]
 
         self._restores(sm, vm, "s1", "s1")
 
@@ -5701,6 +5752,275 @@ class TestACollapseInASnapshotTree:
         assert "['r']" in str(error.call_args.args[0])
         assert virsh.snapshots == ["r", "s"]
         assert all(p.exists() for p in [*overlays.values(), *memory.values()])
+
+
+class TestADeleteAfterACollapse:
+    """``take c1, take c2, collapse --to c1`` left c1 current, and libvirt
+    then refused to delete it: "snapshot VM disk source and parent disk
+    source are not the same". Its delete of the current snapshot takes the
+    domain's disk for the snapshot's and requires the image right under it
+    to be the disk the snapshot was taken on
+    (``qemuSnapshotDeleteExternalPrepareData``), and on a line of takes the
+    collapse had rebased the head onto c1's own overlay instead. boxman
+    falls back only where libvirt says "external" or "not supported", so
+    nothing was removed. c1 also went on recording that overlay: a restore
+    of it unlinked the overlay and left the head where nothing names it,
+    and a collapse onto it again left the first collapse's head behind.
+
+    A collapse now rebases each head onto the disk the target was taken
+    on, has the target record the head, and removes what it merged into the
+    head and nothing needs: as libvirt's own delete of the dropped
+    snapshots leaves them."""
+
+    @staticmethod
+    def _collapse(sm, vm, target, dry_run=False):
+        """``collapse_to`` with the VM shut down first and started after,
+        as the manager does: ``(result, warnings, info lines)``."""
+        running, vm.active = vm.active, False
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, \
+             patch.object(sm.logger, "warning") as warning, \
+             patch.object(sm.logger, "info") as info:
+            done = sm.collapse_to(vm.VM, target, dry_run=dry_run,
+                                  recorded_in_use=vm.recorded)
+        if running:
+            vm.active, vm.live = True, dict(vm.config)
+        return (done, " ".join(str(c.args[0]) for c in warning.call_args_list),
+                [str(c.args[0]) for c in info.call_args_list])
+
+    @staticmethod
+    def _delete(sm, vm, name):
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, patch.object(sm.logger, "error") as error:
+            done = sm.delete_snapshot(vm.VM, name, recorded_in_use=vm.recorded)
+        return done, " ".join(str(c.args[0]) for c in error.call_args_list)
+
+    @staticmethod
+    def _unaccounted(vm) -> list[str]:
+        """The disk images of the VM that nothing accounts for -- in no
+        chain of a disk it runs on, recorded and taken on by no snapshot --
+        which nothing removes until ``destroy``."""
+        accounted = set()
+        for source in vm.disks_now().values():
+            accounted.update(vm._chain(source))
+        for snap in vm.snapshots.values():
+            for disks in (snap["disks"], snap["revert_disks"] or {},
+                          snap["domain"]):
+                accounted.update(p for p in disks.values() if p)
+        dirs = [vm.workdir] + ([vm.disk_dir] if vm.disk_dir else [])
+        return sorted(str(p) for d in dirs for p in d.iterdir()
+                      if "_snapshot_" not in p.name and str(p) not in accounted)
+
+    @staticmethod
+    def _settled(vm, name) -> bool:
+        """Whether *name* records each disk the VM runs on, and each is
+        built right on the disk *name* was taken on: what libvirt's delete
+        of it, current, needs."""
+        snap = vm.snapshots[name]
+        return all(snap["disks"][t] == vm.disks_now()[t]
+                   and vm.backing[vm.disks_now()[t]][1] == snap["domain"][t]
+                   for t, p in snap["disks"].items() if p)
+
+    def test_the_snapshot_a_collapse_left_current_can_be_deleted(
+            self, sm, tmp_path):
+        """The issue's sequence."""
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("c1")
+        vm.take("c2")
+        taken_on, c1_overlay = (vm.snapshots["c1"]["domain"]["vda"],
+                                vm.snapshots["c1"]["disks"]["vda"])
+
+        assert self._collapse(sm, vm, "c1")[0] is True
+        assert vm.current == "c1" and self._settled(vm, "c1")
+        assert not os.path.exists(c1_overlay)
+        assert _validity(sm, vm) == {"c1": (True, [])}
+
+        done, errors = self._delete(sm, vm, "c1")
+
+        assert done is True, errors
+        assert vm.snapshots == {} and vm.current is None
+        # what the guest wrote since c1 is committed into what c1 was
+        # taken on, which the VM runs on again
+        assert vm.live["vda"] == taken_on
+        assert self._unaccounted(vm) == []
+        assert vm.memory_files() == []
+
+    def test_one_with_a_parent_is_merged_into_the_disk_it_was_taken_on(
+            self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        for name in ("p0", "c1", "c2"):
+            vm.take(name)
+        assert self._collapse(sm, vm, "c1")[0] is True
+
+        done, errors = self._delete(sm, vm, "c1")
+
+        assert done is True, errors
+        assert sorted(vm.snapshots) == ["p0"] and vm.current == "p0"
+        assert vm.live["vda"] == vm.snapshots["p0"]["disks"]["vda"]
+        assert self._unaccounted(vm) == []
+        assert _validity(sm, vm) == {"p0": (True, [])}
+        assert _restore(sm, vm, "p0") is True
+
+    def test_a_child_taken_after_the_collapse_and_deleted_leaves_it_deletable(
+            self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("c1")
+        vm.take("c2")
+        assert self._collapse(sm, vm, "c1")[0] is True
+        vm.take("c3")
+
+        assert self._delete(sm, vm, "c3")[0] is True
+        assert vm.current == "c1"
+        done, errors = self._delete(sm, vm, "c1")
+
+        assert done is True, errors
+        assert vm.snapshots == {} and self._unaccounted(vm) == []
+
+    def test_a_second_collapse_leaves_nothing_behind(self, sm, tmp_path):
+        """The first collapse's head was merged into the second's and left
+        where nothing records it: the target still named its own overlay,
+        which the head stood on."""
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("k1")
+        vm.take("k2")
+        assert self._collapse(sm, vm, "k1")[0] is True
+        vm.take("k3")
+
+        assert self._collapse(sm, vm, "k1")[0] is True
+
+        assert self._unaccounted(vm) == []
+        assert self._settled(vm, "k1")
+        assert self._delete(sm, vm, "k1")[0] is True
+        assert self._unaccounted(vm) == []
+
+    def test_a_restore_after_the_collapse_names_every_file_it_leaves(
+            self, sm, tmp_path):
+        """The revert unlinks what the current snapshot records and makes a
+        new overlay; the old ones are put back and named (#287). The head
+        was not among them, and stayed unnamed."""
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("r1")
+        vm.take("r2")
+        assert self._collapse(sm, vm, "r1")[0] is True
+
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, patch.object(sm.logger, "warning") as warning:
+            assert sm.snapshot_restore(
+                vm.VM, "r1", paths_in_use=vm.in_use) is True
+        warned = " ".join(str(c.args[0]) for c in warning.call_args_list)
+
+        left = self._unaccounted(vm)
+        assert left and all(path in warned for path in left), (left, warned)
+        assert _validity(sm, vm) == {"r1": (True, [])}
+        assert self._delete(sm, vm, "r1")[0] is True
+
+    def test_after_a_restore_of_the_target_and_a_take_the_reverts_overlay_goes(
+            self, sm, tmp_path):
+        """#291's fork, its other branch deleted: the head is rebased onto
+        the disk s1 was taken on, and the overlay of the revert it stood
+        on, merged into it, was recorded by nothing."""
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        vm.take("s2")
+        assert _restore(sm, vm, "s1") is True
+        reverted = vm.live["vda"]
+        vm.take("s3")
+        assert self._delete(sm, vm, "s2")[0] is True
+        left = self._unaccounted(vm)
+
+        assert self._collapse(sm, vm, "s1")[0] is True
+
+        assert not os.path.exists(reverted)
+        assert self._unaccounted(vm) == left and self._settled(vm, "s1")
+        assert self._delete(sm, vm, "s1")[0] is True
+
+    def test_the_delete_boxman_carries_out_by_collapsing_leaves_the_parent_deletable(
+            self, sm, tmp_path):
+        """libvirt before 9.0 refuses the delete of s3, and boxman collapses
+        it onto s2; libvirt 9.0 and later then deletes s2 and s1."""
+        vm = _RevertingLibvirt(tmp_path)
+        for name in ("s1", "s2", "s3"):
+            vm.take(name)
+        vm.native_delete = False
+        assert self._delete(sm, vm, "s3")[0] is True
+        assert self._settled(vm, "s2")
+        vm.native_delete = True
+
+        for name in ("s2", "s1"):
+            done, errors = self._delete(sm, vm, name)
+            assert done is True, (name, errors)
+        assert vm.snapshots == {} and self._unaccounted(vm) == []
+
+    def test_two_disks_with_their_overlays_in_a_disk_snapshot_dir(
+            self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path, data_disk=True,
+                               disk_dir=tmp_path / "fast")
+        vm.take("c1")
+        vm.take("c2")
+
+        assert self._collapse(sm, vm, "c1")[0] is True
+
+        assert self._settled(vm, "c1")
+        assert set(vm.snapshots["c1"]["disks"]) >= {"vda", "vdb"}
+        assert self._unaccounted(vm) == []
+        assert self._delete(sm, vm, "c1")[0] is True
+        assert self._unaccounted(vm) == []
+
+    def test_a_record_that_cannot_be_rewritten_keeps_its_overlay_and_says_so(
+            self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("c1")
+        vm.take("c2")
+        c1_overlay = vm.snapshots["c1"]["disks"]["vda"]
+        vm.fail_redefine = "error: invalid argument"
+
+        done, warned, _ = self._collapse(sm, vm, "c1")
+
+        assert done is True
+        assert f"'c1' on vm01 still records {c1_overlay}" in warned
+        assert vm.snapshots["c1"]["disks"]["vda"] == c1_overlay
+        assert os.path.exists(c1_overlay)
+        # the head is on the disk c1 was taken on all the same
+        assert self._delete(sm, vm, "c1")[0] is True
+
+    def test_its_dry_run_says_what_the_target_will_record_and_changes_nothing(
+            self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("c1")
+        vm.take("c2")
+        c1 = vm.snapshots["c1"]
+        head, overlay, taken_on = (vm.live["vda"], c1["disks"]["vda"],
+                                   c1["domain"]["vda"])
+        files = sorted(p.name for p in vm.workdir.iterdir())
+
+        done, _warned, lines = self._collapse(sm, vm, "c1", dry_run=True)
+
+        assert done is True
+        assert f"[dry-run]   would rebase {head} onto {taken_on}" in lines
+        assert (f"[dry-run]   'c1' would record {head} as its overlay of "
+                f"vda, in place of {overlay}") in lines
+        assert (f"[dry-run]   would remove {overlay}, merged into the head"
+                in lines)
+        assert sorted(p.name for p in vm.workdir.iterdir()) == files
+        assert c1["disks"]["vda"] == overlay and vm.redefined == []
+
+    def test_the_rest_of_the_record_goes_back_as_libvirt_wrote_it(
+            self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("c1")
+        vm.take("c2")
+        before = vm.snapshot_xml("c1")
+
+        assert self._collapse(sm, vm, "c1")[0] is True
+
+        [xml] = vm.redefined
+        assert "<libosinfo:os id='http://nixos.org/nixos/unknown'/>" in xml
+        assert "<boxman:disk name='root'" in xml
+        assert "ns0:" not in xml
+        assert xml.count("<disk ") == before.count("<disk ")
+        # the CDROM's record, and the definition c1 saved, as libvirt wrote
+        assert "<disk name='sda' snapshot='no'/>" in xml
+        assert before[before.index("<domain "):] == xml[xml.index("<domain "):]
 
 
 class TestADeleteTakesItsCompressedMemoryImageWithIt:
