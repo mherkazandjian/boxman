@@ -1,3 +1,5 @@
+import base64
+import binascii
 import json
 import os
 import re
@@ -31,6 +33,15 @@ from .iso_boot_vm import IsoBootVM
 from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
+from .snapshot_prune import (
+    SAVE_HEADER_READ,
+    Held,
+    References,
+    SnapshotRecord,
+    is_qcow2_file,
+    save_image_owner,
+    save_image_xml,
+)
 from .storage import StorageManager
 from .storage_pools import ensure_pool_on, refresh_pools_holding
 from .virsh_edit import VirshEdit
@@ -163,6 +174,12 @@ def _absence_probe(path: str) -> str:
 #: what :func:`_unreadable_probe` prints once it has established that a
 #: path exists and that whoever the probe runs as may not read it
 _UNREADABLE = "boxman-source-unreadable"
+
+#: how many times, and how many seconds apart, ``snapshot prune``'s scan
+#: asks a running domain which job it runs before it fails
+#: (:meth:`LibVirtSession._hold_backup_jobs`)
+_JOB_ATTEMPTS = 3
+_JOB_RETRY_DELAY = 1.0
 
 #: the most layers :meth:`LibVirtSession._libvirt_backing_chain` follows —
 #: far more than any chain boxman builds (a disk under its snapshot
@@ -1083,9 +1100,14 @@ class LibVirtSession(SessionConfigMixin):
         destroyer = DestroyVM(name=name, provider_config=self.provider_config)
         return destroyer.confirm_absent()
 
-    def disk_paths_in_use(self) -> FilesInUse | None:
+    def disk_paths_in_use(self, media: dict[str, str] | None = None
+                          ) -> FilesInUse | None:
         """
         Map every image file a defined domain uses to that domain's name.
+
+        With *media*, each CD-ROM or floppy source of a domain, as either
+        inventory names it, is mapped to that domain there too, as read in
+        the same pass (``snapshot prune`` scans no directory one is in).
 
         Covers each domain's disk and CD-ROM sources in both its live and
         its persistent definition, and every layer of their backing chains,
@@ -1182,7 +1204,7 @@ class LibVirtSession(SessionConfigMixin):
         for domain, uuid in domains:
             try:
                 used = self._files_used_by(virsh, reads, domain, uuid,
-                                           domain in active)
+                                           domain in active, media=media)
             except _DomainGoneError:
                 self.logger.debug(
                     f"domain {domain} went away during the in-use scan, so "
@@ -1204,11 +1226,14 @@ class LibVirtSession(SessionConfigMixin):
         return in_use
 
     def _files_used_by(self, virsh, reads: _ChainReads, domain: str,
-                       uuid: str, active: bool) -> FilesInUse | None:
+                       uuid: str, active: bool,
+                       media: dict[str, str] | None = None
+                       ) -> FilesInUse | None:
         """
         What *domain*, whose UUID is *uuid*, uses, as
         :meth:`disk_paths_in_use` maps it — every chain read through the
-        scan's *reads* — and its block jobs too when it is *active*.
+        scan's *reads* — and its block jobs too when it is *active*. Its
+        CD-ROM and floppy sources go into *media* as well, when given.
 
         Returns:
             The map, or ``None`` when it cannot be told.
@@ -1226,6 +1251,10 @@ class LibVirtSession(SessionConfigMixin):
                    if row.type not in REMOTE_SOURCE_TYPES
                    and row.source != '-'}
         volumes = {row.source for row in rows if row.type == 'volume'}
+        if media is not None:
+            for row in rows:
+                if row.device in ('cdrom', 'floppy') and row.source in sources:
+                    media.setdefault(row.source, domain)
         live: dict[str, ET.Element | None] = {}
         used = FilesInUse()
         for source in sorted(sources):
@@ -2872,6 +2901,516 @@ class LibVirtSession(SessionConfigMixin):
         memory images (#253, #274). ``None`` when that cannot be told.
         """
         return self.snapshot_files_in_use(overlays_too=False)
+
+    # --- what ``snapshot prune`` decides from (#294) ---------------------
+
+    def domains(self) -> list[tuple[str, str]] | None:
+        """``(name, uuid)`` of every domain on the connection, as ``virsh
+        list --all --uuid --name`` lists them; ``None`` when that cannot be
+        read."""
+        virsh = VirshCommand(provider_config=self.provider_config)
+        listing = virsh.execute("list", "--all", "--uuid", "--name",
+                                warn=True)
+        return _listed_domains(listing.stdout) if listing.ok else None
+
+    def snapshot_references(self) -> References | None:
+        """
+        G2 of ``snapshot prune``: every file a snapshot of any domain on the
+        connection names, mapped to who names it -- ``snapshot 's1' of
+        <domain>`` -- by path and by identity, as :meth:`_record_in_use`
+        records a file.
+
+        Wider than :meth:`snapshot_files_in_use`, and tolerant of unusual
+        snapshots: every ``<source>`` of every ``<disk>`` its XML holds --
+        in ``<disks>``, ``<revertDisks>``, the saved ``<domain>`` and
+        ``<inactiveDomain>``, and their nested ``<backingStore>`` -- by its
+        ``file`` or ``dev``, a volume by the path ``vol-path`` gives it; its
+        ``<memory file>``, with the ``.raw.zst`` beside it; and every image
+        below each file named (:meth:`_backing_chain_files`), though a file
+        confirmed absent has none. What each snapshot records is kept in
+        :attr:`References.snapshots`.
+
+        Each domain is read by the UUID the listing gave, not its name
+        (:meth:`snapshot_files_in_use`), and one gone meanwhile is skipped
+        (:meth:`_raise_if_gone`).
+
+        Fails closed: ``None``, with a warning, when the domains, a domain's
+        snapshots, a volume's path or a chain cannot be read, an external
+        overlay a snapshot records names no local file, or a file's
+        identity cannot be read other than for naming no file.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        listing = virsh.execute("list", "--all", "--uuid", "--name",
+                                warn=True)
+        domains = _listed_domains(listing.stdout) if listing.ok else None
+        if domains is None:
+            self.logger.warning(
+                "could not read the domain list, so what their snapshots "
+                "name cannot be told")
+            return None
+        reads = _ChainReads(self.provider_config)
+        chains: dict[str, list[str] | None] = {}
+        references = References()
+        for domain, uuid in domains:
+            try:
+                snapshots = self._snapshots_named(virsh, domain, uuid)
+            except _DomainGoneError:
+                continue
+            except _DomainRenamedError as renamed:
+                self.logger.warning(
+                    f"domain {domain} was renamed {renamed.name} while its "
+                    f"snapshots were read, so what they name was not read "
+                    f"-- retry")
+                return None
+            if snapshots is None:
+                return None
+            references.snapshots[domain] = {
+                name: record for name, (record, _files) in snapshots.items()}
+            for name, (_record, files) in snapshots.items():
+                paths = list(files)
+                for path in files:
+                    if path not in chains:
+                        chains[path] = self._chain_or_none(reads, path)
+                    if chains[path] is None:
+                        self.logger.warning(
+                            f"the backing chain of {path}, which snapshot "
+                            f"'{name}' of domain {domain} names, could not be "
+                            f"read, so what is built under it cannot be told")
+                        return None
+                    paths += chains[path]
+                if not self._record_named(
+                        references, f"snapshot '{name}' of {domain}", paths):
+                    return None
+        return references
+
+    def _snapshots_named(self, virsh, domain: str, uuid: str
+                         ) -> dict[str, tuple[SnapshotRecord, list[str]]] | None:
+        """
+        ``{snapshot: (what it records, every file it names)}`` for *domain*,
+        whose UUID is *uuid* (:meth:`snapshot_references`), or ``None``, with
+        a warning, when that cannot be told.
+
+        Raises:
+            _DomainGoneError, _DomainRenamedError: A read failed, and
+                *domain* went away or was renamed since.
+        """
+        where = f"the snapshots of domain {domain}"
+        listed = virsh.execute("snapshot-list", uuid, "--name", warn=True)
+        if not listed.ok:
+            self._raise_if_gone(virsh, domain, uuid)
+            self.logger.warning(f"could not list {where}: "
+                                f"{(listed.stderr or '').strip()}")
+            return None
+        names = SnapshotManager._listed_snapshot_names(listed.stdout)
+        if any(n == '' for n in names) or len(set(names)) != len(names):
+            self.logger.warning(f"could not read {where}: a name is blank or "
+                                f"listed twice")
+            return None
+        found = {}
+        for name in names:
+            dumped = virsh.execute("snapshot-dumpxml", uuid, name, warn=True)
+            if not dumped.ok:
+                self._raise_if_gone(virsh, domain, uuid)
+                self.logger.warning(
+                    f"could not read snapshot '{name}' of domain {domain}: "
+                    f"{(dumped.stderr or '').strip()}")
+                return None
+            try:
+                root = ET.fromstring(dumped.stdout)
+            except ET.ParseError as exc:
+                self.logger.warning(f"could not parse snapshot '{name}' of "
+                                    f"domain {domain}: {exc}")
+                return None
+            named = self._snapshot_files(virsh, root)
+            if isinstance(named, str):
+                self.logger.warning(f"snapshot '{name}' of domain {domain}: "
+                                    f"{named}")
+                return None
+            found[name] = named
+        return found
+
+    @staticmethod
+    def _source_path(virsh, source: ET.Element) -> str | None:
+        """The local file a disk's ``<source>`` names: its ``file`` or
+        ``dev``, or the path of the volume it names (``vol-path``); ``""``
+        for one that names nothing local; ``None`` when a volume's path
+        cannot be read."""
+        path = source.get("file") or source.get("dev")
+        if path:
+            return path
+        volume, pool = source.get("volume"), source.get("pool")
+        if not volume:
+            return ""
+        result = virsh.execute("vol-path", volume, pool=pool, warn=True)
+        path = (result.stdout or "").strip() if result.ok else ""
+        return path or None
+
+    def _snapshot_files(self, virsh, root: ET.Element
+                        ) -> tuple[SnapshotRecord, list[str]] | str:
+        """What the snapshot whose XML is *root* records, and every file it
+        names (:meth:`snapshot_references`); or why that cannot be told."""
+        files: list[str] = []
+        for disk in root.iter("disk"):
+            for source in disk.iter("source"):
+                path = self._source_path(virsh, source)
+                if path is None:
+                    return (f"the path of volume {source.get('volume')} in "
+                            f"pool {source.get('pool')} could not be read")
+                if path and path not in files:
+                    files.append(path)
+        recorded: dict[str, dict[str, str]] = {}
+        for section in ("disks", "revertDisks"):
+            recorded[section] = {}
+            for disk in root.findall(f"{section}/disk"):
+                if disk.get("snapshot") != "external":
+                    continue
+                source = disk.find("source")
+                path = (self._source_path(virsh, source)
+                        if source is not None else "")
+                if not path:
+                    return (f"its {section} record an overlay of disk "
+                            f"{disk.get('name')} that names no local file")
+                recorded[section][disk.get("name", "")] = path
+        taken_on = {}
+        definition = SnapshotManager._definition_a_revert_builds_on(root)
+        for disk in (definition.iter("disk") if definition is not None
+                     else ()):
+            target, source = disk.find("target"), disk.find("source")
+            if target is not None and source is not None and (
+                    source.get("file") or source.get("dev")):
+                taken_on[target.get("dev", "")] = (source.get("file")
+                                                   or source.get("dev"))
+        element = root.find("memory")
+        memory = element.get("file") if element is not None else None
+        if memory:
+            files += [memory, f"{memory}.zst"]
+        return SnapshotRecord(disks=recorded["disks"],
+                              revert_disks=recorded["revertDisks"],
+                              taken_on=taken_on, memory=memory), files
+
+    def _chain_or_none(self, reads: _ChainReads,
+                       path: str) -> list[str] | None:
+        """The images below *path*, as :meth:`_backing_chain_files` names
+        them; none for a file confirmed absent, a ``.raw.zst`` that is not
+        there, or one that is no image; ``None`` when they cannot be
+        read."""
+        if path.endswith(".zst") or self._source_absent(path):
+            return []
+        return self._backing_chain_files(reads, path)
+
+    def _record_named(self, scan: FilesInUse, who: str,
+                      paths: list[str]) -> bool:
+        """:meth:`_record_in_use` of *paths* as named by *who*; False, with
+        a warning, when an identity cannot be read."""
+        for path in paths:
+            try:
+                found = self._identify(path)
+            except OSError as exc:
+                self.logger.warning(
+                    f"could not read the identity of {path}, which {who} "
+                    f"names ({exc}): whether a file listed here is that one "
+                    f"cannot be told -- make it accessible")
+                return False
+            if found is None:
+                scan.setdefault(os.path.realpath(path), who)
+                scan.setdefault(path, who)
+                continue
+            name, identity = found
+            scan.setdefault(name, who)
+            scan.setdefault(path, who)
+            scan.identities.setdefault(identity, who)
+        return True
+
+    def files_held(self) -> Held | None:
+        """
+        G1 of ``snapshot prune``: what every domain uses
+        (:meth:`disk_paths_in_use`, its block jobs' destinations included),
+        and every CD-ROM and floppy source (:attr:`Held.media`); and also,
+        with every image below each, the disks of the definition a managed
+        save holds, which the next start runs on (``managedsave-dumpxml``),
+        and the scratch and target files of an active backup job
+        (``backup-dumpxml``).
+
+        Fails closed: ``None``, with a warning, when any of that cannot be
+        read, but for a domain gone meanwhile, a managed save consumed
+        meanwhile, and a domain stopped meanwhile, which runs no job.
+        """
+        media: dict[str, str] = {}
+        in_use = self.disk_paths_in_use(media=media)
+        if in_use is None:
+            return None
+        held = Held(in_use)
+        held.identities.update(in_use.identities)
+        held.media.update(media)
+        virsh = VirshCommand(provider_config=self.provider_config)
+        reads = _ChainReads(self.provider_config)
+        if not self._hold_managed_saves(virsh, reads, held):
+            return None
+        if not self._hold_backup_jobs(virsh, reads, held):
+            return None
+        return held
+
+    def _hold_files(self, reads: _ChainReads, held: Held, who: str,
+                    paths: list[str]) -> bool:
+        """Record *paths* and every image below each as held by *who*;
+        False, with a warning, when a chain or an identity cannot be
+        read."""
+        named = list(paths)
+        for path in paths:
+            chain = self._chain_or_none(reads, path)
+            if chain is None:
+                self.logger.warning(
+                    f"the backing chain of {path}, which {who} holds, could "
+                    f"not be read, so which files it holds cannot be told")
+                return False
+            named += chain
+        return self._record_named(held, who, named)
+
+    def _hold_managed_saves(self, virsh, reads: _ChainReads,
+                            held: Held) -> bool:
+        """The disks of every managed save's definition, into *held*."""
+        flags = ("list", "--all", "--with-managed-save", "--uuid", "--name")
+        listing = virsh.execute(*flags, warn=True)
+        saved = _listed_domains(listing.stdout) if listing.ok else None
+        if saved is None:
+            self.logger.warning("could not list the domains holding a "
+                                "managed save")
+            return False
+        for domain, uuid in saved:
+            dumped = virsh.execute("managedsave-dumpxml", uuid, warn=True)
+            try:
+                root = ET.fromstring(dumped.stdout) if dumped.ok else None
+            except ET.ParseError:
+                root = None
+            if root is None:
+                again = virsh.execute(*flags, warn=True)
+                listed = _listed_domains(again.stdout) if again.ok else None
+                if listed is not None and uuid not in {u for _n, u in listed}:
+                    continue    # started or undefined meanwhile: no save
+                self.logger.warning(
+                    f"could not read the managed save of domain {domain}: "
+                    f"{(dumped.stderr or '').strip()}")
+                return False
+            paths = []
+            for disk in root.iterfind("./devices/disk"):
+                source = disk.find("source")
+                path = (self._source_path(virsh, source)
+                        if source is not None else "")
+                if path is None:
+                    self.logger.warning(
+                        f"could not read the path of a volume the managed "
+                        f"save of domain {domain} names")
+                    return False
+                if path:
+                    paths.append(path)
+            if not self._hold_files(reads, held,
+                                    f"the managed save of domain {domain}",
+                                    paths):
+                return False
+        return True
+
+    def _hold_backup_jobs(self, virsh, reads: _ChainReads,
+                          held: Held) -> bool:
+        """The scratch and target files of every active backup job, into
+        *held*. ``domjobinfo --rawstats`` says which job a running domain
+        runs by its ``operation`` (9, ``VIR_DOMAIN_JOB_OPERATION_BACKUP``);
+        a job that does not say is asked for its backup too, and one whose
+        backup then cannot be read fails the scan."""
+        running = virsh.execute("list", "--uuid", "--name", warn=True)
+        active = _listed_domains(running.stdout) if running.ok else None
+        if active is None:
+            self.logger.warning("could not list the running domains, so "
+                                "which backup jobs run cannot be told")
+            return False
+        for domain, uuid in active:
+            # a domain busy with another job can fail to report it ("invalid
+            # job statistics type", libvirt 10.10, during a snapshot); its
+            # jobs exclude each other, and one that ends shortly is asked
+            # again before the scan fails
+            for attempt in range(_JOB_ATTEMPTS):
+                if attempt:
+                    time.sleep(_JOB_RETRY_DELAY)
+                info = virsh.execute("domjobinfo", uuid, "--rawstats",
+                                     warn=True)
+                if info.ok:
+                    break
+            if not info.ok:
+                again = virsh.execute("list", "--uuid", "--name", warn=True)
+                listed = _listed_domains(again.stdout) if again.ok else None
+                if listed is not None and uuid not in {u for _n, u in listed}:
+                    continue    # stopped meanwhile: it runs no job
+                self.logger.warning(
+                    f"could not read which job domain {domain} runs, so "
+                    f"whether a backup job holds files cannot be told: "
+                    f"{(info.stderr or '').strip()} -- retry once that job "
+                    f"has ended")
+                return False
+            # "Job type: <n>", a blank line, then one "<field>: <value>"
+            # line per typed parameter, none when no job runs (libvirt
+            # 10.10); the field names are not translated, the label may be
+            _type, _blank, params = (info.stdout or "").partition("\n\n")
+            stats = dict(re.findall(r"^\s*([A-Za-z_.]+):\s*(.*?)\s*$",
+                                    params, re.M))
+            operation = stats.get("operation", "")
+            if not stats or (operation and operation != "9"):
+                continue
+            dumped = virsh.execute("backup-dumpxml", uuid, warn=True)
+            try:
+                root = ET.fromstring(dumped.stdout) if dumped.ok else None
+            except ET.ParseError:
+                root = None
+            if root is None:
+                self.logger.warning(
+                    f"domain {domain} runs a job that may be a backup, whose "
+                    f"files could not be read: "
+                    f"{(dumped.stderr or '').strip()} -- retry once it ends")
+                return False
+            paths = [element.get("file") or element.get("dev")
+                     for disk in root.iterfind("./disks/disk")
+                     for element in disk if element.tag in ("scratch",
+                                                            "target")]
+            if not self._hold_files(reads, held,
+                                    f"a backup job of domain {domain}",
+                                    [path for path in paths if path]):
+                return False
+        return True
+
+    def image_headers(self, paths: list[str]) -> dict[str, dict | None]:
+        """
+        One header level of each of *paths* -- G3 of ``snapshot prune`` --
+        as ``{"format": ..., "backing": the image right under it, or
+        None}``, or ``None`` for one whose header cannot be read.
+
+        A file this process can read that does not start as a qcow2 image
+        is no image built on another, and is not handed to ``qemu-img``.
+        Any other is read with ``qemu-img info -U`` (one level, no
+        ``--backing-chain``: an overlay whose backing file is gone still
+        reads, #289), through the runtime's wrapper; one ``qemu-img``, run
+        as the user, may not read is read through libvirt from the pool on
+        its directory (:meth:`_libvirt_image`, #221).
+        """
+        reads = _ChainReads(self.provider_config)
+        refreshed: dict[str, bool] = {}
+        return {path: self._image_header(reads, path, refreshed)
+                for path in paths}
+
+    def _image_header(self, reads: _ChainReads, path: str,
+                      refreshed: dict[str, bool]) -> dict | None:
+        """:meth:`image_headers` of one file."""
+        if is_qcow2_file(path) is False:
+            return {"format": "not qcow2", "backing": None}
+        qemu_img = f"qemu-img info --output=json -U {shlex.quote(path)}"
+        result = reads.cmd.execute_shell(qemu_img, warn=True)
+        if not result.ok:
+            if (not reads.cmd.sudo_prefix(qemu_img)
+                    and self._source_unreadable(reads, path)):
+                image = self._libvirt_image(reads, path, refreshed)
+                if image is not None:
+                    return {"format": image["format"],
+                            "backing": image.get("full-backing-filename")}
+            return None
+        try:
+            info = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(info, dict) or not info.get("format"):
+            return None
+        backing = info.get("full-backing-filename") or info.get(
+            "backing-filename")
+        if backing and not os.path.isabs(backing):
+            backing = os.path.join(os.path.dirname(path), backing)
+        return {"format": info["format"], "backing": backing or None}
+
+    def image_locks_held(self, paths: list[str]) -> set[str]:
+        """
+        The images of *paths* whose lock a process holds: ``qemu-img info``
+        without ``-U``, through the runtime's wrapper, refused for a lock.
+
+        Advisory, and the one place the error text is read: a held lock
+        keeps a file ``snapshot prune`` would list as removable, and a probe
+        that cannot run for any other reason blocks nothing -- G1 has
+        already found every file a domain names.
+        """
+        cmd = LibVirtCommandBase(provider_config=self.provider_config)
+        held = set()
+        for path in paths:
+            result = cmd.execute_shell(
+                f"qemu-img info --output=json {shlex.quote(path)}", warn=True)
+            if not result.ok and "lock" in (result.stderr or "").lower():
+                held.add(path)
+        return held
+
+    def memory_image_owner(self, path: str) -> tuple[str, str] | None:
+        """
+        ``(name, uuid)`` of the domain whose definition the libvirt save
+        image *path* holds -- a snapshot's memory image -- or ``None`` when
+        that cannot be read.
+
+        A ``.raw`` is read by libvirt (``virsh save-image-dumpxml``), as
+        root, though the file is ``0600`` root's. A ``.raw.zst`` is
+        decompressed through the runtime's wrapper as far as its header
+        (``zstd -dc | head``), and the header parsed
+        (:func:`save_image_xml`).
+        """
+        if path.endswith(".zst"):
+            cmd = LibVirtCommandBase(provider_config=self.provider_config)
+            # sudo, as the policy says, goes on zstd: the first word
+            result = cmd.execute_shell(
+                f"zstd -dcq -- {shlex.quote(path)} | head -c "
+                f"{SAVE_HEADER_READ} | base64 -w0", warn=True)
+            if not result.ok:
+                return None
+            try:
+                data = base64.b64decode((result.stdout or "").strip(),
+                                        validate=True)
+            except (ValueError, binascii.Error):
+                return None
+            return save_image_owner(save_image_xml(data))
+        virsh = VirshCommand(provider_config=self.provider_config)
+        result = virsh.execute("save-image-dumpxml", path, warn=True)
+        return save_image_owner(result.stdout) if result.ok else None
+
+    def disk_snapshot_pool_dirs(self, project: str, cluster: str
+                                ) -> list[tuple[str, str]] | None:
+        """
+        ``(pool, target)`` of each directory pool boxman defined for
+        *cluster*'s ``disk_snapshot_dir`` --
+        ``bprj__<project>__bprj_<cluster>_disk_snapshots``, or that with
+        ``_<n>`` added -- which a ``disk_snapshot_dir`` set otherwise since
+        leaves on the old directory (:func:`storage_pools.ensure_pool_on`).
+        Only the pools of those names are described; one undefined between
+        the listing and its description is passed over.
+
+        Returns ``None`` when the pools cannot be listed, or one of those
+        names that is still listed cannot be described.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        named = re.compile(
+            re.escape(f"bprj__{project}__bprj_{cluster}_disk_snapshots")
+            + r"(?:_[0-9]+)?")
+        listing = virsh.execute("pool-list", "--all", "--name", warn=True)
+        if not listing.ok:
+            return None
+        found = []
+        for name in (line.strip() for line in listing.stdout.splitlines()):
+            if not named.fullmatch(name):
+                continue
+            dumped = virsh.execute("pool-dumpxml", name, warn=True)
+            try:
+                root = ET.fromstring(dumped.stdout) if dumped.ok else None
+            except ET.ParseError:
+                root = None
+            if root is None:
+                again = virsh.execute("pool-list", "--all", "--name",
+                                      warn=True)
+                if again.ok and name not in {
+                        line.strip() for line in again.stdout.splitlines()}:
+                    continue
+                return None
+            target = root.findtext("./target/path")
+            if root.get("type") == "dir" and target:
+                found.append((name, target))
+        return found
     # end snapshots
 
     @property

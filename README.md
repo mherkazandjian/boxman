@@ -542,6 +542,12 @@ The right ops, in order, for the snapshot lifecycle and disk hygiene:
     (`qemu-img rebase` is offline-only) and restarts it after. Refused
     while a snapshot on another branch (after a restore and a take) is
     built on `<stable-snap>`.
+- **After restores, deletes and collapses** (read-only):
+  - `boxman snapshot prune --dry-run` — lists the files snapshots left
+    behind that no snapshot records and no domain uses (overlays a restore
+    put back, memory images, an interrupted restore's `.preserve`
+    backups), each removable, kept with the reason, or unknown, and what
+    removing them would reclaim. This version only lists.
 
 The "promote stable, drop pre-stable" pattern: take `pre-step-N` and
 `post-step-N` while iterating; once step N is validated, run `snapshot
@@ -630,6 +636,10 @@ boxman storage optimize
 # Restore is transparent — no flag needed at revert.
 boxman snapshot take --name pre-upgrade --compress-memory
 boxman storage compress-snapshots          # apply retroactively
+
+# List the snapshot files nothing records or uses any more (read-only;
+# --min-age 0 counts files changed in the last hour too)
+boxman snapshot prune --dry-run
 ```
 
 `discard='unmap'` is now the default for *new* VMs across all four

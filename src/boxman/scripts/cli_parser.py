@@ -27,6 +27,25 @@ snap_name = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
 SUPPORTED_PROVIDERS = list(PROVIDERS)
 
 
+def _prune_min_age(text: str) -> int:
+    """``snapshot prune --min-age``: seconds, or ``30m``, ``1h``, ``2d``."""
+    from boxman.providers.libvirt.snapshot_prune import parse_duration
+    try:
+        return parse_duration(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _prune_kinds(text: str) -> tuple[str, ...]:
+    """``snapshot prune --kind``: ``overlay``, ``memory``, ``preserve``,
+    comma-separated; the kinds of file they select."""
+    from boxman.providers.libvirt.snapshot_prune import parse_kinds
+    try:
+        return parse_kinds(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -684,6 +703,67 @@ def parse_args():
         action='store_true',
         dest='yes',
         help='skip the destructive-action confirmation prompt',
+    )
+
+    #
+    # sub parser for the 'snapshot prune' subsubcommand
+    #
+    parser_snap_prune = subparsers_snap.add_parser(
+        'prune', parents=[common, vms_parent],
+        formatter_class=RawTextHelpFormatter,
+        help='list the snapshot files nothing records or uses any more',
+        description=(
+            "List the files snapshots of the vms left behind that no\n"
+            "snapshot records and no domain uses any more: overlays a\n"
+            "restore put back, a revert's or a collapse's leftovers, memory\n"
+            "images, and the .preserve backups of an interrupted restore.\n"
+            "Each is removable, kept (with the reason) or unknown. The\n"
+            "directories scanned are each cluster's workdir and its\n"
+            "disk_snapshot_dir and memory_snapshot_dir, as set now and\n"
+            "before; never the image cache or a directory holding an ISO\n"
+            "a domain uses.\n"
+            "\n"
+            "This version lists only: run it with --dry-run. Removing what\n"
+            "it lists comes in a later version. It exits 2 when a scan\n"
+            "fails, after listing every file as unknown."),
+    )
+    parser_snap_prune.set_defaults(handler='snapshot_prune')
+    parser_snap_prune.add_argument(
+        '--cluster',
+        type=str,
+        default=None,
+        dest='cluster',
+        help='restrict to a single cluster',
+    )
+    parser_snap_prune.add_argument(
+        '--kind',
+        type=_prune_kinds,
+        default=None,
+        dest='kinds',
+        metavar='KIND[,KIND]',
+        help='overlay, memory and/or preserve (default: all three)',
+    )
+    parser_snap_prune.add_argument(
+        '--min-age',
+        type=_prune_min_age,
+        default=3600,
+        dest='min_age',
+        metavar='AGE',
+        help='list a file as removable only once it has not changed for\n'
+             'this long: seconds, or 30m, 1h, 2d (default 1h; 0 allowed)',
+    )
+    parser_snap_prune.add_argument(
+        '--all',
+        action='store_true',
+        dest='show_all',
+        help='also list the files a snapshot records or a domain uses',
+    )
+    parser_snap_prune.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='list what would be removed; change nothing (required in\n'
+             'this version)',
     )
 
     #

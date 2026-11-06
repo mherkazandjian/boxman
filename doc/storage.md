@@ -16,6 +16,7 @@ section has the quick-start.
 | `boxman storage compress-snapshots` | zstd-compress (or `--decompress`) snapshot memory `.raw` files retroactively | any | yes |
 | `boxman storage pools` | list libvirt's storage pools; `--prune` removes the ones left on directories that are gone | any | only `--prune` |
 | `boxman snapshot collapse --to <name>` | merge the snapshots between `<name>` and the live head into the head; every other snapshot remains revertable, and it refuses while another branch is built on `<name>` | off — auto-shutdown by default | yes |
+| `boxman snapshot prune --dry-run` | list the files snapshots left behind that no snapshot records and no domain uses, each removable, kept (with the reason) or unknown | any | no (this version only lists) |
 
 `boxman snapshot take --compress-memory` is the *primary* surface for
 memory compression — it runs at snapshot creation time so no `.raw` is
@@ -429,7 +430,146 @@ clusters:
   libvirt deletes its overlays and records the new ones in their place: the
   old ones are put back all the same, since whether another domain needs
   one cannot be told while it is gone, and named in a warning. Nothing
-  removes them; remove them by hand once no other domain uses them.
+  removes them until `destroy`; `boxman snapshot prune --dry-run` lists
+  them, and says whether each one can go (below).
+
+---
+
+## `boxman snapshot prune --dry-run`
+
+Snapshots leave files behind that no snapshot records and no domain uses,
+and nothing removes them until `destroy`:
+
+- the overlays a restore puts back after the revert recorded new ones in
+  their place: a snapshot's own overlays, once it is restored with nothing
+  built on it (#266), and the overlay a revert made for a snapshot that was
+  restored with no take since, once another one is restored (#288);
+- a deleted snapshot's own overlays, which an earlier restore put back:
+  libvirt's delete of a leaf that is not current unlinks the overlay its
+  parent's take made, not these (#290);
+- what a collapse or a delete kept because it could not tell whether
+  something still needs it, and named in a warning; what a collapse by a
+  boxman before #298 left under the head (a collapse now merges a revert's
+  overlay under the head into the head, and removes it);
+- an interrupted restore's `<overlay>.preserve` backups, their
+  `.preserve.copy` scratch copies and its reservation scaffolds;
+- memory images no snapshot records any more.
+
+`snapshot prune --dry-run` lists them, each `removable`, `kept` with the
+reason, or `unknown`, and what removing the removable ones would reclaim.
+This version only lists: without `--dry-run` it refuses, and removing what
+it lists comes in a later version.
+
+```console
+$ boxman snapshot prune --vms nixos01 --dry-run --min-age 0
+scanned 76 domains (qemu:///system), 3 directories: <ws>, <ws>/overlays, /mnt/mem/nixos
+
+STATUS       SIZE  KIND                  PATH                                     REASON
+removable  196.0K  preserve-backup       <ws>/overlays/<vm>.m1.preserve           a spare copy of <vm>.m1, which is in place
+removable    4.0K  preserve-reservation  <ws>/overlays/<vm>.m2.preserve           an unfilled backup reservation
+removable   12.0K  take-overlay          <ws>/overlays/<vm>_data.t2               no snapshot 't2' is left; nothing records or uses it
+removable  246.5M  memory-image          /mnt/mem/nixos/<vm>_snapshot_m1.raw.zst  no snapshot 'm1' is left; nothing records it
+removable  507.1M  memory-image          /mnt/mem/nixos/<vm>_snapshot_m2.raw      no snapshot 'm2' is left; nothing records it
+kept        12.0K  preserve-backup       <ws>/overlays/<vm>.t2.preserve           the only copy of <ws>/overlays/<vm>.t2, which is missing: mv -fT <ws>/overlays/<vm>.t2.preserve <ws>/overlays/<vm>.t2
+kept        12.0K  revert-overlay        <ws>/overlays/<vm>_data.1793993915       <ws>/userlayer.qcow2 is built on it
+unknown     12.0K  preserve-backup       <ws>/overlays/<vm>_data.t2.preserve      it differs from <vm>_data.t2, which is in place: which one holds the overlay cannot be told
+unknown      4.0M  memory-image          /mnt/mem/nixos/<vm>_snapshot_fake.raw    its save header could not be read
+
+would reclaim 753.8M (5 files); kept 2 (24.0K); unknown 2 (4.0M); 13 recorded or in use not shown (--all)
+note: a .preserve copy made with reflinks shares blocks with its overlay; removing it frees only those it does not share
+dry run: nothing was changed
+```
+
+With the default `--min-age 1h` the same files read `too recent (changed
+2m ago; --min-age 1h)`, but for the only copy, which says how to put it
+back. SIZE is what a file takes on disk (`st_blocks`).
+
+### Where it looks
+
+Each selected cluster's `workdir`, its `disk_snapshot_dir` and its
+`memory_snapshot_dir`, and the ones it set before: a directory a storage
+pool boxman defined for its `disk_snapshot_dir`
+(`bprj__<project>__bprj_<cluster>_disk_snapshots`, or that with `_<n>`) is
+still on, or where one of its VMs' snapshots records an overlay or a memory
+image under the name a take gives it. Each directory once, by identity.
+Never the image cache, the directory of any domain's CD-ROM or other media
+source, or the mount point one is under; a note names each one left out.
+An old `memory_snapshot_dir` that no snapshot records anything in any more
+is not found.
+
+### What it lists
+
+A file named for one of the selected VMs, its name matched literally: an
+overlay `<vm>.<s>` or `<vm>_<disk>.<s>` that is a qcow2 image built on
+another, and none of the disks the VM declares (`revert-overlay` when `<s>`
+is a revert's epoch, else `take-overlay`); a memory image
+`<vm>_snapshot_<s>.raw` or `.raw.zst`; a restore's `<X>.preserve`,
+`<X>.preserve.copy` or reservation scaffold beside an overlay `X` of the
+VM. A longer name of a domain on the connection, or of a VM of the project,
+takes a file: `<vm>.x.s1` is domain `<vm>.x`'s, and is not listed. A
+`<vm>.save`, a file that is no image, or a qcow2 built on nothing is never
+listed.
+
+### When a file is removable
+
+When every one of these holds, each by path and by identity
+(`st_dev`, `st_ino`):
+
+- **What it holds is its VM's.** An overlay is built right on an image
+  named for its VM, or on a layer of one of its disks, and on no domain's
+  media source; one whose backing file is gone counts by that name. A
+  memory image's save header names the VM: a `.raw` is read by libvirt
+  (`virsh save-image-dumpxml`), a `.raw.zst` through `zstd -dc | head`.
+  One that names another domain is kept; one whose header names the VM
+  with another domain's UUID is `unknown`. A VM whose domain is gone has
+  only `unknown` files: they are `destroy`'s.
+- **No domain uses it**: a disk or CD-ROM of either definition of any
+  domain, a layer of their chains, a block job's destination, the
+  definition a managed save holds, an active backup job's files.
+- **No snapshot of any domain names it**: in `<disks>`, `<revertDisks>`,
+  its saved `<domain>` or `<inactiveDomain>`, as its memory image (with the
+  `.raw.zst` beside it), or as a layer below any of those.
+- **No file in the scanned directories that stays is built on it.** One
+  header level of every image there is read, and a file that stays keeps
+  everything below it.
+- **It is a regular file with one name**, no mount point, in a directory
+  you may write to.
+- **It has not changed for `--min-age`** (default `1h`; `0` is allowed). A
+  rename counts, so an overlay a restore put back counts from that
+  restore, and a restore that is running is left alone.
+- **A `.preserve` is provably spare**: an unfilled reservation, or a copy
+  of an overlay that is in place with the same size and modification
+  time. One whose overlay is missing is the only copy: kept, with the
+  `mv -fT` that puts it back. One that differs from its overlay is
+  `unknown`.
+- **No process holds its image lock**: an advisory `qemu-img info`
+  without `-U`, asked of what would otherwise be removable.
+
+A scan that fails — the domains, their snapshots, a backing chain, a header
+in a scanned directory, a directory that cannot be listed — makes every
+file `unknown`. The table is printed all the same, and the command exits 2
+with `nothing was pruned: …`, under `--dry-run` too. A
+`.boxman-removing-*` directory a removal left behind is named in a note,
+never listed.
+
+It reads only the libvirt connection in the provider config. A file
+outside the scanned directories that is built on a listed one and that
+nothing on the connection names is not seen.
+
+### Flags
+
+| Flag | Meaning |
+|---|---|
+| `--cluster C`, `--vms a,b` | Whose files to list, as `snapshot take` selects VMs. Files of the project's other VMs in the same directories are never listed. |
+| `--kind overlay,memory,preserve` | Which kinds to list; default all three. A file of a kind left out stays, and so does what it is built on. |
+| `--min-age AGE` | Seconds, or `30m`, `1h`, `2d`; default `1h`. |
+| `--all` | Also list the files a snapshot records or a domain uses, as `kept`; by default only their count is shown. |
+| `--dry-run` | List, change nothing. Required in this version. |
+
+Under the docker runtime only the cluster workdirs are scanned (the
+snapshot directories are local-runtime only); libvirt and the images are
+read in the project's container. A workdir shared with another project's
+container cannot be told. A docker-compose cluster is skipped with a note.
 
 ---
 

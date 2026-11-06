@@ -36,7 +36,7 @@ _CLI_HANDLERS = frozenset({
     'list_projects', 'provision', 'up', 'update', 'down',
     'destroy_runtime', 'destroy', 'deprovision', 'snapshot_take',
     'snapshot_list', 'snapshot_log', 'snapshot_restore', 'snapshot_delete',
-    'snapshot_collapse', 'storage_df', 'storage_trim', 'storage_compact',
+    'snapshot_collapse', 'snapshot_prune', 'storage_df', 'storage_trim', 'storage_compact',
     'storage_optimize', 'storage_compress_snapshots', 'storage_pools',
     'suspend_vm',
     'resume_vm', 'save_vm', 'start_vm', 'finish_install', 'run_task', 'ps',
