@@ -500,6 +500,65 @@ runtime has `zstd` available.
 
 ---
 
+## The guest's clock after a memory restore
+
+A snapshot that saved the guest's memory stops its clock with everything
+else, and a revert carries on from that instant: the guest comes back behind
+the host by the snapshot's age. So does a guest `boxman up` restores from the
+managed save `boxman down` left (behind by the downtime), one `control start`
+restores the same way, and one `control resume` or `up` resumes after a
+pause. Each time, boxman sets the guest's clock from the host's with
+`virsh domtime --now`, through the QEMU guest agent, and says so:
+
+```
+set the clock of bprj__lab__bprj_win_win01 from the host's (it was 71 s behind)
+```
+
+It never makes a restore noticeably slower. It first reads the agent's
+channel from the VM's live definition, which takes no longer than a
+`virsh dumpxml`. libvirt records the channel connected before a revert or a
+managed-save restore returns, so a channel that reads disconnected, or a VM
+that has none, means no agent: boxman warns at once and does not wait. Only
+a channel that has no state yet is looked at again, and an agent that does
+not answer yet is asked again, within `guest_clock_wait`, 1 s by default.
+Every virsh call is cut off so the whole cannot outlast that wait by more
+than a second, even with a hung agent.
+
+Whenever the clock was not set (no agent, none connected, no answer in time,
+a call cut off, a refusal), boxman warns once, saying how far behind the
+clock is left: the snapshot's age, or how long ago the managed save was
+written. The restore still succeeds. A snapshot that saved no memory leaves
+the VM shut off, and its guest reads the time when it boots; one taken while
+paused comes back paused, and its clock is set when boxman resumes it.
+
+`guest_clock_wait` is a number of seconds, 0 or more. It is set on the
+provider, in `conf.yml` (`provider.libvirt`) or in `boxman.yml`
+(`providers.libvirt`, which `conf.yml` overrides), and a cluster or a VM can
+override it:
+
+```yaml
+provider:
+  libvirt:
+    guest_clock_wait: 1        # the default
+clusters:
+  lab:
+    guest_clock_wait: 0.1      # this cluster's VMs (for development, say)
+    vms:
+      win01:
+        guest_clock_wait: 3    # this VM
+```
+
+0 looks at the channel and asks the agent once, without waiting. When a
+wait below the default runs out, the warning says so. A value that is not a
+number of seconds, 0 or more, is refused before any command runs.
+
+On Linux the agent sets the clock only where the guest has `/sbin/hwclock`:
+Ubuntu 24.04's cloud image has none, its agent refuses, and the warning says
+so. `util-linux-extra` provides it; the agent looks for it once, so restart
+`qemu-guest-agent` after installing it.
+
+---
+
 ## Soft requirements
 
 | Tool | Used by | Soft-require behaviour |
@@ -507,6 +566,7 @@ runtime has `zstd` available.
 | `virt-sparsify` (from `guestfs-tools`) | `compact --method sparsify` and `auto` when snapshots exist | Pre-flight check; clear error before any destructive op: `virt-sparsify not found in the runtime — install guestfs-tools, or pass --method convert` |
 | `zstd` | Memory compression / decompression | Same — error if missing on first compress; restore-side decompress also surfaces a clear error |
 | `qemu-guest-agent` | `trim` (`virsh domfstrim`) | If unresponsive, `trim` errors with `qemu-guest-agent not responsive. install it in the guest (apt/dnf install qemu-guest-agent) and reboot.` |
+| `qemu-guest-agent` | Setting the guest's clock after a memory restore or a resume (`virsh domtime --now`) | Without one that answers, a warning says how far behind the clock is left; the restore or resume still succeeds |
 
 The bundled docker runtime image (`containers/docker/Dockerfile`) ships
 both `guestfs-tools` and `zstd` — no extra install needed if you use
@@ -551,6 +611,9 @@ boxman storage optimize --dry-run
 |---|---|---|
 | `trim` warns "no discard='unmap' on disks" | Pre-existing VM created before `discard='unmap'` became default | `virsh edit <vm>` to add `discard='unmap'` to the `<driver/>` element on each `<disk device='disk'>`, then reboot. Or `boxman destroy && boxman up` to regenerate. |
 | `fstrim failed: … qemu-guest-agent not responsive` | The guest agent isn't installed or the agent channel is missing | In the guest: `sudo apt install qemu-guest-agent && sudo systemctl enable --now qemu-guest-agent` (or `dnf` equivalent). Reboot if the agent channel was added by `boxman update`. |
+| `could not set the clock of … (no QEMU guest agent is connected to its channel)` after a restore | No guest agent runs in the guest | Install and start `qemu-guest-agent` in the guest; until then its clock stays behind by the amount the warning gives |
+| `could not set the clock of … (no QEMU guest agent answered within 0.1 s …; guest_clock_wait is 0.1 s, below its 1 s default)` | The agent did not answer within a short `guest_clock_wait` | Raise `guest_clock_wait`, or leave it at its default |
+| `could not set the clock of … refused (… not currently supported …)` | A Linux guest without `/sbin/hwclock`, whose agent then refuses to set the time | In the guest: `sudo apt install util-linux-extra` (Debian, Ubuntu), then `sudo systemctl restart qemu-guest-agent`: the agent looks for `hwclock` once |
 | `compact` refuses with "snapshots present and --drop-snapshots not given" | Method `convert`/`convert-compressed` would flatten the chain | Either pass `--drop-snapshots`, or use `--method sparsify` (or default `auto`) which preserves the chain |
 | `compact` refuses with "vm … is running and --no-shutdown was passed" | You opted out of auto-shutdown but the VM is up | Drop `--no-shutdown`, or shut the VM down manually first |
 | `virt-sparsify not found in the runtime` | `guestfs-tools` not installed in the active runtime | Install `guestfs-tools` with `dnf` (RHEL/Rocky) or `apt` (Debian/Ubuntu); or use `--method convert`; or switch to the docker runtime which already includes it |

@@ -593,6 +593,11 @@ def _main():
                 log.error(str(exc))
                 sys.exit(2)
             session.manager = manager
+            # before any command runs: a bad guest_clock_wait met after a
+            # revert could only be ignored (#275). A ConfigError here is
+            # main()'s clean exit 2.
+            if hasattr(session, 'validate_guest_clock_wait'):
+                session.validate_guest_clock_wait()
             manager.register_session(_ptype, session)
 
         getattr(manager, args.handler)(args)

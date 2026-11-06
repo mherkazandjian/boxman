@@ -94,7 +94,8 @@ class FakeDomain:
       kept in :attr:`driver_types`. ``dumpxml`` lists the cdroms of the
       definition it reports, each on a raw image.
     * a start boots the persistent definition, which is the live one from
-      then on.
+      then on. ``list --with-managed-save``, which a start asks first
+      (#275), lists nothing: this domain never holds a managed save.
     * *refuse* maps ``attach-device`` or ``detach-device`` to the reason
       libvirt gives for refusing a change that reaches the persistent
       definition: refused whole, before anything else, and nothing changes.
@@ -149,6 +150,8 @@ class FakeDomain:
 
     def __call__(self, *args, **kwargs):
         self.calls.append(args)
+        if args[0] == 'list' and '--with-managed-save' in args:
+            return Result(stdout='\n')
         handler = getattr(self, '_' + args[0].replace('-', '_'), None)
         if handler is None or args[1] != VM:
             raise AssertionError(f'virsh call not modelled: {args!r}')
