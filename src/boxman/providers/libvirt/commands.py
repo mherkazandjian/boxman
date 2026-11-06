@@ -461,6 +461,8 @@ class VirshCommand(LibVirtCommandBase):
     def _read_kind(self, args: tuple, kwargs: dict) -> str:
         """What ``virsh <args>`` is, to :mod:`.read_cache`
         (:func:`read_cache.kind`)."""
+        if not args:
+            return read_cache.CHANGE
         return read_cache.kind(args[0], args[1:], kwargs)
 
     def execute(self, cmd: str, *args, **kwargs) -> invoke.runners.Result:

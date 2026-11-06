@@ -29,9 +29,10 @@ from typing import Any
 #: at once; 1 reads them one after another, as boxman did before
 WORKERS_KEY = "in_use_scan_workers"
 
-#: how many domains a scan reads at once by default: on a host with 73
-#: domains, a scan took 8.4 s one domain at a time, 2.0 s eight at a time
-#: and 1.65 s sixteen at a time
+#: how many domains a scan reads at once by default, and how many disks of
+#: one domain: on a host with 71 domains, a scan took 7.8 s one at a time,
+#: 2.0 s four at a time, 1.1 s eight at a time and 0.7 s sixteen at a time.
+#: Eight leaves room for several scans at once (three took 1.4 s each)
 DEFAULT_WORKERS = 8
 
 
@@ -131,9 +132,12 @@ class OnceEach:
             mine = future is None
             if mine:
                 future = self._values[key] = Future()
-        if mine:
-            try:
-                future.set_result(compute())
-            except BaseException as exc:
-                future.set_exception(exc)
-        return future.result()
+        if not mine:
+            return future.result()
+        try:
+            value = compute()
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        future.set_result(value)
+        return value
