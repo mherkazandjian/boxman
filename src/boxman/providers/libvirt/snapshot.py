@@ -209,7 +209,62 @@ class SnapshotManager:
         return xmls
 
     @staticmethod
-    def _retarget_snapshot_xml(xml_text: str,
+    def _written_disks(xml_text: str) -> tuple:
+        """
+        ``(root, disks)`` for *xml_text*, a snapshot's XML: the parsed
+        document, and ``(span, element, section)`` for each ``<disk>``
+        libvirt wrote in it -- where it is in the text, the element parsed
+        alone, and the child of the snapshot it is under (``disks``,
+        ``revertDisks``, ``domain``, ``inactiveDomain``). Each ``<disk>``
+        written is matched to the parsed element in its place, so that an
+        edit (:meth:`_edited`) changes those elements alone, as text, and
+        everything else goes back to libvirt as it gave it: an ElementTree
+        round trip renames the namespace prefixes of a definition's
+        ``<metadata>``.
+
+        Raises:
+            ValueError: the XML does not parse, or its disk elements cannot
+                be matched up.
+        """
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            raise ValueError(f"it does not parse ({exc})") from exc
+        section_of = {}
+        for section in root:
+            if section.tag in ("disks", "revertDisks", "domain",
+                               "inactiveDomain"):
+                for disk in section.iter("disk"):
+                    section_of[id(disk)] = section.tag
+        elements = list(root.iter("disk"))
+        matches = list(_DISK_ELEMENT.finditer(xml_text))
+        if len(matches) != len(elements):
+            raise ValueError(f"{len(matches)} disk elements are written in "
+                             f"it, and {len(elements)} parsed")
+        disks = []
+        for match, element in zip(matches, elements, strict=True):
+            try:
+                written = ET.fromstring(match.group(0))
+            except ET.ParseError as exc:
+                raise ValueError(f"a disk element of it does not parse "
+                                 f"alone ({exc})") from exc
+            if written.tag != element.tag or written.attrib != element.attrib:
+                raise ValueError("its disk elements are not written in the "
+                                 "order they parse")
+            disks.append((match.span(), written, section_of.get(id(element))))
+        return root, disks
+
+    @staticmethod
+    def _edited(xml_text: str, edits: list[tuple]) -> str:
+        """*xml_text* with each ``(span, text)`` of *edits* -- spans
+        :meth:`_written_disks` gave -- replaced by its text."""
+        for (start, end), text in reversed(edits):
+            xml_text = xml_text[:start] + text + xml_text[end:]
+        ET.fromstring(xml_text)
+        return xml_text
+
+    @classmethod
+    def _retarget_snapshot_xml(cls, xml_text: str,
                                retired: dict[str, str]) -> str | None:
         """
         *xml_text*, a snapshot's XML, recording no overlay of a CDROM and
@@ -229,50 +284,24 @@ class SnapshotManager:
         the source nor the format of a disk is part of the ABI a revert
         checks the memory image against.
 
-        Only those elements change, as text, and everything else goes back
-        to libvirt as it gave it: an ElementTree round trip renames the
-        namespace prefixes of a definition's ``<metadata>``. Each
-        ``<disk>`` libvirt wrote is matched to the parsed element in its
-        place.
+        Only those elements change (:meth:`_written_disks`).
 
         Raises:
             ValueError: the XML does not parse, or its disk elements cannot
                 be matched up.
         """
-        try:
-            root = ET.fromstring(xml_text)
-        except ET.ParseError as exc:
-            raise ValueError(f"it does not parse ({exc})") from exc
-        section_of = {}
+        root, disks = cls._written_disks(xml_text)
         cdroms = set()
         for section in root:
-            if section.tag in ("disks", "revertDisks", "domain",
-                               "inactiveDomain"):
-                for disk in section.iter("disk"):
-                    section_of[id(disk)] = section.tag
             if section.tag in ("domain", "inactiveDomain"):
                 cdroms.update(
                     target.get("dev") for disk in section.iter("disk")
                     if disk.get("device") == "cdrom"
                     and (target := disk.find("target")) is not None)
-        elements = list(root.iter("disk"))
-        matches = list(_DISK_ELEMENT.finditer(xml_text))
-        if len(matches) != len(elements):
-            raise ValueError(f"{len(matches)} disk elements are written in "
-                             f"it, and {len(elements)} parsed")
         edits = []
-        for match, element in zip(matches, elements, strict=True):
-            try:
-                written = ET.fromstring(match.group(0))
-            except ET.ParseError as exc:
-                raise ValueError(f"a disk element of it does not parse "
-                                 f"alone ({exc})") from exc
-            if written.tag != element.tag or written.attrib != element.attrib:
-                raise ValueError("its disk elements are not written in the "
-                                 "order they parse")
+        for span, written, section in disks:
             source = written.find("source")
             path = source.get("file") if source is not None else None
-            section = section_of.get(id(element))
             if (section in ("disks", "revertDisks")
                     and written.get("snapshot") == "external"
                     and (path in retired or written.get("name") in cdroms)):
@@ -284,13 +313,35 @@ class SnapshotManager:
                 text = media_disk_xml(written, retired[path])
             else:
                 continue
-            edits.append((match.span(), text))
-        if not edits:
-            return None
-        for (start, end), text in reversed(edits):
-            xml_text = xml_text[:start] + text + xml_text[end:]
-        ET.fromstring(xml_text)
-        return xml_text
+            edits.append((span, text))
+        return cls._edited(xml_text, edits) if edits else None
+
+    @classmethod
+    def _snapshot_xml_recording(cls, xml_text: str,
+                                heads: dict[str, str]) -> str | None:
+        """
+        *xml_text*, a snapshot's XML, recording *heads* -- ``{disk target:
+        image}`` -- as the overlays of those of its disks it records as
+        external, under ``<disks>`` and ``<revertDisks>``; ``None`` when it
+        records them already. Only those elements change
+        (:meth:`_written_disks`).
+
+        Raises:
+            ValueError: the XML does not parse, or its disk elements cannot
+                be matched up.
+        """
+        _root, disks = cls._written_disks(xml_text)
+        edits = []
+        for span, written, section in disks:
+            source = written.find("source")
+            head = heads.get(written.get("name"))
+            if (section not in ("disks", "revertDisks") or head is None
+                    or written.get("snapshot") != "external"
+                    or source is None or source.get("file") in (None, head)):
+                continue
+            source.set("file", head)
+            edits.append((span, ET.tostring(written, encoding="unicode")))
+        return cls._edited(xml_text, edits) if edits else None
 
     def _redefine_snapshot(self, vm_name: str,
                            xml_text: str) -> tuple[bool, str]:
@@ -3532,9 +3583,11 @@ class SnapshotManager:
     # ── snapshot collapse (qemu-img rebase) ─────────────────────────────
     #
     # collapse_to(target) merges the snapshots between *target* and the
-    # current one into the live head, dropping their overlays and metadata,
-    # and refuses when anything else is built on *target* (collapse_drops).
-    # Every other snapshot remains revertable. The VM must be off
+    # current one, and *target*'s own overlay, into the live head, which it
+    # rebases onto the disk *target* was taken on and records in *target*'s
+    # place; it drops their overlays and metadata, and refuses when anything
+    # else is built on *target* (collapse_drops). Every other snapshot
+    # remains revertable. The VM must be off
     # because qemu-img rebase is offline-only — the BoxmanManager
     # orchestrator handles shutdown/start.
 
@@ -3654,11 +3707,11 @@ class SnapshotManager:
         anything built on the target is off that line, and when the current
         snapshot is not built on the target at all. Keeping such a branch
         while dropping the line would mean working out which overlays of a
-        dropped snapshot the branch is built on, and the rebase would put
-        the live disk on the target's overlay, which a branch taken right
-        after the target is built on too -- the image libvirt's own delete
-        of that branch unlinks (#289). Refusing loses nothing, and the
-        error names what to delete first.
+        dropped snapshot the branch is built on, and the collapse merges
+        the target's overlay into the live disk and removes it, though a
+        branch taken right after the target is built on it too -- the image
+        libvirt's own delete of that branch unlinks (#289). Refusing loses
+        nothing, and the error names what to delete first.
 
         Also None when the target is not there or a snapshot cannot be read
         (:meth:`_snapshot_tree`).
@@ -3819,16 +3872,19 @@ class SnapshotManager:
     def _collapse_keeps(self,
                         vm_name: str,
                         kept: list[str],
-                        disks: list[tuple[str, str]]) -> list[tuple] | None:
+                        disks: list[tuple[str, str]],
+                        records: dict | None = None) -> list[tuple] | None:
         """
         The files :meth:`collapse_to` must not remove, each with the reason:
         every disk's head, the disk each *kept* snapshot was taken on, which
         a revert to it builds on (what :meth:`validate_snapshot` checks),
-        and every overlay the *kept* snapshots record --
-        the target's among them, which is what each head stands on once it
-        is rebased, on a line of takes (else it stands on the disk the
-        target was taken on, :meth:`_collapse_base`). That covers each
-        disk's live chain after the rebase.
+        and every overlay the *kept* snapshots record. Each head is rebased
+        onto the disk the target was taken on (:meth:`_collapse_base`), so
+        that covers each disk's live chain after the rebase.
+
+        *records*, ``{(snapshot, disk target): overlay}``, stands in for
+        what those snapshots record now: what the collapse records in its
+        target once the heads stand on that disk (:meth:`_settle_target`).
 
         The head needs saying. An external snapshot records the overlay it
         created, and that overlay became the active disk, so until a revert
@@ -3849,8 +3905,9 @@ class SnapshotManager:
             keeps.append((head, f"it is the disk {disk_target} runs on"))
         for snap in kept:
             for disk_target, _head in disks:
-                path = self._overlay_path_for_snapshot(
-                    vm_name, snap, disk_target)
+                path = ((records or {}).get((snap, disk_target))
+                        or self._overlay_path_for_snapshot(
+                            vm_name, snap, disk_target))
                 if path:
                     keeps.append(
                         (path, f"kept snapshot '{snap}' still records it"))
@@ -3893,14 +3950,26 @@ class SnapshotManager:
         image (None when that cannot be told where qemu-img runs) -- or
         ``(None, None, why)`` when the target records no overlay for it.
 
-        On a line of takes that is the overlay the target's take made, its
-        ``<disks>``: the head is built on it. After a restore of the target
-        and a take, the head is built instead on the disk the target was
-        taken on (:meth:`_source_in_snapshot_domain`), under the overlay of
-        the revert, and the overlay the take
-        made is under another branch -- or gone with it, which libvirt's
-        delete of that branch unlinks (#289). Where the head's chain shows
-        that, it is that disk (#291); otherwise the overlay, as before.
+        The disk the target was taken on
+        (:meth:`_source_in_snapshot_domain`), wherever the head's chain
+        shows it is built on that: the overlay the target records, made by
+        its take or by a revert to it, is merged into the head with the
+        snapshots dropped. That is what libvirt's own delete of each of
+        them would leave, the target's disk right under the head
+        (``qemuSnapshotDiscardExternal``), and what its delete of the
+        target, current then, requires: it takes the domain's disk for the
+        target's and refuses unless the image right under it is the one the
+        target was taken on, "snapshot VM disk source and parent disk
+        source are not the same" (``qemuSnapshotDeleteExternalPrepareData``,
+        libvirt 10.10). Rebased onto the overlay instead, as on a line of
+        takes it was, the target could not be deleted afterwards. The
+        target then records the head (:meth:`_settle_target`).
+
+        After a restore of the target and a take, the overlay the take made
+        is under another branch -- or gone with it, which libvirt's delete
+        of that branch unlinks (#289) -- and the head is built on the
+        revert's overlay on that disk (#291). Where the head's chain cannot
+        be read, it is the overlay, as before.
         """
         recorded = self._overlay_path_for_snapshot(
             vm_name, target_name, disk_target)
@@ -3924,7 +3993,7 @@ class SnapshotManager:
                        for layer in under))
         taken_on = self._source_in_snapshot_domain(
             vm_name, target_name, disk_target)
-        if not is_under(recorded) and is_under(taken_on):
+        if is_under(taken_on):
             return taken_on, False, None
         return recorded, same, None
 
@@ -3975,13 +4044,17 @@ class SnapshotManager:
         another branch is built on *target_name*). *target_name* and every
         other snapshot remain revertable.
 
-        Workflow per disk: ``qemu-img rebase`` the head onto the target
-        snapshot's overlay so the rebased head's read-alone view equals
-        what the full chain produced. Then strip ``<backingStore>``
-        cache, ``virsh define``, delete the dropped snapshots' overlays,
-        clear their libvirt metadata, and then remove their memory images,
-        ``.raw`` and ``.raw.zst``, as :meth:`_remove_memory_images` says,
-        asking *recorded_in_use*: not one another snapshot still records.
+        Workflow per disk: ``qemu-img rebase`` the head onto the disk the
+        target was taken on (:meth:`_collapse_base`), so the rebased head's
+        read-alone view equals what the full chain produced. Then strip
+        ``<backingStore>`` cache, ``virsh define``, delete the dropped
+        snapshots' overlays, clear their libvirt metadata, and then remove
+        their memory images, ``.raw`` and ``.raw.zst``, as
+        :meth:`_remove_memory_images` says, asking *recorded_in_use*: not
+        one another snapshot still records. Last, the target records each
+        head in place of the overlay it recorded, which is removed
+        (:meth:`_settle_target`): what libvirt's own delete of the dropped
+        snapshots would leave, which its delete of the target needs.
 
         A dropped overlay that is still live -- usually the newest one,
         which is the head itself -- is kept, and so is anything the kept
@@ -4023,6 +4096,8 @@ class SnapshotManager:
                 f"({drop_set}), the line from '{target_name}' to the one the "
                 f"VM runs on; would keep {kept}")
             stops = False
+            moved: dict[str, tuple[str, str]] = {}
+            retiring: list[str] = []
             for disk_target, source in disks:
                 new_base, same, why = self._collapse_base(
                     vm_name, target_name, disk_target, source)
@@ -4043,21 +4118,48 @@ class SnapshotManager:
                 else:
                     self.logger.info(
                         f"[dry-run]   would rebase {source} onto {new_base}")
+                    stranded = self._stranded_overlay(
+                        vm_name, target_name, disk_target, new_base)
+                    if stranded:
+                        moved[disk_target] = (source, stranded)
+                        retiring.append(stranded)
+                        self.logger.info(
+                            f"[dry-run]   '{target_name}' would record "
+                            f"{source} as its overlay of {disk_target}, in "
+                            f"place of {stranded}")
+                    retiring.extend(self._merged_layers(
+                        vm_name, source, new_base))
             if stops:
                 # before anything is rebased or removed
                 return False
+            told: set[str] = set()
             for snap in drop_set:
                 for disk_target, _ in disks:
                     overlay = self._overlay_path_for_snapshot(
                         vm_name, snap, disk_target)
                     if not overlay or not os.path.isfile(overlay):
                         continue
+                    told.add(overlay)
                     reason = self._collapse_keep_reason(overlay, keeps)
                     if reason:
                         self.logger.info(
                             f"[dry-run]   would keep {overlay}: {reason}")
                     else:
                         self.logger.info(f"[dry-run]   would remove {overlay}")
+            retiring = [p for p in dict.fromkeys(retiring)
+                        if p not in told and os.path.isfile(p)]
+            # what is left once the target records the heads (_settle_target)
+            settled = self._collapse_keeps(
+                vm_name, kept, disks,
+                records={(target_name, disk): head
+                         for disk, (head, _old) in moved.items()}
+            ) if retiring else None
+            for path in retiring:
+                reason = self._collapse_keep_reason(path, settled)
+                self.logger.info(
+                    f"[dry-run]   would keep {path}: {reason}" if reason
+                    else f"[dry-run]   would remove {path}, merged into the "
+                         f"head")
             return True
 
         # Per-disk rebase — must succeed for every disk before we touch
@@ -4077,6 +4179,20 @@ class SnapshotManager:
                     f"there); not collapsing vm {vm_name}")
                 return False
             rebases.append((disk_target, head_path, new_base, same))
+        # read before anything changes: the overlays the target records that
+        # no head will stand on, which it records the heads in place of, and
+        # the images each rebase merges into its head
+        moved: dict[str, tuple[str, str]] = {}
+        merged: dict[str, tuple[str, list[str]]] = {}
+        for disk_target, head_path, new_base, same in rebases:
+            if same:
+                continue
+            stranded = self._stranded_overlay(
+                vm_name, target_name, disk_target, new_base)
+            if stranded:
+                moved[disk_target] = (head_path, stranded)
+            merged[disk_target] = (head_path, self._merged_layers(
+                vm_name, head_path, new_base))
         for disk_target, head_path, new_base, same in rebases:
             if same:
                 # nothing stands between them: the head is the target's own
@@ -4130,7 +4246,138 @@ class SnapshotManager:
                     f"kept, as the snapshot still records it")
         self._remove_memory_images(vm_name, images, recorded_in_use)
 
+        if moved or merged:
+            self._settle_target(vm_name, target_name, moved, merged, disks)
+
         self.logger.info(
             f"collapsed {len(drop_set)} snapshot(s) on vm {vm_name}; "
             f"'{target_name}' is its current snapshot now")
         return True
+
+    def _stranded_overlay(self, vm_name: str, target_name: str,
+                          disk_target: str, new_base: str) -> str | None:
+        """
+        The overlay *target_name* records for *disk_target*, when a collapse
+        rebases that disk's head onto another image, *new_base*: the disk
+        the target was taken on (:meth:`_collapse_base`). No head stands on
+        the overlay then, and the target records the head in its place
+        (:meth:`_settle_target`). None when the head goes onto the overlay.
+        """
+        recorded = self._overlay_path_for_snapshot(
+            vm_name, target_name, disk_target)
+        return recorded if recorded and recorded != new_base else None
+
+    def _record_the_heads(self, vm_name: str, snapshot_name: str,
+                          heads: dict[str, str]) -> str | None:
+        """
+        Redefine *snapshot_name* of *vm_name* to record *heads* -- ``{disk
+        target: image}`` -- as its overlays of those disks
+        (:meth:`_snapshot_xml_recording`): None once it does, else why it
+        does not.
+        """
+        result = self.virsh.execute("snapshot-dumpxml", vm_name,
+                                    snapshot_name, "--security-info",
+                                    warn=True)
+        if not result.ok:
+            return (f"its record could not be read "
+                    f"({(result.stderr or '').strip()})")
+        try:
+            xml_text = self._snapshot_xml_recording(result.stdout, heads)
+        except ValueError as exc:
+            return f"its record could not be edited ({exc})"
+        if xml_text is None:
+            return None
+        ok, error = self._redefine_snapshot(vm_name, xml_text)
+        return None if ok else f"its redefine failed ({error})"
+
+    def _merged_layers(self, vm_name: str, head: str,
+                       new_base: str) -> list[str]:
+        """
+        The images between *head* and *new_base* in the head's chain, top
+        first: what a rebase of the head onto *new_base* merges into it.
+        None of them when the chain cannot be read, or does not reach
+        *new_base*.
+        """
+        layers = CDROMManager(
+            vm_name, provider_config=self.provider_config).image_layers(head)
+        between: list[str] = []
+        for path, _format in (layers or [])[1:]:
+            if (os.path.normpath(path) == os.path.normpath(new_base)
+                    or self._one_file_where_qemu_runs(path, new_base)):
+                return between
+            between.append(path)
+        return []
+
+    def _settle_target(self, vm_name: str, target_name: str,
+                       moved: dict[str, tuple[str, str]],
+                       merged: dict[str, tuple[str, list[str]]],
+                       disks: list[tuple[str, str]]) -> None:
+        """
+        Once a collapse has put heads on the disks *target_name* was taken
+        on, record each head as the target's overlay in place of the one it
+        recorded -- *moved*, ``{disk target: (head, that overlay)}``. Then
+        remove those overlays and the images the rebase merged into the
+        heads -- *merged*, ``{disk target: (head, [image, ...])}`` -- which
+        no head stands on now, where nothing still needs them
+        (:meth:`_collapse_keeps`, asked of every snapshot left).
+
+        That is the record libvirt's own delete of the dropped snapshots
+        leaves: the current snapshot records the disk the domain runs on,
+        and a revert to it unlinks that, the state it discards
+        (``qemuSnapshotRevertExternalFinish``). Still naming the old
+        overlay, the target had that unlinked instead and the head left
+        where nothing records it; and a collapse onto it again left this
+        one's head behind, merged into the next. So did a revert's overlay
+        under the head, after a restore of the target and a take: nothing
+        records it once the take it was taken on is dropped.
+
+        A record that cannot be rewritten keeps the overlays it names, and
+        is named in a warning.
+        """
+        if moved:
+            heads = {disk: head for disk, (head, _old) in moved.items()}
+            why = self._record_the_heads(vm_name, target_name, heads)
+            if why:
+                self.logger.warning(
+                    f"'{target_name}' on {vm_name} still records "
+                    f"{', '.join(old for _head, old in moved.values())}, "
+                    f"though it runs on {', '.join(heads.values())}, built on "
+                    f"the disks '{target_name}' was taken on: {why}. A delete "
+                    f"or a restore of it still works, and leaves those files "
+                    f"behind; remove them by hand once nothing uses them.")
+            else:
+                self.logger.info(
+                    f"'{target_name}' on {vm_name} records "
+                    f"{', '.join(heads.values())}, the disks it runs on, now")
+        parents = self._snapshot_tree(vm_name)
+        keeps = (None if parents is None
+                 else self._collapse_keeps(vm_name, list(parents), disks))
+        done: set[str] = set()
+        for disk_target, (head, layers) in merged.items():
+            stranded = moved.get(disk_target, (None, None))[1]
+            for path in ([stranded] if stranded else []) + layers:
+                if path in done or not os.path.isfile(path):
+                    # a dropped overlay is gone already, and libvirt's
+                    # delete of a branch unlinks the target's (#289)
+                    continue
+                done.add(path)
+                reason = self._collapse_keep_reason(path, keeps)
+                if keeps is None:
+                    self.logger.warning(
+                        f"not removing {path}, merged into {head}: {reason}. "
+                        f"Remove it by hand once nothing uses it.")
+                    continue
+                if reason:
+                    self.logger.info(
+                        f"keeping {path}, merged into {head}: {reason}")
+                    continue
+                result = self.virsh.execute_shell(
+                    f"rm -f -- {shlex.quote(path)}", warn=True)
+                if result.ok:
+                    self.logger.info(
+                        f"removed {path}, merged into {head}, which "
+                        f"{disk_target} runs on")
+                else:
+                    self.logger.warning(
+                        f"could not remove {path}, merged into {head}: "
+                        f"{(result.stderr or '').strip()}")
