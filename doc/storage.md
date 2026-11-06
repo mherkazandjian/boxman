@@ -701,6 +701,31 @@ so. `util-linux-extra` provides it; the agent looks for it once, so restart
 
 ---
 
+## The in-use scan
+
+Before boxman removes a file that another VM could still need (a CD-ROM
+overlay after a restore, a VM's disks at teardown, a memory image after a
+delete or collapse, a leftover a `take --force` clears), it reads what every
+domain defined on the host uses: each domain's disks and CD-ROMs in both
+definitions, every layer below them, and its block jobs. It reads every
+domain because one project's file can be another's base (the ISO cache, a
+shared template). A file whose use cannot be told is kept.
+
+On a host with many domains this scan costs a few `virsh` and `qemu-img`
+calls per domain. boxman reads up to 8 domains at once, and up to 8 disks of
+one domain, each as it would alone. It credits a file to the first domain
+listed whatever order the reads finish in. On a host with 71 domains that
+takes the scan from 7.8 s to 1.1 s. `in_use_scan_workers` sets that number
+in `provider.libvirt` (conf.yml) or `providers.libvirt` (boxman.yml):
+
+```yaml
+provider:
+  libvirt:
+    in_use_scan_workers: 8     # the default; 1 reads one at a time, 16 took 0.7 s
+```
+
+---
+
 ## Soft requirements
 
 | Tool | Used by | Soft-require behaviour |

@@ -2139,8 +2139,12 @@ class SnapshotManager:
         overlays: dict[str, list[str]] = {}
         parents: dict[str, str | None] = {}
         for name in names:
+            # read as _snapshot_xmls reads it: the same XML, with secrets
+            # nothing here looks at, so that a restore's next read of every
+            # snapshot is answered from this one (read_cache)
             xml_result = self.virsh.execute(
-                "snapshot-dumpxml", vm_name, name, warn=True)
+                "snapshot-dumpxml", vm_name, name, "--security-info",
+                warn=True)
             if not xml_result.ok:
                 raise SnapshotError(
                     f"cannot read the metadata of snapshot '{name}' on "

@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import tempfile
+import threading
 import time
 from multiprocessing import Lock, Process, Queue
 from typing import Any
@@ -18,7 +19,7 @@ from boxman.exceptions import (
 )
 
 from ..session_base import SessionConfigMixin
-from . import net_reconcile
+from . import net_reconcile, read_cache
 from .cdrom import CDROMManager, cdroms_awaiting_boot, explicit_cdrom_targets
 from .clone_vm import CloneVM
 from .commands import LibVirtCommandBase, VirshCommand
@@ -31,6 +32,7 @@ from .import_image import ImageImporter
 from .install_media import InstallMediaOutcome, eject_finished_install_media
 from .iso_boot_vm import IsoBootVM
 from .net import Network, NetworkInterface
+from .scan_pool import InOrder, OnceEach, scan_workers
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
 from .snapshot_prune import (
@@ -98,6 +100,20 @@ class _DomainRenamedError(Exception):
     def __init__(self, name: str):
         super().__init__(name)
         self.name = name
+
+
+#: what a domain that went away during a scan holds: nothing
+_GONE = object()
+
+
+def _merge_in_use(into: FilesInUse, found: FilesInUse) -> None:
+    """Add what one domain uses, *found*, to a scan's map *into*, by path
+    and by identity, without replacing what a domain listed before it was
+    credited with: merged in listing order, each file keeps the first."""
+    for path, owner in found.items():
+        into.setdefault(path, owner)
+    for identity, owner in found.identities.items():
+        into.identities.setdefault(identity, owner)
 
 
 def _live_disks(domain: ET.Element, source: str) -> list[ET.Element]:
@@ -257,6 +273,11 @@ class _ChainReads:
     chain was read must not be read from that refresh (#221 review R1). Each
     chain read through libvirt refreshes the pools it reads, once each
     (:meth:`LibVirtSession._libvirt_backing_chain`).
+
+    The scan's domains are read side by side (:mod:`.scan_pool`), all
+    through one of these: the command wrappers keep no state between
+    commands, and the pools' targets are read under a lock, by the first
+    thread to need them, and only once.
     """
 
     #: :attr:`_pool_targets` before the pools were first read
@@ -269,6 +290,8 @@ class _ChainReads:
         self.virsh = VirshCommand(provider_config=provider_config)
         #: target directory -> active pool, ``None`` when they cannot be told
         self._pool_targets: Any = self._UNREAD
+        #: held while the pools' targets are read, the first time only
+        self._pool_targets_read = threading.Lock()
 
     def refresh(self, pool: str, refreshed: dict[str, bool]) -> bool:
         """Refresh *pool* unless *refreshed* — one chain's refreshes — holds
@@ -301,8 +324,9 @@ class _ChainReads:
             that cannot be told: the pools cannot be listed, or one's
             description cannot be read.
         """
-        if self._pool_targets is self._UNREAD:
-            self._pool_targets = self._read_pool_targets()
+        with self._pool_targets_read:
+            if self._pool_targets is self._UNREAD:
+                self._pool_targets = self._read_pool_targets()
         if self._pool_targets is None:
             return None
         pools = self._pool_targets.get(os.path.normpath(directory), [])
@@ -1100,6 +1124,7 @@ class LibVirtSession(SessionConfigMixin):
         destroyer = DestroyVM(name=name, provider_config=self.provider_config)
         return destroyer.confirm_absent()
 
+    @read_cache.fresh
     def disk_paths_in_use(self, media: dict[str, str] | None = None
                           ) -> FilesInUse | None:
         """
@@ -1176,6 +1201,13 @@ class LibVirtSession(SessionConfigMixin):
         a refresh made for one domain's chain is never trusted for
         another's, whose image may have been rebased meanwhile (#221 review
         R1).
+
+        The domains are read side by side, :data:`.scan_pool.WORKERS_KEY`
+        at a time (:class:`.scan_pool.InOrder`), each exactly as before;
+        what each one uses is then taken in the order they were listed. A
+        file two domains use is credited to the one listed first, and the
+        first domain whose read decides -- it failed, or it was renamed --
+        decides the scan, as when they were read one after another.
         """
         virsh = VirshCommand(provider_config=self.provider_config)
         listing = virsh.execute("list", "--all", "--uuid", "--name",
@@ -1200,30 +1232,92 @@ class LibVirtSession(SessionConfigMixin):
             return None
         active = {line.strip() for line in running.stdout.splitlines()}
         reads = _ChainReads(self.provider_config)
+        # each domain's media into a map of its own, merged into *media* in
+        # listing order like its files, so the first listed keeps a source
+        seen: list[dict[str, str] | None] = [
+            None if media is None else {} for _ in domains]
+
+        def read(index: int) -> FilesInUse | None:
+            domain, uuid = domains[index]
+            return self._files_used_by(virsh, reads, domain, uuid,
+                                       domain in active, media=seen[index])
+
         in_use = FilesInUse()
-        for domain, uuid in domains:
-            try:
-                used = self._files_used_by(virsh, reads, domain, uuid,
-                                           domain in active, media=media)
-            except _DomainGoneError:
-                self.logger.debug(
-                    f"domain {domain} went away during the in-use scan, so "
-                    f"it holds nothing")
-                continue
-            except _DomainRenamedError as renamed:
-                self.logger.warning(
-                    f"domain {domain} was renamed {renamed.name} while the "
-                    f"in-use scan read it, so what it uses was not read: no "
-                    f"teardown can tell which files other domains use, and "
-                    f"each keeps them all — retry")
-                return None
-            if used is None:
-                return None
-            for path, owner in used.items():
-                in_use.setdefault(path, owner)
-            for identity, owner in used.identities.items():
-                in_use.identities.setdefault(identity, owner)
+        with InOrder(read, range(len(domains)),
+                      self._scan_workers()) as outcomes:
+            for (domain, _uuid), its_media, outcome in zip(
+                    domains, seen, outcomes, strict=True):
+                try:
+                    used = outcome.result()
+                except _DomainGoneError:
+                    used = _GONE
+                except _DomainRenamedError as renamed:
+                    used = renamed
+                # recorded before what it uses was read, gone or not
+                for source, owner in (its_media or {}).items():
+                    media.setdefault(source, owner)
+                if used is _GONE:
+                    self.logger.debug(
+                        f"domain {domain} went away during the in-use scan, "
+                        f"so it holds nothing")
+                    continue
+                if isinstance(used, _DomainRenamedError):
+                    self.logger.warning(
+                        f"domain {domain} was renamed {used.name} while the "
+                        f"in-use scan read it, so what it uses was not read: "
+                        f"no teardown can tell which files other domains use, "
+                        f"and each keeps them all — retry")
+                    return None
+                if used is None:
+                    return None
+                _merge_in_use(in_use, used)
         return in_use
+
+    def _scan_workers(self) -> int:
+        """How many domains a host-wide scan reads at once
+        (:func:`.scan_pool.scan_workers`)."""
+        return scan_workers(self.provider_config, self.logger)
+
+    def files_in_use(self, paths: list[str]) -> dict[str, str] | None:
+        """
+        Which of *paths* have to stay because a domain uses them, from one
+        host-wide in-use scan (:meth:`disk_paths_in_use`) however many
+        paths there are. Several VMs' files can be asked about together,
+        the CD-ROM overlays their reverts made say, at one scan's cost
+        rather than one scan each.
+
+        Returns:
+            ``{path: why it has to stay}`` for each one that does: a domain
+            uses it, by the name given, its resolved path, or its identity
+            (``st_dev``, ``st_ino``, links followed); or its identity
+            cannot be read other than for naming no file. A path left out
+            is one no domain uses, or one that is not there. ``None`` when
+            the scan fails: every path has to stay.
+
+        The answer is the scan's, as of when it ran. Ask once the command
+        has done whatever changes what the domains use (its reverts, its
+        media changes): a scan taken before them knows nothing of them.
+        """
+        in_use = self.disk_paths_in_use()
+        if in_use is None:
+            return None
+        why: dict[str, str] = {}
+        for path in paths:
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                identity = None
+            except OSError as exc:
+                why[path] = f"it cannot be inspected ({exc.strerror})"
+                continue
+            else:
+                identity = (st.st_dev, st.st_ino)
+            domain = (in_use.get(path) or in_use.get(os.path.realpath(path))
+                      or (in_use.identities.get(identity)
+                          if identity is not None else None))
+            if domain:
+                why[path] = f"domain {domain} uses it"
+        return why
 
     def _files_used_by(self, virsh, reads: _ChainReads, domain: str,
                        uuid: str, active: bool,
@@ -1257,37 +1351,43 @@ class LibVirtSession(SessionConfigMixin):
                     media.setdefault(row.source, domain)
         live: dict[str, ET.Element | None] = {}
         used = FilesInUse()
-        for source in sorted(sources):
-            chain = self._backing_chain_files(reads, source)
-            if chain is None:
-                if not self._source_absent(source):
-                    # not proved absent — which a source spelled otherwise
-                    # than normalised never is — so possibly there
-                    self._raise_if_gone(virsh, domain, uuid)
-                    return None
-                held = self._held_below(virsh, domain, uuid, source,
-                                        source in volumes, live)
-                if held is None:
-                    return None
-                for path in held:
-                    try:
-                        found = self._identify(path)
-                    except OSError as exc:
-                        self.logger.warning(
-                            f"could not read the identity of {path}, which "
-                            f"domain {domain} holds ({exc}): whether a file "
-                            f"a teardown would remove is that one cannot be "
-                            f"told, so each keeps everything — make it "
-                            f"accessible")
+        # the chains side by side too, a domain with many disks being as
+        # slow as many domains, and taken in the order they were read before
+        ordered = sorted(sources)
+        with InOrder(lambda source: self._backing_chain_files(reads, source),
+                     ordered, self._scan_workers()) as chains:
+            for source, outcome in zip(ordered, chains, strict=True):
+                chain = outcome.result()
+                if chain is None:
+                    if not self._source_absent(source):
+                        # not proved absent — which a source spelled
+                        # otherwise than normalised never is — so possibly
+                        # there
+                        self._raise_if_gone(virsh, domain, uuid)
                         return None
-                    if found is None:
-                        continue      # deleted too: nothing to protect
-                    name, identity = found
-                    used.setdefault(name, domain)
-                    used.identities.setdefault(identity, domain)
-                continue
-            if not self._record_in_use(used, domain, chain):
-                return None
+                    held = self._held_below(virsh, domain, uuid, source,
+                                            source in volumes, live)
+                    if held is None:
+                        return None
+                    for path in held:
+                        try:
+                            found = self._identify(path)
+                        except OSError as exc:
+                            self.logger.warning(
+                                f"could not read the identity of {path}, "
+                                f"which domain {domain} holds ({exc}): "
+                                f"whether a file a teardown would remove is "
+                                f"that one cannot be told, so each keeps "
+                                f"everything — make it accessible")
+                            return None
+                        if found is None:
+                            continue      # deleted too: nothing to protect
+                        name, identity = found
+                        used.setdefault(name, domain)
+                        used.identities.setdefault(identity, domain)
+                    continue
+                if not self._record_in_use(used, domain, chain):
+                    return None
         if active:
             jobs = self._block_job_files(virsh, reads, domain, uuid, live)
             if jobs is None:
@@ -2564,6 +2664,7 @@ class LibVirtSession(SessionConfigMixin):
         """
         return SnapshotManager(self.provider_config).overlay_files(vm_name)
 
+    @read_cache.fresh
     def snapshot_files_in_use(self,
                               overlays_too: bool = True) -> FilesInUse | None:
         """
@@ -2597,6 +2698,9 @@ class LibVirtSession(SessionConfigMixin):
         — unless it went away meanwhile
         (:meth:`_raise_if_gone`) — or a file's identity cannot be read
         other than for naming no file.
+
+        The domains are read side by side, and what each records taken in
+        listing order, as :meth:`disk_paths_in_use` takes them.
         """
         virsh = VirshCommand(provider_config=self.provider_config)
         listing = virsh.execute("list", "--all", "--uuid", "--name",
@@ -2607,16 +2711,12 @@ class LibVirtSession(SessionConfigMixin):
         if domains is None:
             return None
         snapshots = SnapshotManager(self.provider_config)
-        recorded = FilesInUse()
-        for domain, uuid in domains:
+
+        def read(entry: tuple[str, str]) -> FilesInUse | None:
+            domain, uuid = entry
             files = snapshots.recorded_files(uuid)
             if files is None:
-                try:
-                    self._raise_if_gone(virsh, domain, uuid)
-                except _DomainGoneError:
-                    continue
-                except _DomainRenamedError:
-                    return None
+                self._raise_if_gone(virsh, domain, uuid)
                 return None
             images, overlays, unnamed = files
             if overlays_too and unnamed:
@@ -2633,15 +2733,36 @@ class LibVirtSession(SessionConfigMixin):
                     return None
                 paths += [*its_overlays, *(layer for chain in chains.values()
                                            for layer in chain)]
-            if not self._record_in_use(recorded, domain, paths):
+            found = FilesInUse()
+            if not self._record_in_use(found, domain, paths):
                 return None
+            return found
+
+        recorded = FilesInUse()
+        with InOrder(read, domains, self._scan_workers()) as outcomes:
+            for outcome in outcomes:
+                try:
+                    found = outcome.result()
+                except _DomainGoneError:
+                    continue
+                except _DomainRenamedError:
+                    return None
+                if found is None:
+                    return None
+                _merge_in_use(recorded, found)
         return recorded
 
+    @read_cache.keeping
     def snapshot_restore(self, vm_name, snapshot_name=None):
         """
         Restore a VM to a specific snapshot.
 
         If snapshot_name is None, the current (latest) snapshot is used.
+
+        It keeps its reads of the VM's snapshots and persistent definition
+        (:mod:`.read_cache`): one made again with nothing run in between is
+        answered from the first, the snapshots' XML after the revert, say,
+        read for the backup's inventory and again for the CD-ROM put-back.
 
         Args:
             vm_name (str): Name of the VM to revert
@@ -2913,6 +3034,7 @@ class LibVirtSession(SessionConfigMixin):
                                 warn=True)
         return _listed_domains(listing.stdout) if listing.ok else None
 
+    @read_cache.fresh
     def snapshot_references(self) -> References | None:
         """
         G2 of ``snapshot prune``: every file a snapshot of any domain on the
@@ -2938,6 +3060,11 @@ class LibVirtSession(SessionConfigMixin):
         snapshots, a volume's path or a chain cannot be read, an external
         overlay a snapshot records names no local file, or a file's
         identity cannot be read other than for naming no file.
+
+        The domains are read side by side and taken in listing order, as
+        :meth:`disk_paths_in_use` takes them; the chain of a file several
+        snapshots name is read once, by the first to need it
+        (:class:`.scan_pool.OnceEach`).
         """
         virsh = VirshCommand(provider_config=self.provider_config)
         listing = virsh.execute("list", "--all", "--uuid", "--name",
@@ -2949,38 +3076,51 @@ class LibVirtSession(SessionConfigMixin):
                 "name cannot be told")
             return None
         reads = _ChainReads(self.provider_config)
-        chains: dict[str, list[str] | None] = {}
-        references = References()
-        for domain, uuid in domains:
-            try:
-                snapshots = self._snapshots_named(virsh, domain, uuid)
-            except _DomainGoneError:
-                continue
-            except _DomainRenamedError as renamed:
-                self.logger.warning(
-                    f"domain {domain} was renamed {renamed.name} while its "
-                    f"snapshots were read, so what they name was not read "
-                    f"-- retry")
-                return None
+        chains = OnceEach()
+
+        def read(entry: tuple[str, str]) -> References | None:
+            domain, uuid = entry
+            snapshots = self._snapshots_named(virsh, domain, uuid)
             if snapshots is None:
                 return None
-            references.snapshots[domain] = {
+            found = References()
+            found.snapshots[domain] = {
                 name: record for name, (record, _files) in snapshots.items()}
             for name, (_record, files) in snapshots.items():
                 paths = list(files)
                 for path in files:
-                    if path not in chains:
-                        chains[path] = self._chain_or_none(reads, path)
-                    if chains[path] is None:
+                    chain = chains.get(
+                        path, lambda path=path: self._chain_or_none(reads, path))
+                    if chain is None:
                         self.logger.warning(
                             f"the backing chain of {path}, which snapshot "
                             f"'{name}' of domain {domain} names, could not be "
                             f"read, so what is built under it cannot be told")
                         return None
-                    paths += chains[path]
+                    paths += chain
                 if not self._record_named(
-                        references, f"snapshot '{name}' of {domain}", paths):
+                        found, f"snapshot '{name}' of {domain}", paths):
                     return None
+            return found
+
+        references = References()
+        with InOrder(read, domains, self._scan_workers()) as outcomes:
+            for (domain, _uuid), outcome in zip(domains, outcomes,
+                                                strict=True):
+                try:
+                    found = outcome.result()
+                except _DomainGoneError:
+                    continue
+                except _DomainRenamedError as renamed:
+                    self.logger.warning(
+                        f"domain {domain} was renamed {renamed.name} while its "
+                        f"snapshots were read, so what they name was not read "
+                        f"-- retry")
+                    return None
+                if found is None:
+                    return None
+                references.snapshots.update(found.snapshots)
+                _merge_in_use(references, found)
         return references
 
     def _snapshots_named(self, virsh, domain: str, uuid: str
@@ -3121,6 +3261,7 @@ class LibVirtSession(SessionConfigMixin):
             scan.identities.setdefault(identity, who)
         return True
 
+    @read_cache.fresh
     def files_held(self) -> Held | None:
         """
         G1 of ``snapshot prune``: what every domain uses
