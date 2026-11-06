@@ -343,6 +343,7 @@ template time:
 | `boxman image inspect <ref>` | Print an OCI image's manifest, `kind`, and `vmimage.json` metadata without downloading the disk. |
 | `boxman snapshot take [--name N] [-m DESC] [--vms a,b] [--cluster c] [--compress-memory] [--force]` | Snapshot in parallel (default name = UTC timestamp). `--force` (aliases `--overwrite`/`--replace`) clears a colliding name and re-takes. |
 | `boxman snapshot {list\|log\|restore\|delete\|collapse}` | List / git-log-style graph / restore / delete / merge-newer-into-head. |
+| `boxman snapshot prune --dry-run [--vms a,b] [--cluster c] [--kind overlay,memory,preserve] [--min-age 1h] [--all]` | List the snapshot files no snapshot records and no domain uses, each removable / kept (why) / unknown. Read-only; this version refuses without `--dry-run`. Exits 2 when a scan fails. |
 | `boxman restore` | Shortcut: restore all VMs to their latest snapshot. |
 | `boxman storage {df\|trim\|compact\|optimize\|compress-snapshots}` | qcow2 space reclaim and snapshot-memory compression. |
 | `boxman storage pools [--stale \| --prune [POOL ...] [--dry-run] [-y]]` | List libvirt's storage pools; `--prune` removes the ones left on directories that are gone. |
@@ -352,8 +353,8 @@ template time:
 | `boxman control {suspend\|resume\|save\|start [--restore]} [--vms a,b] [--cluster c]` | Lifecycle ops; all VMs unless scoped. `save` is a libvirt managed save that `start` restores on its own; it takes a running or paused VM (a paused one comes back running) and refuses a shut-off or already-saved one; `start --restore` is only for an external `<workdir>/<vm>.save` from an older boxman. On container clusters these map to `pause`/`unpause`/`start`; `save` has no equivalent and is skipped with a message. |
 
 **Selection flags.** Every snapshot, storage and control subcommand takes
-`--vms`; `--cluster` exists only on `snapshot take` / `restore` / `delete` and
-the `control` verbs (plus `run` and `ssh`, where it scopes the workspace env).
+`--vms`; `--cluster` exists only on `snapshot take` / `restore` / `delete` /
+`prune` and the `control` verbs (plus `run` and `ssh`, where it scopes the workspace env).
 Where both exist they compose. Each `--vms` entry matches either the bare VM
 name (`node01`) or the cluster-qualified short name (`cluster_1_node01`); the
 default `all` selects everything. An unknown `--cluster` is an error, not a
@@ -1253,6 +1254,20 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   branch; a collapse refuses while another branch is built on `N` (it would
   drop it unmerged): delete that branch first. Offline-only: it auto-shuts running VMs down unless
   `--no-shutdown`, which skips them instead.
+- `snapshot prune --dry-run` lists what snapshots left behind that no
+  snapshot records and no domain uses: overlays a restore put back (the
+  warning "no snapshot of it records them any more" names them), a deleted
+  leaf's own overlays, memory images, an interrupted restore's `.preserve`
+  backups and scaffolds. It scans each selected cluster's workdir and its
+  snapshot directories, as set now and before, never the image cache or an
+  ISO's directory. A file is `removable` only when nothing on the
+  connection uses or names it (any domain, any snapshot, a managed save, a
+  backup job, a chain), no file that stays is built on it, it has not
+  changed for `--min-age` (default `1h`), and what it holds is its VM's;
+  a `.preserve` whose overlay is missing is the only copy and is kept, with
+  the `mv -fT` that puts it back. A failed scan makes everything `unknown`
+  and exits 2. This version only lists; it refuses without `--dry-run`.
+  See `doc/storage.md`.
 
 ### `boxman storage`
 
@@ -1457,6 +1472,7 @@ Upgrade boxman so `passlib` is present, and recreate the template.
 | "I broke the template, recreate it" | `boxman create-templates --force`. |
 | "Reclaim disk" | `boxman storage df`, then `boxman storage optimize`. |
 | "See / prune snapshot history" | `boxman snapshot log`; `boxman snapshot collapse --to <name>`. |
+| "Which snapshot files are left over / can I delete these overlays?" | `boxman snapshot prune --dry-run` (read-only; `--min-age 0` for files changed in the last hour). |
 | "Turn up the logging" | `-v` / `-vv` / `-vvv` either side of the subcommand, or `BOXMAN_VERBOSITY=2`. `-q` (after the subcommand) for warnings only. |
 | "Tear down only the docker runtime" | `boxman destroy-runtime` — it removes `.boxman`, and with it libvirt's domain, network and snapshot definitions. |
 

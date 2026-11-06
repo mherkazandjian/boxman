@@ -294,6 +294,37 @@ class TestStorageDispatch:
         assert args.reverse is True
         assert args.no_graph is True
 
+    def test_snapshot_prune_help_says_it_lists_only(self, capsys):
+        assert _run_cli(["snapshot", "prune", "--help"]) == 0
+        out = " ".join(capsys.readouterr().out.split())
+        assert "This version lists only: run it with --dry-run" in out
+
+    def test_snapshot_prune_dispatch(self):
+        from boxman.scripts.app import _CLI_HANDLERS, parse_args
+        args = parse_args().parse_args(["snapshot", "prune"])
+        assert (args.handler, args.dry_run, args.kinds, args.min_age,
+                args.show_all, args.cluster, args.vms) == (
+            'snapshot_prune', False, None, 3600, False, None, "all")
+        assert 'snapshot_prune' in _CLI_HANDLERS
+
+    def test_snapshot_prune_flags(self):
+        from boxman.scripts.app import parse_args
+        args = parse_args().parse_args([
+            "snapshot", "prune", "--cluster", "c1", "--vms", "node01",
+            "--kind", "preserve", "--min-age", "0", "--all", "--dry-run"])
+        assert (args.cluster, args.vms, args.min_age, args.show_all,
+                args.dry_run) == ("c1", "node01", 0, True, True)
+        assert args.kinds == ("preserve-backup", "preserve-scratch",
+                              "preserve-reservation")
+
+    @pytest.mark.parametrize("flag, value", [
+        ("--kind", "disks"), ("--kind", ""), ("--min-age", "1w"),
+        ("--min-age", "-5")])
+    def test_snapshot_prune_refuses_a_bad_value(self, flag, value):
+        from boxman.scripts.app import parse_args
+        with pytest.raises(SystemExit):
+            parse_args().parse_args(["snapshot", "prune", flag, value])
+
     def test_snapshot_collapse_all_flags(self):
         from boxman.scripts.app import parse_args
         parser = parse_args()
