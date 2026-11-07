@@ -497,6 +497,8 @@ class MiscMixin:
         import subprocess
         import sys
 
+        from boxman.utils.shell import default_stop_signals
+
         cmd = list(getattr(cli_args, 'cmd', None) or [])
         shell = getattr(cli_args, 'shell', None) or 'sh'
 
@@ -506,6 +508,9 @@ class MiscMixin:
             cluster, cluster_cfg, box, cmd=cmd or None, shell=shell
         )
         self.logger.info(f"exec: {' '.join(argv)}")
-        result = subprocess.run(argv)
+        # attached to the terminal: a SIGTERM to boxman leaves it to end on
+        # its own, as it did (#294 review)
+        with default_stop_signals():
+            result = subprocess.run(argv)
         if result.returncode != 0:
             sys.exit(result.returncode)

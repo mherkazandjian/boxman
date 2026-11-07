@@ -2692,6 +2692,31 @@ class SnapshotManager:
             f"paused {vm_name} while its overlays are copied")
         return True
 
+    def _report_interrupted_revert(self, vm_name: str, paused: bool,
+                                   preserved: list[tuple]) -> None:
+        """
+        Say what a restore stopped during its revert leaves (#294): every
+        backup of an overlay, kept, as the revert may have deleted the
+        overlay -- libvirtd finishes a revert virsh has left -- and the
+        backup is the only copy then; and the guest, perhaps paused.
+        """
+        if preserved:
+            missing = [(o, b) for o, b in preserved if not self._is_regular_file(o)]
+            self.logger.error(
+                f"the restore of {vm_name} was stopped during its revert, "
+                f"which libvirt may finish on its own. Every backup of its "
+                f"overlays is kept, and the next restore refuses until they "
+                f"are dealt with: once `virsh domstate {vm_name}` shows the "
+                f"revert done, a backup whose overlay is missing is the only "
+                f"copy of it and goes back in place"
+                + ("" if not missing else " ("
+                   + "; ".join(f"mv -fT {shlex.quote(b)} {shlex.quote(o)}"
+                               for o, b in missing) + ")")
+                + "; one whose overlay is there is a spare copy and can be "
+                  "removed. Backups: "
+                + ", ".join(f"{b} (of {o})" for o, b in preserved))
+        self._report_pause_after_failed_revert(vm_name, paused)
+
     def _report_pause_after_failed_revert(self,
                                           vm_name: str,
                                           paused: bool) -> None:
@@ -3140,7 +3165,7 @@ class SnapshotManager:
                 f"named here. Refusing to revert: writing there would "
                 f"overwrite a live overlay. Rename or delete that snapshot.")
 
-        for _src, dst in pairs:
+        for src, dst in pairs:
             try:
                 os.lstat(dst)
             except FileNotFoundError:
@@ -3157,7 +3182,9 @@ class SnapshotManager:
                 f"link, or land inside a directory, and the cleanup would "
                 f"then delete something this restore did not create. It is "
                 f"most likely left over from an interrupted restore — check "
-                f"it, then remove it.")
+                f"it: if {src} is missing, it is the only copy of it, and "
+                f"goes back there (mv -fT); if {src} is there, it is a spare "
+                f"copy, to remove.")
 
     def _reserve_backup_paths(self, pairs: list[tuple]) -> dict[str, tuple]:
         """
@@ -3652,6 +3679,7 @@ class SnapshotManager:
             max_retries = 3
             last_stderr = ''
             success = False
+            reverting = False
 
             for attempt in range(1, max_retries + 1):
                 try:
@@ -3664,8 +3692,25 @@ class SnapshotManager:
                         intended = self._record_pending(vm_name, ledger,
                                                         before)
                     lock.reverting()
+                    reverting = True
                     result = self.virsh.execute(
                         "snapshot-revert", vm_name, snapshot_name, warn=True)
+                except KeyboardInterrupt:
+                    # stopped (#294). Before the revert, nothing has changed
+                    # but the copies and the pause, and both are undone. Once
+                    # it is under way, libvirtd may finish it on its own after
+                    # virsh has gone: which overlays it deleted is not known
+                    # yet, so every backup stays, and the user is told how to
+                    # tell the copies still needed from the spare ones
+                    if reverting:
+                        self._report_interrupted_revert(vm_name, paused,
+                                                        preserved)
+                    else:
+                        self._reap_preserve_files([b for _o, b in preserved])
+                        self._resume_after_backup(vm_name, paused)
+                        self._undo_decompression(mem_path,
+                                                 decompressed_for_revert)
+                    raise
                 except Exception as exc:
                     self.logger.error(
                         f"error reverting vm {vm_name} to snapshot '{snapshot_name}': {exc}")
