@@ -29,6 +29,7 @@ import os
 import shlex
 import shutil
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from boxman.manager import BoxmanManager
+from boxman.providers.libvirt import revert_locks
 
 # ---------------------------------------------------------------------------
 # Captured logs — attach caplog to boxman's module-level singleton
@@ -86,6 +88,26 @@ def _private_boxman_cache_dir(tmp_path_factory: pytest.TempPathFactory,
         "boxman.config_cache.DEFAULT_CACHE_DIR",
         str(tmp_path_factory.getbasetemp() / "boxman-cache"
             / str(next(_cache_dirs))))
+
+
+@pytest.fixture(autouse=True)
+def _revert_locks_on_a_clock_of_their_own(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Give the revert locks (#303) a clock of this test's own, which moves
+    on when they wait on it: a restore stamps its lock with the next whole
+    second, and the next restore of a VM booted from the same ISO waits for
+    it -- up to a second of real time per restore, in a test that restores
+    a VM several times. Tests that patch ``_now`` and ``_wait`` themselves
+    still win.
+    """
+    now = [time.time()]
+
+    def wait(seconds: float) -> None:
+        now[0] += max(seconds, 0.0)
+
+    monkeypatch.setattr(revert_locks, "_now", lambda: now[0])
+    monkeypatch.setattr(revert_locks, "_wait", wait)
 
 
 # ---------------------------------------------------------------------------

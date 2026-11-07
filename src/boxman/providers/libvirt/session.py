@@ -1278,7 +1278,8 @@ class LibVirtSession(SessionConfigMixin):
         (:func:`.scan_pool.scan_workers`)."""
         return scan_workers(self.provider_config, self.logger)
 
-    def files_in_use(self, paths: list[str]) -> dict[str, str] | None:
+    def files_in_use(self, paths: list[str],
+                     scan=None) -> dict[str, str] | None:
         """
         Which of *paths* have to stay because a domain uses them, from one
         host-wide in-use scan (:meth:`disk_paths_in_use`) however many
@@ -1297,27 +1298,14 @@ class LibVirtSession(SessionConfigMixin):
         The answer is the scan's, as of when it ran. Ask once the command
         has done whatever changes what the domains use (its reverts, its
         media changes): a scan taken before them knows nothing of them.
+        *scan*, when given, is asked instead of :meth:`disk_paths_in_use`:
+        a teardown's, taken once the domain is gone and shared with its
+        storage removal (:meth:`FilesInUse.reasons`).
         """
-        in_use = self.disk_paths_in_use()
+        in_use = (scan or self.disk_paths_in_use)()
         if in_use is None:
             return None
-        why: dict[str, str] = {}
-        for path in paths:
-            try:
-                st = os.stat(path)
-            except FileNotFoundError:
-                identity = None
-            except OSError as exc:
-                why[path] = f"it cannot be inspected ({exc.strerror})"
-                continue
-            else:
-                identity = (st.st_dev, st.st_ino)
-            domain = (in_use.get(path) or in_use.get(os.path.realpath(path))
-                      or (in_use.identities.get(identity)
-                          if identity is not None else None))
-            if domain:
-                why[path] = f"domain {domain} uses it"
-        return why
+        return in_use.reasons(paths)
 
     def _files_used_by(self, virsh, reads: _ChainReads, domain: str,
                        uuid: str, active: bool,
@@ -2548,7 +2536,8 @@ class LibVirtSession(SessionConfigMixin):
             paths_in_use=self.disk_paths_in_use,
             recorded_in_use=lambda: self.snapshot_files_in_use(
                 overlays_too=disk_dir is not None),
-            disk_dir=disk_dir)
+            disk_dir=disk_dir,
+            files_in_use=self.files_in_use)
 
     def ensure_pool_on(self, directory: str, name: str) -> str | None:
         """
@@ -2780,11 +2769,28 @@ class LibVirtSession(SessionConfigMixin):
             self.logger.info(f"restoring latest snapshot '{snapshot_name}' for vm {vm_name}")
         else:
             self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
-        restored = snapshot_mgr.snapshot_restore(
-            vm_name, snapshot_name, paths_in_use=self.disk_paths_in_use)
-        if restored:
-            self._set_clock_after_revert(snapshot_mgr, vm_name, snapshot_name)
-        return restored
+        # the clock is set as soon as the CDROMs are back on their ISOs,
+        # the last step that pauses the guest
+        return snapshot_mgr.snapshot_restore(
+            vm_name, snapshot_name, paths_in_use=self.disk_paths_in_use,
+            after_media=lambda: self._set_clock_after_revert(
+                snapshot_mgr, vm_name, snapshot_name),
+            files_in_use=self.files_in_use)
+
+    def remove_pending_iso_overlays(self, vm_name: str, scan=None,
+                                    gone: bool = False) -> None:
+        """
+        Remove the overlays of its CDROM images that restores of *vm_name*
+        left for later, once nothing uses them
+        (:meth:`SnapshotManager.remove_pending_iso_overlays`), asking
+        :meth:`files_in_use` once for all of them; with *gone*, its domain
+        is confirmed undefined. *scan* is the in-use scan to ask, a
+        teardown's shared with its storage removal; by default a scan of
+        its own (:meth:`disk_paths_in_use`).
+        """
+        SnapshotManager(self.provider_config).remove_pending_iso_overlays(
+            vm_name, lambda paths: self.files_in_use(paths, scan=scan),
+            gone=gone)
 
     def _set_clock_after_revert(self, snapshot_mgr: SnapshotManager,
                                 vm_name: str, snapshot_name: str) -> None:

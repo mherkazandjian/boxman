@@ -875,16 +875,36 @@ class VMsMixin:
                 f"undefined; leaving its disks in place rather than removing "
                 f"storage under a possibly-live guest")
 
+        # what every domain uses, asked once -- by the storage removal, and
+        # by the removal of the overlays of its CDROM images its restores
+        # left for later -- after the domain is gone: no domain starts using
+        # either in between
+        scans: list = []
+
+        def paths_in_use():
+            if not scans:
+                scans.append(session.disk_paths_in_use())
+            return scans[0]
+
         # remove_vm_storage() raises on a filesystem error, which reaches
         # _run_parallel's failure handling. Other domains' overlays are
         # asked about only where one can be removed: in a disk_snapshot_dir
         overlay_dirs = self._cluster_disk_snapshot_dirs()
-        outcome = remove_vm_storage(
-            inventory, self._cluster_workdirs(), session.disk_paths_in_use,
-            memory_dirs=self._cluster_memory_snapshot_dirs(),
-            recorded_in_use=lambda: session.snapshot_files_in_use(
-                overlays_too=bool(overlay_dirs)),
-            overlay_dirs=overlay_dirs)
+        try:
+            outcome = remove_vm_storage(
+                inventory, self._cluster_workdirs(), paths_in_use,
+                memory_dirs=self._cluster_memory_snapshot_dirs(),
+                recorded_in_use=lambda: session.snapshot_files_in_use(
+                    overlays_too=bool(overlay_dirs)),
+                overlay_dirs=overlay_dirs)
+        finally:
+            # the overlays libvirt made of its CDROM images that its
+            # restores left beside them for later, however the storage
+            # removal ended: its snapshots went with the domain, and no
+            # later command asks for them by its name. What it keeps it
+            # names, and keeps on record
+            self._remove_pending_iso_overlays(session, full_vm_name,
+                                              paths_in_use)
         for path, reason in outcome.kept:
             self.logger.warning(
                 f"{full_vm_name}: left {path} in place because {reason}")
@@ -907,6 +927,28 @@ class VMsMixin:
                     os.remove(inventory.locator_at)
         if removed:
             session.refresh_pools_holding(removed)
+
+    def _remove_pending_iso_overlays(self, session, full_vm_name: str,
+                                     paths_in_use) -> None:
+        """
+        Remove the overlays of its CDROM images that restores of
+        *full_vm_name*, now undefined, left for later
+        (``LibVirtSession.remove_pending_iso_overlays``), on the teardown's
+        own scan, *paths_in_use*. Housekeeping: a failure is warned about,
+        and what is kept stays on record, where ``snapshot prune --dry-run``
+        names it.
+        """
+        remove_pending = getattr(session, 'remove_pending_iso_overlays', None)
+        if remove_pending is None:
+            return
+        try:
+            remove_pending(full_vm_name, scan=paths_in_use, gone=True)
+        except Exception as exc:
+            self.logger.warning(
+                f"{full_vm_name}: the overlays of its CDROM images left for "
+                f"later removal could not be removed "
+                f"({type(exc).__name__}: {exc}); they stay on record, and "
+                f"`boxman snapshot prune --dry-run` names them")
 
     def _name_memory_images_left(self, full_vm_name: str,
                                  inventory: StorageInventory,

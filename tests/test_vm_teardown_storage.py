@@ -26,7 +26,9 @@ from boxman.providers.libvirt.disk_ownership import (
     ROLE_DATA,
     DiskRecord,
 )
+from boxman.providers.libvirt.pending_overlays import PendingOverlays
 from boxman.providers.libvirt.session import LibVirtSession
+from boxman.providers.libvirt.snapshot import SnapshotManager
 from boxman.providers.libvirt.virsh_parse import DomblkRow
 from conftest import domain_listing, domain_uuid, make_bare_manager
 from fake_libvirt_host import FakeHost
@@ -232,6 +234,93 @@ class TestOrdinaryTeardown:
         assert list(tmp_path.iterdir()) == []
         assert not (boot_base.exists() or memory.exists())
         assert t.warnings == ''
+
+
+class TestTheOverlaysItsRestoresLeftForLater:
+    """A restore leaves the overlay libvirt's revert made of a CD-ROM's ISO
+    beside the ISO, recorded for removal (#273): the teardown removes it,
+    on the scan its storage was removed by, once nothing uses it."""
+
+    @staticmethod
+    def _left(tmp_path):
+        isodir = tmp_path / 'image-cache'
+        isodir.mkdir()
+        iso = _file(isodir / 'nixos.iso', b'the ISO')
+        overlay = _file(isodir / 'nixos.1793626526', b'QFI\xfb')
+        PendingOverlays().record(VM, [([str(overlay)], str(iso))])
+        return iso, overlay
+
+    @staticmethod
+    def _removing(t):
+        """``LibVirtSession.remove_pending_iso_overlays``, asking which
+        files are in use of the *scan* the teardown hands it."""
+        def remove(vm, scan=None, gone=False):
+            sm = SnapshotManager({})
+            with patch.object(sm, '_remove_file',
+                              side_effect=lambda p: os.unlink(p) or True):
+                sm.remove_pending_iso_overlays(
+                    vm, lambda paths: disk_cleanup.FilesInUse(
+                        scan()).reasons(paths), gone=gone)
+        t.session.remove_pending_iso_overlays.side_effect = remove
+
+    def test_they_go_with_it_on_the_scan_its_storage_was_removed_by(
+            self, tmp_path):
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        iso, overlay = self._left(tmp_path)
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+        self._removing(t)
+
+        t.deprovision()
+
+        assert not overlay.exists() and iso.read_bytes() == b'the ISO'
+        assert PendingOverlays().chains(VM) == []
+        t.session.disk_paths_in_use.assert_called_once_with()
+        assert t.session.remove_pending_iso_overlays.call_args.kwargs[
+            'gone'] is True
+
+    def test_one_another_domain_uses_stays_on_record_and_is_named(
+            self, tmp_path):
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        _iso, overlay = self._left(tmp_path)
+        t = _Teardown(tmp_path, disks=[boot], records=[],
+                      in_use={str(overlay): OTHER})
+        self._removing(t)
+
+        with patch('boxman.providers.libvirt.snapshot.log') as log:
+            t.deprovision()
+
+        assert overlay.exists()
+        assert [c.layers for c in PendingOverlays().chains(VM)] == [
+            [str(overlay)]]
+        assert f'domain {OTHER} uses it' in ' '.join(
+            str(c.args[0]) for c in log.warning.call_args_list)
+
+    def test_they_go_though_the_storage_removal_raises(self, tmp_path):
+        """No later command asks for an undefined VM's records by its
+        name: a teardown that fails part-way still removes them."""
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        _iso, overlay = self._left(tmp_path)
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+        self._removing(t)
+
+        with patch('boxman.manager_parts.vms.remove_vm_storage',
+                   side_effect=OSError(5, 'Input/output error')), \
+             pytest.raises(OSError):
+            t.deprovision()
+
+        assert not overlay.exists()
+        assert PendingOverlays().chains(VM) == []
+
+    def test_a_removal_that_raises_does_not_fail_the_teardown(self, tmp_path):
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+        t.session.remove_pending_iso_overlays.side_effect = RuntimeError(
+            'virsh vanished')
+
+        t.deprovision()
+
+        assert not boot.exists()
+        assert 'virsh vanished' in t.warnings
 
 
 class TestOwnedSnapshotChains:

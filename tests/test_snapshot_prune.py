@@ -503,6 +503,21 @@ class TestPreserveLeftovers:
             REMOVABLE)
         assert found[f"{VM}.s1.preserve.4243.0123456789ab"].status == UNKNOWN
 
+    def test_a_hard_link_an_interrupted_restore_left_is_kept_with_its_overlay(
+            self, box):
+        """A restore backs an overlay up as a hard link of it: until the
+        put-back renames it over the original's name, or drops it, the two
+        names are one file. G4 keeps both -- removing either frees nothing
+        -- and a restore that ends drops the second name either way."""
+        overlay = box.overlay(f"{VM}.s1")
+        os.link(overlay, box.wd / f"{VM}.s1.preserve")
+        box.headers[str(box.wd / f"{VM}.s1.preserve")] = _qcow2(box.base)
+        found = box.decide()
+        for name in (f"{VM}.s1", f"{VM}.s1.preserve"):
+            assert (found[name].status, found[name].reason) == (
+                KEPT, "it has 2 names (hard links): removing one frees "
+                      "nothing")
+
     def test_a_restore_in_progress_is_left_alone(self, box):
         box.overlay(f"{VM}.s1")
         box._make(f"{VM}.s1.preserve", b"QFI\xfbbeing copied")

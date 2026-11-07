@@ -229,12 +229,12 @@ class TestAShutOffVm:
         and the VM then failed to start (see
         test_a_stopped_vm_has_its_persistent_definition_switched_alone)."""
         domain = _Domain("shut off")
-        in_use = MagicMock(name="disk_paths_in_use")
+        in_use = MagicMock(name="files_in_use")
         with patch.object(sm, "_flatten_cdrom_overlays") as flatten:
-            ok, _logger = _take(sm, domain, tmp_path, paths_in_use=in_use)
+            ok, _logger = _take(sm, domain, tmp_path, files_in_use=in_use)
 
         assert ok is True
-        flatten.assert_called_once_with(VM, paths_in_use=in_use)
+        flatten.assert_called_once_with(VM, files_in_use=in_use)
         assert domain.calls_to("change-media") == []
 
     def test_the_take_says_it_is_disk_only(self, sm, tmp_path):
@@ -304,16 +304,16 @@ class TestARunningOrPausedVm:
         """Through update-device behind a raw driver (#273), before the
         memory is saved: see TestARestorePutsTheCdromBackOnItsIso."""
         domain = _Domain(state)
-        in_use = MagicMock(name="disk_paths_in_use")
+        in_use = MagicMock(name="files_in_use")
         before_the_snapshot = []
         with patch.object(sm, "_flatten_cdrom_overlays",
                           side_effect=lambda *_a, **_k: before_the_snapshot.append(
                               not domain.calls_to("snapshot-create-as"))
                           ) as flatten:
-            ok, _logger = _take(sm, domain, tmp_path, paths_in_use=in_use)
+            ok, _logger = _take(sm, domain, tmp_path, files_in_use=in_use)
 
         assert ok is True
-        flatten.assert_called_once_with(VM, paths_in_use=in_use)
+        flatten.assert_called_once_with(VM, files_in_use=in_use)
         assert before_the_snapshot == [True]
         assert domain.calls_to("change-media") == []
 

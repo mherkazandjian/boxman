@@ -795,6 +795,32 @@ class FilesInUse(dict):
         #: (st_dev, st_ino) -> the domain that uses that file
         self.identities: dict[tuple[int, int], str] = {}
 
+    def reasons(self, paths) -> dict[str, str]:
+        """
+        ``{path: why it has to stay}`` for each of *paths* a domain uses,
+        by the name given, its resolved path, or its identity (``st_dev``,
+        ``st_ino``, links followed), or whose identity cannot be read other
+        than for naming no file. A path left out is one no domain uses, or
+        one that is not there (``LibVirtSession.files_in_use``).
+        """
+        why: dict[str, str] = {}
+        for path in paths:
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                identity = None
+            except OSError as exc:
+                why[path] = f"it cannot be inspected ({exc.strerror})"
+                continue
+            else:
+                identity = (st.st_dev, st.st_ino)
+            domain = (self.get(path) or self.get(os.path.realpath(path))
+                      or (self.identities.get(identity)
+                          if identity is not None else None))
+            if domain:
+                why[path] = f"domain {domain} uses it"
+        return why
+
 
 class _Identities:
     """
