@@ -486,18 +486,45 @@ back. SIZE is what a file takes on disk (`st_blocks`).
 
 ### Removing them
 
+Here the memory directory was made read-only after the listing, so its
+two files could not go:
+
 ```console
 $ boxman snapshot prune --vms nixos01 --min-age 0
-...the table, as above...
-These files will be removed (reclaiming 753.8M):
+...the table...
+These files will be removed (reclaiming 13.5M):
 
+  <ws>/overlays/<vm>.1794013309
   <ws>/overlays/<vm>.m1.preserve
-  ...
+  <ws>/overlays/<vm>.m2.preserve
+  <ws>/overlays/<vm>.p2
+  <ws>/overlays/<vm>_data.1794013309
+  <ws>/overlays/<vm>_data.p2
+  <ws>/overlays/<vm>_data.t2
+  /mnt/mem/nixos/<vm>_snapshot_m1.raw.zst
+  /mnt/mem/nixos/<vm>_snapshot_m2.raw
+
+And these overlays of CD-ROM images, which restores left for later removal, each once a scan of every domain finds nothing uses it, as `boxman snapshot take` removes them:
+
+  <cache>/nixos-minimal-25.05-cecb98c4.1794013309
+  <cache>/nixos-minimal-25.05-cecb98c4.1794013314
 
 Proceed? [y/N] y
-removed <ws>/overlays/<vm>.m1.preserve (196.0K)
-...
-reclaimed 753.8M (5 files)
+removed <ws>/overlays/<vm>.1794013309 (196.0K)
+removed <ws>/overlays/<vm>.m1.preserve (1.0M)
+removed <ws>/overlays/<vm>.m2.preserve (4.0K)
+removed <ws>/overlays/<vm>.p2 (196.0K)
+removed <ws>/overlays/<vm>_data.1794013309 (196.0K)
+removed <ws>/overlays/<vm>_data.p2 (196.0K)
+removed <ws>/overlays/<vm>_data.t2 (196.0K)
+could not remove /mnt/mem/nixos/<vm>_snapshot_m1.raw.zst: it could not be removed (Permission denied)
+could not remove /mnt/mem/nixos/<vm>_snapshot_m2.raw: it could not be removed (Permission denied)
+removed <cache>/nixos-minimal-25.05-cecb98c4.1794013309 (200.0K)
+removed <cache>/nixos-minimal-25.05-cecb98c4.1794013314 (200.0K)
+reclaimed 2.4M (9 files)
+ERROR: could not prune 2 file(s): /mnt/mem/nixos/<vm>_snapshot_m1.raw.zst: it could not be removed (Permission denied); /mnt/mem/nixos/<vm>_snapshot_m2.raw: it could not be removed (Permission denied)
+$ echo $?
+2
 ```
 
 - **The prompt.** "No input available, aborted." at the end of input, and
