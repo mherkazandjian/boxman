@@ -4169,6 +4169,9 @@ class SnapshotManager:
         snapshot unlinks the overlay its parent's take made (#289), not its
         own, which an earlier restore put back (#290).
 
+        Only its records of the VM's disks: an overlay of a CDROM's image
+        sits beside the image, where prune removes nothing itself.
+
         A hint: when the snapshots, the VM's disks or a chain cannot be
         read, nothing is said. ``snapshot prune`` asks everything again.
         """
@@ -4176,18 +4179,19 @@ class SnapshotManager:
             root = ET.fromstring(xml_before or "")
         except ET.ParseError:
             return
-        recorded = [source.get("file")
+        recorded = [(disk.get("name"), source.get("file"))
                     for section in ("disks", "revertDisks")
                     for disk in root.findall(f"{section}/disk")
                     for source in disk.findall("source")
                     if source.get("file")]
-        left = [path for path in dict.fromkeys(recorded)
-                if os.path.isfile(path)]
-        if not left:
+        if not any(os.path.isfile(path) for _name, path in recorded):
             return
-        snapshots = self._snapshot_xmls(vm_name)
         disks = self._data_disk_targets(vm_name)
-        if snapshots is None or not disks:
+        targets = {target for target, _source in disks}
+        left = list(dict.fromkeys(path for name, path in recorded
+                                  if name in targets and os.path.isfile(path)))
+        snapshots = self._snapshot_xmls(vm_name) if left else None
+        if snapshots is None:
             return
         needed: set[str] = set()
         for xml in snapshots.values():

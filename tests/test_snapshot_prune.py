@@ -1688,6 +1688,25 @@ class TestTheWarningsPointAtPrune:
                 f"`boxman snapshot prune` removes them once nothing uses "
                 f"them.") in _warnings(logger)
 
+    @pytest.mark.parametrize("target, named", [("vda", True),
+                                               ("sda", False)])
+    def test_only_a_left_overlay_of_a_disk_is_named_not_a_cdroms(
+            self, sm, tmp_path, target, named):
+        """A CDROM's overlay sits beside its image, where prune removes
+        nothing itself: a delete that left one does not point at prune."""
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        left = tmp_path / "image-cache" / "nixos-minimal.1793626528"
+        left.write_bytes(b"QFI\xfb")
+        xml = (f"<domainsnapshot><name>gone</name><disks><disk "
+               f"name='{target}' snapshot='external' type='file'><source "
+               f"file='{left}'/></disk></disks></domainsnapshot>")
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, patch.object(sm, "logger") as logger:
+            sm._name_overlays_the_delete_left(vm.VM, "gone", xml)
+        assert (f"left {left}, which it recorded" in _warnings(logger)) is (
+            named)
+
     def test_a_delete_that_leaves_nothing_of_its_own_says_nothing(
             self, sm, tmp_path):
         vm = _RevertingLibvirt(tmp_path)
