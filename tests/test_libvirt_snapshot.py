@@ -1546,18 +1546,20 @@ class TestOwnershipSurvivesFailures:
         assert any(c.startswith("rm -f") and str(backup) in c for c in calls)
 
     def test_a_cleanup_that_cannot_run_still_names_what_it_left(
-        self, sm: SnapshotManager
+        self, sm: SnapshotManager, tmp_path: Path
     ):
         """This is the function that promises to name what it left behind,
         so it must not be the one that dies quietly."""
         def explode(*_a, **_kw):
             raise OSError(24, "Too many open files")
 
+        left = tmp_path / "a.qcow2.preserve"
+        left.write_bytes(b"QFI\xfb")
         with patch.object(sm.virsh, "execute_shell", side_effect=explode), \
              patch.object(sm, "logger") as logger:
-            sm._reap_preserve_files(["/overlays/a.qcow2.preserve"])
+            sm._reap_preserve_files([str(left)])
 
-        assert any("/overlays/a.qcow2.preserve" in str(call)
+        assert any(str(left) in str(call)
                    for call in logger.warning.call_args_list)
 
     @pytest.mark.skipif(os.geteuid() == 0,
@@ -7451,7 +7453,8 @@ class TestARestoreLeavesTheIsoOverlayForLater:
             session.remove_pending_iso_overlays("vm01", scan=lambda: in_use,
                                                 gone=True)
         _sm, vm_name, asking = remove.call_args.args
-        assert (vm_name, remove.call_args.kwargs) == ("vm01", {"gone": True})
+        assert (vm_name, remove.call_args.kwargs) == (
+            "vm01", {"gone": True, "only": None})
         assert asking(["/cache/nixos.1", "/cache/nixos.2"]) == {
             "/cache/nixos.1": "domain other01 uses it"}
 
@@ -7601,7 +7604,7 @@ class TestARestoreLeavesTheIsoOverlayForLater:
         assert len(status.call_args_list) == 1
         line = str(status.call_args.args[0])
         assert "2 overlays" in line and "snapshot take" in line
-        assert "snapshot prune --dry-run" in line
+        assert "`boxman snapshot prune`, its next" in line
 
 
 # ---------------------------------------------------------------------------
