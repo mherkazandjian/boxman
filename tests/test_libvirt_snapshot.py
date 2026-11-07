@@ -8106,6 +8106,49 @@ class TestRevertsOfVmsSharingAnImage:
             assert _restore(sm, vm, "s1") is True
         assert seen == [(False, False)]
 
+    def test_an_interrupt_before_the_revert_undoes_the_copies_and_the_pause(
+            self, sm, tmp_path):
+        """A stop in the wait for the revert's second (#294): nothing was
+        reverted, so the backups go, and the guest runs on, as after any
+        refusal before the revert."""
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        vm.take("s2")
+        with patch.object(revert_locks.RevertLock, "reverting",
+                          side_effect=KeyboardInterrupt), \
+                pytest.raises(KeyboardInterrupt):
+            _restore(sm, vm, "s1")
+        assert "snapshot-revert" not in [c[0] for c in vm.calls]
+        assert vm.paused is False
+        assert not list(tmp_path.rglob("*.preserve*"))
+
+    def test_an_interrupted_revert_keeps_every_backup_and_says_which_go_back(
+            self, sm, tmp_path):
+        """libvirtd finishes a revert virsh has left (#294): an overlay it
+        deleted lives on in its backup alone, which the cleanup of a revert
+        judged failed could not tell yet. Every backup stays, and the error
+        says how to put back the overlays that are missing, where the next
+        restore's refusal said only to remove the backups."""
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        vm.take("s2")
+        real = vm._revert
+
+        def finished_then_interrupted(name):
+            real(name)
+            raise KeyboardInterrupt
+        vm._revert = finished_then_interrupted
+        with patch.object(sm.logger, "error") as error, \
+                pytest.raises(KeyboardInterrupt):
+            _restore(sm, vm, "s1")
+        backups = sorted(str(path) for path in tmp_path.rglob("*.preserve"))
+        missing = [b for b in backups if not os.path.exists(b[:-len(".preserve")])]
+        said = " ".join(str(call) for call in error.call_args_list)
+        assert backups and missing
+        assert "stopped during its revert" in said
+        assert all(b in said for b in backups)
+        assert all(f"mv -fT {b} {b[:-len('.preserve')]}" in said for b in missing)
+
     def test_an_interrupted_revert_still_releases_and_stamps_its_turn(
             self, sm, tmp_path):
         """A Ctrl-C during snapshot-revert: the lock is released, stamped
