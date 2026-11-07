@@ -2778,19 +2778,23 @@ class LibVirtSession(SessionConfigMixin):
             files_in_use=self.files_in_use)
 
     def remove_pending_iso_overlays(self, vm_name: str, scan=None,
-                                    gone: bool = False) -> None:
+                                    gone: bool = False, only=None):
         """
         Remove the overlays of its CDROM images that restores of *vm_name*
         left for later, once nothing uses them
         (:meth:`SnapshotManager.remove_pending_iso_overlays`), asking
         :meth:`files_in_use` once for all of them; with *gone*, its domain
         is confirmed undefined. *scan* is the in-use scan to ask, a
-        teardown's shared with its storage removal; by default a scan of
-        its own (:meth:`disk_paths_in_use`).
+        teardown's shared with its storage removal, or ``snapshot prune``'s
+        shared by its VMs; by default a scan of its own
+        (:meth:`disk_paths_in_use`). *only* limits it to the chains topped
+        by those overlays. Returns what was removed and what was kept
+        (``IsoOverlayRemoval``).
         """
-        SnapshotManager(self.provider_config).remove_pending_iso_overlays(
-            vm_name, lambda paths: self.files_in_use(paths, scan=scan),
-            gone=gone)
+        return SnapshotManager(
+            self.provider_config).remove_pending_iso_overlays(
+                vm_name, lambda paths: self.files_in_use(paths, scan=scan),
+                gone=gone, only=only)
 
     def _set_clock_after_revert(self, snapshot_mgr: SnapshotManager,
                                 vm_name: str, snapshot_name: str) -> None:

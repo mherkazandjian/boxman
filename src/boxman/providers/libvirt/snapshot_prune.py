@@ -18,13 +18,14 @@ Snapshots leave such files behind, and nothing removes them until
 - a memory image no snapshot records: from before #295, from an
   interrupted run, or kept by a delete whose scan failed.
 
-This module decides, and removes nothing: it reads files, never libvirt.
-:func:`find_candidates` lists what is named for one of the project's VMs in
-its snapshot directories (N1, N2), and :func:`decide` gives each file a
-status -- ``removable``, ``kept`` with the reason, or ``unknown`` -- from
-the scans ``LibVirtSession`` makes: what every domain uses (G1), what every
-snapshot names (G2), and one header level of every image in those
-directories (G3).
+This module reads files, never libvirt. :func:`find_candidates` lists what
+is named for one of the project's VMs in its snapshot directories (N1, N2),
+and :func:`decide` gives each file a status -- ``removable``, ``kept`` with
+the reason, or ``unknown`` -- from the scans ``LibVirtSession`` makes: what
+every domain uses (G1), what every snapshot names (G2), and one header level
+of every image in those directories (G3). :func:`prune` removes the
+removable ones (G7): each only while it is still the file listed, newest
+layer first, and a file that stays keeps what it is built on.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from xml.etree import ElementTree as ET
 
-from .disk_cleanup import FilesInUse
+from .disk_cleanup import FilesInUse, remove_if_unchanged
 from .snapshot import SnapshotManager
 
 REMOVABLE = "removable"
@@ -80,6 +81,9 @@ _PRESERVE = re.compile(r"(?P<x>.+)\.preserve(?P<copy>\.copy)?"
 
 #: the first bytes of every qcow2 image
 _QCOW2_MAGIC = b"QFI\xfb"
+
+#: why a removable file stays in a prune of named paths it is not one of
+_NOT_NAMED = "it is not named"
 
 #: a revert overlay's suffix is the epoch of the revert; outside this range
 #: it is not taken for one when saying when it was made
@@ -179,6 +183,9 @@ class Entry:
     #: kept because a domain uses it or a snapshot records it: listed only
     #: with ``--all``
     recorded: bool = False
+    #: the image right under it, as its header names it; None for a file
+    #: built on nothing, or whose header was not read
+    backing: str | None = None
 
     @property
     def size(self) -> int:
@@ -229,6 +236,10 @@ class Scans:
     mounts: set[str] | None = None
     #: why a scan failed, other than G1 and G2 being ``None``
     failures: list[str] = field(default_factory=list)
+    #: the overlays of CD-ROM images restores left for later removal
+    #: (``pending_overlays``), by path and by identity: never prune's to
+    #: remove, but the take's, the teardown's, or prune's drain of them
+    pending: FilesInUse = field(default_factory=FilesInUse)
 
 
 def owner_of(name: str, vms: dict[str, VmFacts],
@@ -724,6 +735,7 @@ def decide(listing: Listing, vms: dict[str, VmFacts], known: set[str],
                      or not header.get("backing"))):
             continue        # no overlay: <vm>.save, a standalone image
         entries.append(entry)
+        entry.backing = (header or {}).get("backing") or None
         decision = _Decision()
         vm = vms[entry.vm]
         if failures:
@@ -763,6 +775,9 @@ def _gates(entry: Entry, vm: VmFacts, vms: dict[str, VmFacts],
     who = references.who(entry.path, identity)
     if who:
         decision.keep(f"{who} names it", recorded=True)
+    who = _Index(scans.pending).who(entry.path, identity)
+    if who:
+        decision.keep(who)
     if not stat.S_ISREG(st.st_mode):
         decision.keep("it is a symlink or not a regular file")
     elif st.st_nlink > 1:
@@ -801,7 +816,9 @@ def _keep_what_is_built_on(entries: list[Entry], listing: Listing,
                    if entry.identity is not None}
     # what each entry is, said in brackets after its name
     status = {entry.path: ("too recent" if entry.reason.startswith(
-                               "too recent") else entry.status)
+                               "too recent")
+                           else "not named" if entry.reason == _NOT_NAMED
+                           else entry.status)
               for entry in entries}
     below: dict[str, tuple[str, tuple[int, int] | None]] = {}
     for path in listing.files:
@@ -826,3 +843,119 @@ def _keep_what_is_built_on(entries: list[Entry], listing: Listing,
             del removable[under.path]
             status[under.path] = KEPT
             changed = True
+
+
+def _built_on(upper: Entry, lower: Entry) -> bool:
+    """Whether *upper*'s header names *lower* as the image right under it,
+    by path -- as named and resolved -- or by identity."""
+    if not upper.backing:
+        return False
+    return (upper.backing == lower.path
+            or os.path.realpath(upper.backing) == os.path.realpath(lower.path)
+            or (lower.identity is not None
+                and _identity_of(upper.backing) == lower.identity))
+
+
+def removal_order(entries: list[Entry]) -> list[Entry]:
+    """
+    *entries* newest layer first: each before every one of them it is built
+    on, by path otherwise. Entries in a loop of backing files, which no
+    qcow2 chain can be, come last, by path.
+    """
+    above = {id(entry): [other for other in entries
+                         if other is not entry and _built_on(other, entry)]
+             for entry in entries}
+    order: list[Entry] = []
+    placed: set[int] = set()
+    left = sorted(entries, key=lambda e: e.path)
+    while left:
+        ready = [entry for entry in left
+                 if all(id(up) in placed for up in above[id(entry)])]
+        if not ready:
+            order += left
+            break
+        order += ready
+        placed.update(id(entry) for entry in ready)
+        left = [entry for entry in left if id(entry) not in placed]
+    return order
+
+
+@dataclass
+class Removal:
+    """What :func:`prune` did with each entry it was given."""
+
+    removed: list[Entry] = field(default_factory=list)
+    #: removed by something else before it got to them
+    gone: list[Entry] = field(default_factory=list)
+    #: ``(entry, why)``: replaced since it was listed, or its removal failed
+    failed: list[tuple[Entry, str]] = field(default_factory=list)
+    #: ``(entry, why)``: a file built on it stays
+    kept: list[tuple[Entry, str]] = field(default_factory=list)
+
+    @property
+    def reclaimed(self) -> int:
+        return sum(entry.size for entry in self.removed)
+
+
+def prune(entries: list[Entry], remove=None) -> Removal:
+    """
+    G7: remove each of *entries*, removable ones, newest layer first
+    (:func:`removal_order`), each only while it is still the file that was
+    listed -- *remove*, by default ``remove_if_unchanged``, given its
+    identity when it was listed. A file replaced since is put back under
+    its name, and stays.
+
+    A file that stays -- replaced since, or whose removal failed -- keeps
+    every entry it is built on, all the way down, as a teardown keeps what
+    is below a layer it keeps: removed, they would leave it on nothing.
+    One that something else removed first holds nothing up.
+    """
+    remove = remove or remove_if_unchanged
+    result = Removal()
+    held: dict[str, str] = {}
+
+    def keep_below(entry: Entry) -> None:
+        for lower in entries:
+            if lower is not entry and _built_on(entry, lower):
+                held.setdefault(lower.path, f"{entry.path}, which stays, is "
+                                            f"built on it")
+
+    for entry in removal_order(entries):
+        if entry.path in held:
+            result.kept.append((entry, held[entry.path]))
+            keep_below(entry)
+            continue
+        try:
+            outcome, where = remove(entry.path, entry.identity)
+        except OSError as exc:
+            result.failed.append(
+                (entry, f"it could not be removed "
+                        f"({exc.strerror or exc})"))
+            keep_below(entry)
+            continue
+        if outcome == "removed":
+            result.removed.append(entry)
+        elif outcome == "gone":
+            result.gone.append(entry)
+        else:
+            result.failed.append((entry, (
+                "it was replaced after it was listed, and stays"
+                if outcome == "restored" else
+                f"it was replaced after it was listed, and its name was "
+                f"taken again before the replacement could be put back; the "
+                f"replacement is at {where}")))
+            keep_below(entry)
+    return result
+
+
+def keep_unnamed(entries: list[Entry], listing: Listing, scans: Scans,
+                 named: set[str]) -> None:
+    """
+    For a prune of the paths *named* alone: every removable entry not
+    named stays (``kept``), and so does what it is built on (G3, asked
+    again), so that no file left is built on one removed.
+    """
+    for entry in entries:
+        if entry.status == REMOVABLE and entry.path not in named:
+            entry.status, entry.reason = KEPT, _NOT_NAMED
+    _keep_what_is_built_on(entries, listing, scans)

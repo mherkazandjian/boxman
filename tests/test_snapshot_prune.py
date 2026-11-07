@@ -8,9 +8,13 @@ behind that nothing records or uses, and why each other one is kept.
   holds (G1), one header level (G3), a memory image's save header, the
   pools of earlier ``disk_snapshot_dir``\\ s -- against :class:`FakeHost`;
 - the leftovers of real snapshot sequences, driven through
-  ``SnapshotManager`` on :class:`_RevertingLibvirt` (sources 1, 2, 3a, 3b).
-
-This version lists only: nothing here removes a file.
+  ``SnapshotManager`` on :class:`_RevertingLibvirt` (sources 1, 2, 3a, 3b),
+  removed by :func:`prune`, after which every snapshot left validates and
+  restores;
+- :func:`prune` (G7): newest layer first, a file replaced since it was
+  listed, and what a file that stays is built on;
+- the removal a take runs of the overlays restores left beside an ISO, as
+  prune drives it, and the warnings that point at prune.
 """
 
 from __future__ import annotations
@@ -26,6 +30,8 @@ from xml.etree import ElementTree as ET
 
 import pytest
 
+from boxman.exceptions import SnapshotError
+from boxman.providers.libvirt.disk_cleanup import FilesInUse
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.providers.libvirt.snapshot import SnapshotManager
 from boxman.providers.libvirt.snapshot_prune import (
@@ -40,6 +46,7 @@ from boxman.providers.libvirt.snapshot_prune import (
     SKIPPED,
     TAKE_OVERLAY,
     UNKNOWN,
+    Entry,
     Held,
     References,
     Scans,
@@ -49,15 +56,25 @@ from boxman.providers.libvirt.snapshot_prune import (
     decide,
     find_candidates,
     format_duration,
+    keep_unnamed,
     owner_of,
     parse_duration,
     parse_kinds,
+    prune,
+    removal_order,
     save_image_owner,
     save_image_xml,
 )
 from conftest import domain_listing, domain_uuid
 from fake_libvirt_host import FakeHost, Result
-from test_libvirt_snapshot import _restore, _restoring, _RevertingLibvirt
+from test_libvirt_snapshot import (
+    _files_in_use,
+    _restore,
+    _restoring,
+    _result,
+    _RevertingLibvirt,
+    _waiting,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -97,6 +114,7 @@ class _Box:
         self.locked: set[str] = set()
         self.mounts: set[str] | None = set()
         self.failures: list[str] = []
+        self.pending = FilesInUse()
 
     def _make(self, name: str, data: bytes = b"data") -> str:
         path = self.wd / name
@@ -127,10 +145,11 @@ class _Box:
         scans = Scans(held=self.held, references=self.references,
                       headers=headers, owners=self.owners,
                       locked=self.locked, domains=self.domains,
-                      mounts=self.mounts, failures=list(self.failures))
+                      mounts=self.mounts, failures=list(self.failures),
+                      pending=self.pending)
         entries = decide(listing, self.vms, self.known, scans,
                          time.time() + later, min_age, kinds)
-        self.listing = listing
+        self.listing, self.scans = listing, scans
         return {os.path.basename(entry.path): entry for entry in entries}
 
 
@@ -1116,11 +1135,11 @@ def _unaccounted(vm: _RevertingLibvirt) -> list[str]:
                   if "_snapshot_" not in p.name and str(p) not in accounted)
 
 
-def _prune(vm: _RevertingLibvirt) -> dict[str, list[str]]:
-    """``{status: [path, ...]}`` of a prune of *vm*'s directories, every
-    scan read from *vm* as libvirt would answer it: what it uses, what its
-    snapshots name (parsed as :meth:`LibVirtSession.snapshot_references`
-    parses them), one header level of each file."""
+def _entries(vm: _RevertingLibvirt) -> list:
+    """The entries of a prune of *vm*'s directories, every scan read from
+    *vm* as libvirt would answer it: what it uses, what its snapshots name
+    (parsed as :meth:`LibVirtSession.snapshot_references` parses them), one
+    header level of each file."""
     uuid = domain_uuid(vm.VM)
     facts = VmFacts(name=vm.VM, cluster="c", uuid=uuid,
                     disks=(str(vm.workdir / "vm01.qcow2"),
@@ -1151,11 +1170,35 @@ def _prune(vm: _RevertingLibvirt) -> dict[str, list[str]]:
               if entry.kind == MEMORY_IMAGE}
     scans = Scans(held=held, references=references, headers=headers,
                   owners=owners, domains=[(vm.VM, uuid)], mounts=set())
+    return decide(listing, {vm.VM: facts}, {vm.VM}, scans,
+                  time.time() + 7200, 3600)
+
+
+def _prune(vm: _RevertingLibvirt) -> dict[str, list[str]]:
+    """``{status: [path, ...]}`` of a prune of *vm*'s directories
+    (:func:`_entries`)."""
     found: dict[str, list[str]] = {}
-    for entry in decide(listing, {vm.VM: facts}, {vm.VM}, scans,
-                        time.time() + 7200, 3600):
+    for entry in _entries(vm):
         found.setdefault(entry.status, []).append(entry.path)
     return {status: sorted(paths) for status, paths in found.items()}
+
+
+def _prune_and_restore_each(sm, vm: _RevertingLibvirt) -> list[str]:
+    """Remove what a prune of *vm* lists as removable (:func:`prune`), then
+    validate and restore every snapshot left, newest name first, the first
+    again last; what was removed. Each must validate and restore."""
+    removable = [e for e in _entries(vm) if e.status == REMOVABLE]
+    result = prune(removable)
+    assert (result.failed, result.kept, result.gone) == ([], [], [])
+    removed = sorted(entry.path for entry in result.removed)
+    assert REMOVABLE not in _prune(vm)      # a second prune finds nothing
+    names = sorted(vm.snapshots, reverse=True)
+    for name in [*names, names[0]]:
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            assert sm.validate_snapshot(vm.VM, name) == (True, []), name
+        assert _restore(sm, vm, name) is True, name
+    return removed
 
 
 @pytest.fixture
@@ -1278,3 +1321,388 @@ class TestWhatSnapshotsLeaveBehind:
             [*(p for s in vm.snapshots.values() for p in s["disks"].values()
                if p),
              *(s["memory"] for s in vm.snapshots.values())])
+
+
+class TestWhatPruneRemovesLeavesEverySnapshotWhole:
+    """Design §8: drive each source, remove what prune lists, then every
+    snapshot left validates and restores."""
+
+    def test_after_the_restores_of_a_leaf(self, sm, tmp_path):
+        """Sources 2 (#266) and 1 (#288)."""
+        vm = _RevertingLibvirt(tmp_path, data_disk=True,
+                               disk_dir=tmp_path / "fast")
+        vm.take("s1")
+        assert _restore(sm, vm, "s1") is True
+        assert _restore(sm, vm, "s1") is True
+        vm.take("s2")
+        assert _restore(sm, vm, "s1") is True
+        assert _restore(sm, vm, "s2") is True
+        left = _unaccounted(vm)
+        assert left
+
+        removed = _prune_and_restore_each(sm, vm)
+
+        assert removed == left
+        assert not any(os.path.exists(path) for path in removed)
+
+    def test_after_a_deleted_leaf_and_a_collapse(self, sm, tmp_path):
+        """Source 3b (#290), after #298's collapse."""
+        vm = _RevertingLibvirt(tmp_path, data_disk=True)
+        vm.take("t1")
+        vm.take("t2")
+        assert _restore(sm, vm, "t1") is True
+        vm.take("t3")
+        t2 = vm.snapshots["t2"]["disks"]["vda"]
+        assert _delete(sm, vm, "t2") is True
+        assert _collapse(sm, vm, "t1") is True
+
+        removed = _prune_and_restore_each(sm, vm)
+
+        assert t2 in removed
+
+
+def _entry(path: str, backing: str | None = None):
+    """An entry for :func:`prune` of the file *path*, as listed now."""
+    return Entry(path=path, vm=VM, kind=TAKE_OVERLAY, named="s",
+                 lstat=os.lstat(path), backing=backing)
+
+
+class TestTheRemoval:
+    """G7 (:func:`prune`)."""
+
+    def test_each_goes_and_what_it_took_is_reclaimed(self, box):
+        a, b = box.overlay(f"{VM}.s1"), box.memory(f"{VM}_snapshot_s0.raw")
+        entries = [_entry(a), _entry(b)]
+        result = prune(entries)
+        assert [e.path for e in result.removed] == [a, b]
+        assert result.reclaimed == sum(e.size for e in entries) > 0
+        assert not os.path.exists(a) and not os.path.exists(b)
+
+    def test_the_newest_layer_comes_first(self, box):
+        s1 = box.overlay(f"{VM}.s1")
+        s2 = box.overlay(f"{VM}.s2", backing=s1)
+        s3 = box.overlay(f"{VM}.s3", backing=s2)
+        loose = box.overlay(f"{VM}.s0")
+        entries = [_entry(s1), _entry(s2, s1), _entry(loose), _entry(s3, s2)]
+        assert [e.path for e in removal_order(entries)] == [loose, s3, s2, s1]
+
+    def test_built_on_is_told_by_resolved_path_and_by_identity(self, box,
+                                                               tmp_path):
+        s1 = box.overlay(f"{VM}.s1")
+        (tmp_path / "link").symlink_to(box.wd)
+        s2 = box.overlay(f"{VM}.s2")
+        named_otherwise = str(tmp_path / "link" / f"{VM}.s1")
+        entries = [_entry(s1), _entry(s2, named_otherwise)]
+        assert [e.path for e in removal_order(entries)] == [s2, s1]
+
+    def test_a_loop_of_backing_files_comes_last(self, box):
+        a, b = box.overlay(f"{VM}.a"), box.overlay(f"{VM}.b")
+        c = box.overlay(f"{VM}.c")
+        order = removal_order([_entry(a, b), _entry(b, a), _entry(c)])
+        assert [e.path for e in order] == [c, a, b]
+
+    def test_a_failed_removal_keeps_everything_below_it(self, box):
+        s1 = box.overlay(f"{VM}.s1")
+        s2 = box.overlay(f"{VM}.s2", backing=s1)
+        s3 = box.overlay(f"{VM}.s3", backing=s2)
+        tried = []
+
+        def remove(path, identity):
+            tried.append(path)
+            raise PermissionError(13, "Permission denied")
+
+        result = prune([_entry(s1), _entry(s2, s1), _entry(s3, s2)],
+                       remove=remove)
+        assert tried == [s3]
+        assert [(e.path, why) for e, why in result.failed] == [
+            (s3, "it could not be removed (Permission denied)")]
+        assert [(e.path, why) for e, why in result.kept] == [
+            (s2, f"{s3}, which stays, is built on it"),
+            (s1, f"{s2}, which stays, is built on it")]
+        assert all(os.path.exists(p) for p in (s1, s2, s3))
+
+    def test_a_file_replaced_since_it_was_listed_stays_with_what_is_below(
+            self, box):
+        s1 = box.overlay(f"{VM}.s1")
+        s2 = box.overlay(f"{VM}.s2", backing=s1)
+        entries = [_entry(s1), _entry(s2, s1)]
+        replacement = box.wd / "replacement"
+        replacement.write_bytes(b"another file")
+        os.replace(replacement, s2)
+
+        result = prune(entries)
+
+        assert [(e.path, why) for e, why in result.failed] == [
+            (s2, "it was replaced after it was listed, and stays")]
+        assert [e.path for e, _why in result.kept] == [s1]
+        assert Path(s2).read_bytes() == b"another file"
+        assert os.path.exists(s1)
+
+    def test_one_gone_meanwhile_holds_nothing_up(self, box):
+        s1 = box.overlay(f"{VM}.s1")
+        s2 = box.overlay(f"{VM}.s2", backing=s1)
+        entries = [_entry(s1), _entry(s2, s1)]
+        os.unlink(s2)
+        result = prune(entries)
+        assert [e.path for e in result.gone] == [s2]
+        assert [e.path for e in result.removed] == [s1]
+
+    def test_decide_says_what_each_entry_is_built_on(self, box):
+        s1 = box.overlay(f"{VM}.s1")
+        box.overlay(f"{VM}.s2", backing=s1)
+        box.memory(f"{VM}_snapshot_s0.raw")
+        found = box.decide()
+        assert found[f"{VM}.s2"].backing == s1
+        assert found[f"{VM}.s1"].backing == box.base
+        assert found[f"{VM}_snapshot_s0.raw"].backing is None
+
+
+class TestAPruneOfNamedPaths:
+    """:func:`keep_unnamed`: a removable file not named stays, and keeps
+    what it is built on."""
+
+    def test_one_an_unnamed_file_is_built_on_is_kept(self, box):
+        s1 = box.overlay(f"{VM}.s1")
+        s2 = box.overlay(f"{VM}.s2", backing=s1)
+        box.overlay(f"{VM}.s0")
+        found = box.decide()
+        keep_unnamed(list(found.values()), box.listing, box.scans,
+                     {s1, str(box.wd / f"{VM}.s0")})
+        assert (found[f"{VM}.s1"].status, found[f"{VM}.s1"].reason) == (
+            KEPT, f"{s2} (not named) is built on it")
+        assert found[f"{VM}.s2"].status == KEPT
+        assert found[f"{VM}.s0"].status == REMOVABLE
+
+
+class TestTheOverlaysRestoresLeftForLater:
+    """#305's records: what a restore left beside an ISO for later removal
+    is never prune's own to remove, whatever its name; prune has the
+    removal a take runs remove it."""
+
+    def test_a_file_one_records_is_kept_by_its_path(self, box):
+        overlay = box.overlay(f"{VM}.1793626528")
+        box.pending[overlay] = "a restore of vm01 left it for later removal"
+        found = box.decide()[f"{VM}.1793626528"]
+        assert (found.status, found.reason) == (
+            KEPT, "a restore of vm01 left it for later removal")
+
+    def test_and_by_its_identity(self, box):
+        overlay = box.overlay(f"{VM}.1793626528")
+        st = os.stat(overlay)
+        box.pending.identities[(st.st_dev, st.st_ino)] = "recorded"
+        assert box.decide()[f"{VM}.1793626528"].status == KEPT
+
+    def test_only_the_chains_prune_listed_go(self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        assert _restore(sm, vm, "s1") is True
+        listed = _waiting(vm)
+        assert _restore(sm, vm, "s1") is True
+        later = sorted(set(_waiting(vm)) - set(listed))
+        assert listed and later
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            outcome = sm.remove_pending_iso_overlays(
+                vm.VM, files_in_use=_files_in_use(vm), only=set(listed))
+        assert (outcome.removed, outcome.failed, outcome.decided) == (
+            listed, [], True)
+        assert not any(os.path.exists(p) for p in listed)
+        assert all(os.path.exists(p) for p in later)
+        assert _waiting(vm) == later
+
+    def test_what_a_domain_uses_is_kept_and_said_to_be(self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        assert _restore(sm, vm, "s1") is True
+        [overlay] = _waiting(vm)
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            outcome = sm.remove_pending_iso_overlays(
+                vm.VM, files_in_use=_files_in_use(vm, others=[overlay]))
+        assert outcome.removed == [] and overlay in outcome.kept
+        assert os.path.exists(overlay) and _waiting(vm) == [overlay]
+
+    def test_a_scan_that_fails_decides_nothing(self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        assert _restore(sm, vm, "s1") is True
+        [overlay] = _waiting(vm)
+        execute, shell = _restoring(sm, vm)
+        with execute, shell:
+            outcome = sm.remove_pending_iso_overlays(
+                vm.VM, files_in_use=lambda paths: None)
+        assert outcome.decided is False and list(outcome.kept) == [overlay]
+
+    def test_a_removal_that_fails_is_named(self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        assert _restore(sm, vm, "s1") is True
+        [overlay] = _waiting(vm)
+        execute, shell = _restoring(sm, vm)
+        with execute, shell, patch.object(sm, "_remove_file",
+                                          return_value=False):
+            outcome = sm.remove_pending_iso_overlays(
+                vm.VM, files_in_use=_files_in_use(vm))
+        assert outcome.failed == [overlay]
+        assert outcome.kept == {overlay: "it could not be removed"}
+
+    def test_the_session_hands_only_and_its_scan_on(self):
+        session = LibVirtSession.__new__(LibVirtSession)
+        session.provider_config = {}
+        in_use = FilesInUse({"/cache/nixos.1": "other01"})
+        with patch.object(SnapshotManager, "remove_pending_iso_overlays",
+                          autospec=True, return_value="outcome") as remove:
+            assert session.remove_pending_iso_overlays(
+                "vm01", scan=lambda: in_use, only={"/cache/nixos.1"}) == (
+                "outcome")
+        _sm, vm_name, asking = remove.call_args.args
+        assert remove.call_args.kwargs == {"gone": False,
+                                           "only": {"/cache/nixos.1"}}
+        assert asking(["/cache/nixos.1"]) == {"/cache/nixos.1": (
+            "domain other01 uses it")}
+
+
+def _warnings(logger) -> str:
+    return "\n".join(str(call.args[0])
+                     for call in logger.warning.call_args_list)
+
+
+class TestTheWarningsPointAtPrune:
+    """Design §5: what snapshots leave behind is named, with the command
+    that removes it; a ``.preserve`` that may be the only copy never gets
+    "remove it"."""
+
+    def test_a_leftover_backup_path_sends_to_a_dry_run_never_to_rm(
+            self, sm, tmp_path):
+        left = tmp_path / "vm01.s1.preserve"
+        left.write_bytes(b"QFI\xfbmaybe the only copy")
+        with pytest.raises(SnapshotError) as refused:
+            sm._claim_backup_paths(
+                [(str(tmp_path / "vm01.s1"), str(left))], {})
+        said = str(refused.value)
+        assert said.endswith(
+            "It is most likely left over from an interrupted restore: run "
+            "`boxman snapshot prune --dry-run`: it says whether this is a "
+            "redundant copy or the only one.")
+        assert "remove it" not in said
+
+    def test_the_overlays_a_revert_put_back_are_prunes(self, sm, tmp_path):
+        """Sources 1 and 2."""
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        with patch.object(sm, "logger") as logger:
+            assert _restore(sm, vm, "s1") is True
+        warned = _warnings(logger)
+        assert "no snapshot of it records them any more. `boxman snapshot " \
+               "prune` removes them once nothing uses them, an hour from " \
+               "now (or sooner with --min-age)." in warned
+        assert "by hand" not in warned
+
+    def test_backups_a_cleanup_left_say_who_removes_which(self, sm,
+                                                          tmp_path):
+        overlay = tmp_path / "vm01.s1"
+        overlay.write_bytes(b"QFI\xfb")
+        copy, link = tmp_path / "vm01.s2.preserve", tmp_path / "vm01.s1.preserve"
+        copy.write_bytes(b"QFI\xfb")
+        os.link(overlay, link)
+        with patch.object(sm.virsh, "execute_shell",
+                          return_value=_result(ok=False, stderr="busy")), \
+                patch.object(sm, "logger") as logger:
+            sm._reap_preserve_files([str(copy), str(link),
+                                     str(tmp_path / "gone.preserve")])
+        assert _warnings(logger) == (
+            f"could not remove the overlay backups (busy); `boxman snapshot "
+            f"prune` removes each of these that is a spare copy or an "
+            f"unfilled reservation: {copy}; these are second names of their "
+            f"overlays (hard links), which prune keeps: remove them by hand: "
+            f"{link}")
+
+    def test_a_memory_image_a_delete_kept_is_prunes(self, sm, tmp_path):
+        image = tmp_path / "vm01_snapshot_s1.raw"
+        image.write_bytes(b"memory")
+        with patch.object(sm, "logger") as logger:
+            sm._remove_memory_images("vm01", {"s1": str(image)},
+                                     recorded_in_use=lambda: None)
+        assert ("whether another snapshot records it could not be checked. "
+                "`boxman snapshot prune` removes it once no snapshot records "
+                "it.") in _warnings(logger)
+        assert image.exists()
+
+    def test_a_deleted_leafs_own_overlays_are_named(self, sm, tmp_path):
+        """Source 3b, new: libvirt's delete of a leaf that is not current
+        leaves the overlays it recorded."""
+        vm = _RevertingLibvirt(tmp_path, data_disk=True)
+        vm.take("t1")
+        vm.take("t2")
+        assert _restore(sm, vm, "t1") is True
+        vm.take("t3")
+        t2 = vm.snapshots["t2"]["disks"]
+        with patch.object(sm, "logger") as logger:
+            assert _delete(sm, vm, "t2") is True
+        assert (f"{vm.VM}: libvirt's delete of snapshot 't2' left "
+                f"{t2['vda']}, {t2['vdb']}, which it recorded: no snapshot "
+                f"of the VM records them now, and it runs on none of them. "
+                f"`boxman snapshot prune` removes them once nothing uses "
+                f"them.") in _warnings(logger)
+
+    def test_a_delete_that_leaves_nothing_of_its_own_says_nothing(
+            self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("s1")
+        vm.take("s2")
+        with patch.object(sm, "logger") as logger:
+            assert _delete(sm, vm, "s2") is True
+        assert "libvirt's delete of snapshot" not in _warnings(logger)
+
+    def test_a_collapse_that_cannot_read_the_heads_chain_says_so(
+            self, sm, tmp_path):
+        """Source 3a, where it still applies after #298: what the rebase
+        merges into the head cannot be told, so it is not removed."""
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("t1")
+        vm.take("t2")
+        assert _restore(sm, vm, "t1") is True
+        vm.take("t3")
+        assert _delete(sm, vm, "t2") is True
+        with patch.object(sm, "_merged_layers", return_value=None), \
+                patch.object(sm, "logger") as logger:
+            assert _collapse(sm, vm, "t1") is True
+        warned = _warnings(logger)
+        assert "could not be read down to" in warned
+        assert "`boxman snapshot prune` lists those nothing records or " \
+               "uses." in warned
+
+    def test_a_dropped_overlay_a_collapse_could_not_remove_is_named(
+            self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("t1")
+        vm.take("t2")
+        vm.take("t3")
+        dropped = vm.snapshots["t2"]["disks"]["vda"]
+        run = vm.qemu_img
+
+        def refusing_rm(command, *args, **kwargs):
+            if command == f"rm -f '{dropped}'":
+                return _result(ok=False, stderr="Operation not permitted")
+            return run(command, *args, **kwargs)
+
+        vm.qemu_img = refusing_rm
+        with patch.object(sm, "logger") as logger:
+            assert _collapse(sm, vm, "t1") is True
+        assert (f"could not remove {dropped} of dropped snapshot 't2' on "
+                f"{vm.VM}: Operation not permitted. `boxman snapshot prune` "
+                f"removes it once nothing uses it.") in _warnings(logger)
+
+    def test_what_a_collapse_could_not_check_is_prunes(self, sm, tmp_path):
+        vm = _RevertingLibvirt(tmp_path)
+        vm.take("t1")
+        vm.take("t2")
+        vm.take("t3")
+        with patch.object(sm, "_collapse_keeps", return_value=None), \
+                patch.object(sm, "logger") as logger:
+            assert _collapse(sm, vm, "t1") is True
+        warned = _warnings(logger)
+        assert "of dropped snapshot 't2'" in warned
+        assert "`boxman snapshot prune` removes it once nothing uses it." \
+               in warned
+        assert "by hand" not in warned
