@@ -711,7 +711,7 @@ def parse_args():
     parser_snap_prune = subparsers_snap.add_parser(
         'prune', parents=[common, vms_parent],
         formatter_class=RawTextHelpFormatter,
-        help='list the snapshot files nothing records or uses any more',
+        help='remove the snapshot files nothing records or uses any more',
         description=(
             "List the files snapshots of the vms left behind that no\n"
             "snapshot records and no domain uses any more: overlays a\n"
@@ -723,11 +723,25 @@ def parse_args():
             "before; never the image cache or a directory holding an ISO\n"
             "a domain uses.\n"
             "\n"
-            "This version lists only: run it with --dry-run. Removing what\n"
-            "it lists comes in a later version. It exits 2 when a scan\n"
-            "fails, after listing every file as unknown."),
+            "Then it removes the removable ones, after a prompt that lists\n"
+            "them (-y skips it), each only while it is still the file\n"
+            "listed, newest layer first. Without a PATH it also removes the\n"
+            "overlays of CD-ROM images the vms' restores left for later, as\n"
+            "`snapshot take` does. Given PATHs, only those, all or nothing.\n"
+            "--min-age 0 also counts what a snapshot command running right\n"
+            "now may still need: use it only while none runs.\n"
+            "\n"
+            "It exits 2 when a scan fails (after listing every file as\n"
+            "unknown), when a PATH is not removable, or when a removal\n"
+            "fails (after the others)."),
     )
     parser_snap_prune.set_defaults(handler='snapshot_prune')
+    parser_snap_prune.add_argument(
+        'paths',
+        nargs='*',
+        metavar='PATH',
+        help='remove only these files, all or nothing',
+    )
     parser_snap_prune.add_argument(
         '--cluster',
         type=str,
@@ -762,8 +776,13 @@ def parse_args():
         '--dry-run',
         action='store_true',
         dest='dry_run',
-        help='list what would be removed; change nothing (required in\n'
-             'this version)',
+        help='list what would be removed; change nothing',
+    )
+    parser_snap_prune.add_argument(
+        '-y', '--yes',
+        action='store_true',
+        dest='yes',
+        help='skip the confirmation prompt',
     )
 
     #

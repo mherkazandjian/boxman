@@ -1,6 +1,6 @@
 """``boxman snapshot prune``: the snapshot files of this project's VMs that
-no snapshot records and no domain uses any more (#294). This version lists
-them (``--dry-run``); removing them comes in a later one."""
+no snapshot records and no domain uses any more (#294), listed, and removed
+after a prompt."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from boxman.image_cache import ImageCache
 from boxman.providers.libvirt.disk import disk_path_for
 from boxman.providers.libvirt.disk_cleanup import (
     MOUNTINFO,
+    FilesInUse,
     memory_image_name,
     mount_points,
 )
@@ -40,6 +41,8 @@ from boxman.providers.libvirt.snapshot_prune import (
     VmFacts,
     decide,
     find_candidates,
+    keep_unnamed,
+    prune,
     scan_failures,
 )
 
@@ -63,11 +66,26 @@ class SnapshotPruneMixin:
 
     def snapshot_prune(self, cli_args) -> None:
         """
-        ``boxman snapshot prune --dry-run``: list the files a snapshot of
-        the selected VMs left in the project's snapshot directories, each
+        ``boxman snapshot prune``: list the files a snapshot of the
+        selected VMs left in the project's snapshot directories, each
         ``removable``, ``kept`` with the reason, or ``unknown``
         (:func:`snapshot_prune.decide`), and what removing the removable
-        ones would reclaim. Nothing is changed.
+        ones would reclaim; then remove those, after a prompt that lists
+        them unless ``-y`` (:func:`snapshot_prune.prune`: each only while
+        it is still the file listed, newest layer first). ``--dry-run``
+        lists them and changes nothing.
+
+        Given *PATH*\\ s, only those, all or nothing: one that is not
+        removable -- a removable one not named counts as staying, so what
+        it is built on is not removable -- stops everything.
+
+        Without a path, and unless ``--kind`` leaves overlays out, the
+        overlays of the selected VMs' CD-ROM images that their restores
+        left for later removal (``pending_overlays``) go too: through the
+        removal a ``snapshot take`` or a teardown runs, behind its own
+        checks, on one fresh scan of every domain
+        (``LibVirtSession.remove_pending_iso_overlays``). Prune itself
+        never removes a file beside an image, nor one such a record names.
 
         The directories, de-duplicated by identity, are each selected
         cluster's workdir, its ``disk_snapshot_dir`` and
@@ -78,17 +96,15 @@ class SnapshotPruneMixin:
         CD-ROM or other media source, or a mount point one is under.
 
         Raises:
-            ConfigError: run without ``--dry-run`` (removal comes in a later
-                version), or an unknown ``--cluster``.
+            ConfigError: an unknown ``--cluster``.
             SnapshotError: a directory could not be listed, or a scan failed:
                 every file is ``unknown``, the table is printed all the same,
-                and nothing could be pruned.
+                and nothing is pruned; a path named is not removable, and
+                nothing is pruned; or a removal failed, after all the others.
         """
-        if not getattr(cli_args, 'dry_run', False):
-            raise ConfigError(
-                "snapshot prune only lists what it would remove in this "
-                "version: run it with --dry-run. Removing those files comes "
-                "in a later version.")
+        dry_run = bool(getattr(cli_args, 'dry_run', False))
+        named = [os.path.abspath(os.path.expanduser(path))
+                 for path in getattr(cli_args, 'paths', None) or []]
         kinds = getattr(cli_args, 'kinds', None)
         min_age = getattr(cli_args, 'min_age', 3600)
         self._update_sessions_with_runtime()
@@ -104,6 +120,10 @@ class SnapshotPruneMixin:
             for note in notes:
                 print(f"note: {note}")
             print("no VM matched the --cluster/--vms selection")
+            if named:
+                raise SnapshotError(
+                    "nothing was pruned: " + "; ".join(
+                        f"{path}: no VM is selected" for path in named))
             return
         clusters = list(dict.fromkeys(cluster for _f, cluster, _v, _w
                                       in targets))
@@ -123,6 +143,7 @@ class SnapshotPruneMixin:
         selected = {full for full, *_ in targets}
         listing.entries = [entry for entry in listing.entries
                            if entry.vm in selected]
+        ledger = PendingOverlays(scope=ledger_scope(session.provider_config))
         scans = Scans(
             held=held, references=references,
             headers=session.image_headers(listing.files),
@@ -130,7 +151,7 @@ class SnapshotPruneMixin:
                     for entry in listing.entries
                     if entry.kind == MEMORY_IMAGE and entry.lstat is not None},
             domains=domains or [], mounts=mount_points(MOUNTINFO),
-            failures=failures)
+            failures=failures, pending=self._pending_files(ledger))
         now = time.time()
         entries = decide(listing, vms, known, scans, now, min_age, kinds)
         # the advisory lock probe, of the overlays it would list as
@@ -140,15 +161,213 @@ class SnapshotPruneMixin:
              if entry.kind in OVERLAYS and entry.status == REMOVABLE])
         if scans.locked:
             entries = decide(listing, vms, known, scans, now, min_age, kinds)
-        self._print_prune(session, scans, dirs, entries, notes, listing,
-                          references, bool(getattr(cli_args, 'show_all',
-                                                   False)),
-                          waiting=self._pending_iso_overlay_notes(
-                              selected, held, references, domains,
-                              ledger_scope(session.provider_config)))
+        refused, chosen_named = [], {}
+        if named:
+            chosen_named = self._named_entries(named, entries)
+            keep_unnamed(entries, listing, scans,
+                         {entry.path for entry in chosen_named.values()
+                          if entry is not None})
+            refused = [f"{path}: {self._why_not_removable(entry)}"
+                       for path, entry in chosen_named.items()
+                       if entry is None or entry.status != REMOVABLE]
+        drain = (not named and (kinds is None or any(
+            kind in kinds for kind in OVERLAYS)))
+        waiting = (self._waiting_iso_overlays(ledger, selected, vms)
+                   if drain else {})
+        self._print_prune(
+            session, scans, dirs, entries, notes, listing, references,
+            bool(getattr(cli_args, 'show_all', False)),
+            waiting=self._pending_iso_overlay_notes(
+                selected, held, references, domains,
+                ledger_scope(session.provider_config)),
+            only=({entry.path for entry in chosen_named.values()
+                   if entry is not None} if named else None))
+        if dry_run:
+            print("dry run: nothing was changed")
         failed = scan_failures(listing, scans)
         if failed:
             raise SnapshotError("nothing was pruned: " + "; ".join(failed))
+        if refused:
+            raise SnapshotError("nothing was pruned: " + "; ".join(refused))
+        if dry_run:
+            return
+        chosen = [entry for entry in entries if entry.status == REMOVABLE]
+        if not chosen and not waiting:
+            print("nothing to prune")
+            return
+        if not self._prune_confirmed(cli_args, chosen, waiting):
+            return
+        self._prune_now(session, chosen, waiting)
+
+    @staticmethod
+    def _pending_files(ledger: PendingOverlays) -> FilesInUse:
+        """Every overlay of a CD-ROM image a restore on this connection left
+        for later removal, by path and by identity as recorded, mapped to
+        what says so: prune never removes one itself."""
+        pending = FilesInUse()
+        for chain in ledger.chains():
+            why = (f"a restore of {chain.vm} left it for later removal, as "
+                   f"an overlay of {chain.iso}: its next take, its destroy, "
+                   f"or a prune with no path removes it")
+            for layer, identity in zip(chain.layers, chain.identities,
+                                       strict=True):
+                pending.setdefault(layer, why)
+                pending.setdefault(os.path.realpath(layer), why)
+                if identity is not None:
+                    pending.identities.setdefault(tuple(identity), why)
+        return pending
+
+    @staticmethod
+    def _waiting_iso_overlays(ledger: PendingOverlays, selected: set[str],
+                              vms: dict[str, VmFacts]) -> dict[str, list[str]]:
+        """``{vm: [overlay, ...]}``: the overlays of its CD-ROM images that
+        restores left for later removal, there now, of each of *selected*
+        that has a domain (one that has none is destroy's)."""
+        waiting: dict[str, list[str]] = {}
+        for chain in ledger.chains():
+            if chain.vm in selected and vms[chain.vm].uuid is not None:
+                waiting.setdefault(chain.vm, []).extend(
+                    layer for layer in chain.layers
+                    if os.path.lexists(layer))
+        return {vm: list(dict.fromkeys(layers))
+                for vm, layers in waiting.items() if layers}
+
+    @staticmethod
+    def _named_entries(named: list[str],
+                       entries: list[Entry]) -> dict[str, Entry | None]:
+        """``{path named: the entry it names, or None}``, a path matched as
+        given and with its directory resolved."""
+        def key(path: str) -> str:
+            return os.path.join(os.path.realpath(os.path.dirname(path)),
+                                os.path.basename(path))
+        by_key = {key(entry.path): entry for entry in entries}
+        by_path = {entry.path: entry for entry in entries}
+        return {path: by_path.get(path) or by_key.get(key(path))
+                for path in dict.fromkeys(named)}
+
+    @staticmethod
+    def _why_not_removable(entry: Entry | None) -> str:
+        """Why a path named may not be pruned: see :meth:`snapshot_prune`."""
+        if entry is None:
+            return ("it is no snapshot file of the selected VMs in a "
+                    "directory prune scans (see `boxman snapshot prune "
+                    "--dry-run --all`)")
+        if entry.status == SKIPPED:
+            return f"--kind leaves its kind, {entry.kind}, out"
+        return f"{entry.status}: {entry.reason}"
+
+    def _prune_confirmed(self, cli_args, chosen: list[Entry],
+                         waiting: dict[str, list[str]]) -> bool:
+        """List what is about to be removed, and ask, unless ``-y``."""
+        fmt = self._format_bytes
+        if chosen:
+            print(f"These files will be removed (reclaiming "
+                  f"{fmt(sum(entry.size for entry in chosen))}):\n")
+            for entry in sorted(chosen, key=lambda e: e.path):
+                print(f"  {entry.path}")
+            print()
+        if waiting:
+            print(f"{'And these' if chosen else 'These'} overlays of CD-ROM "
+                  f"images, which restores left for later removal, each once "
+                  f"a scan of every domain finds nothing uses it, as `boxman "
+                  f"snapshot take` removes them:\n")
+            for vm in sorted(waiting):
+                for layer in waiting[vm]:
+                    print(f"  {layer}")
+            print()
+        if getattr(cli_args, 'yes', False):
+            return True
+        try:
+            answer = input("Proceed? [y/N] ").strip().lower()
+        except EOFError:
+            print("No input available, aborted.")
+            return False
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return False
+        return True
+
+    def _prune_now(self, session, chosen: list[Entry],
+                   waiting: dict[str, list[str]]) -> None:
+        """Remove *chosen* (:func:`snapshot_prune.prune`), then what
+        *waiting* lists through the removal a take runs, and say what went.
+
+        Raises:
+            SnapshotError: a removal failed, or what the domains use could
+                not be told for the overlays waiting: after all the others.
+        """
+        fmt = self._format_bytes
+        result = prune(chosen)
+        for entry in result.removed:
+            print(f"removed {entry.path} ({fmt(entry.size)})")
+        for entry in result.gone:
+            print(f"{entry.path} was gone already")
+        problems = []
+        for entry, why in result.failed + result.kept:
+            print(f"could not remove {entry.path}: {why}")
+            problems.append(f"{entry.path}: {why}")
+        if result.removed:
+            session.refresh_pools_holding(
+                [entry.path for entry in result.removed])
+        reclaimed, count = result.reclaimed, len(result.removed)
+        if waiting:
+            drained, gone, more = self._drain_iso_overlays(session, waiting)
+            reclaimed, count = reclaimed + drained, count + gone
+            problems += more
+        print(f"reclaimed {fmt(reclaimed)} ({count} "
+              f"file{'' if count == 1 else 's'})")
+        if problems:
+            raise SnapshotError(
+                f"could not prune {len(problems)} file(s): "
+                + "; ".join(problems))
+
+    def _drain_iso_overlays(self, session, waiting: dict[str, list[str]]
+                            ) -> tuple[int, int, list[str]]:
+        """
+        Remove the overlays *waiting* lists -- ``{vm: [overlay, ...]}``,
+        of each VM's CD-ROM images, left for later removal by its restores
+        -- as its next take would (``remove_pending_iso_overlays``), on one
+        scan of every domain taken now, shared by the VMs. ``(what it
+        reclaimed, how many went, problems)``: an overlay it could not
+        remove, or VMs for which nothing could be told. One a domain uses,
+        or a snapshot names, stays on record, and is said to.
+        """
+        fmt = self._format_bytes
+        sizes = {}
+        for layers in waiting.values():
+            for layer in layers:
+                try:
+                    sizes[layer] = os.lstat(layer).st_blocks * 512
+                except OSError:
+                    sizes[layer] = 0
+        taken: list = []
+
+        def scan():
+            if not taken:
+                taken.append(session.disk_paths_in_use())
+            return taken[0]
+
+        reclaimed, gone, problems = 0, 0, []
+        for vm in sorted(waiting):
+            try:
+                outcome = session.remove_pending_iso_overlays(
+                    vm, scan=scan, only=set(waiting[vm]))
+            except Exception as exc:
+                problems.append(f"the overlays of the CD-ROM images of {vm} "
+                                f"({type(exc).__name__}: {exc})")
+                continue
+            for layer in outcome.removed:
+                print(f"removed {layer} ({fmt(sizes.get(layer, 0))})")
+                reclaimed += sizes.get(layer, 0)
+                gone += 1
+            if not outcome.decided:
+                problems.append(
+                    f"the overlays of the CD-ROM images of {vm}: whether a "
+                    f"snapshot names them, or a domain uses them, could not "
+                    f"be told")
+            problems += [f"{layer}: it could not be removed"
+                         for layer in outcome.failed]
+        return reclaimed, gone, problems
 
     def _prune_vm_facts(self, domains: list[tuple[str, str]] | None,
                         held: Held | None) -> dict[str, VmFacts]:
@@ -284,10 +503,12 @@ class SnapshotPruneMixin:
     def _print_prune(self, session, scans: Scans, dirs: list[ScopeDir],
                      entries: list[Entry], notes: list[str],
                      listing: Listing, references: References | None,
-                     show_all: bool, waiting: list[str] = ()) -> None:
+                     show_all: bool, waiting: list[str] = (),
+                     only: set[str] | None = None) -> None:
         """The listing (design §6): what was scanned, a row per file, the
         totals, and the notes -- *waiting* among them, the overlays of CD-ROM
-        images left for later removal."""
+        images left for later removal. With *only*, the paths named, just
+        their rows, recorded or not."""
         fmt = self._format_bytes
         uri = session.provider_config.get('uri', 'qemu:///system')
         print(f"scanned {len(scans.domains)} domains ({uri}), {len(dirs)} "
@@ -297,6 +518,9 @@ class SnapshotPruneMixin:
             print(f"note: {note}")
         listed = [entry for entry in entries if entry.status != SKIPPED]
         shown = [entry for entry in listed if show_all or not entry.recorded]
+        if only is not None:
+            listed = shown = [entry for entry in entries
+                              if entry.path in only]
         print()
         if shown:
             rows = [("STATUS", "SIZE", "KIND", "PATH", "REASON")] + [
@@ -343,7 +567,6 @@ class SnapshotPruneMixin:
                   f"a process holds")
         for line in waiting:
             print(f"note: {line}")
-        print("dry run: nothing was changed")
 
     @staticmethod
     def _pending_iso_overlay_notes(selected: set[str], held: Held | None,
@@ -407,9 +630,9 @@ class SnapshotPruneMixin:
                         why.append(f"{named} names it")
                 lines.append(
                     f"{layer} waits for removal: an overlay libvirt made of "
-                    f"{chain.iso} for a CD-ROM of {chain.vm}; its next "
-                    f"`boxman snapshot take`, or its destroy, removes it once "
-                    f"nothing uses it"
+                    f"{chain.iso} for a CD-ROM of {chain.vm}; a prune with "
+                    f"no path, its next `boxman snapshot take`, or its "
+                    f"destroy, removes it once nothing uses it"
                     + (f" ({'; '.join(why)})" if why else ""))
         lines += [f"{path}, a record of CD-ROM overlays left for later "
                   f"removal, cannot be read ({why}): check the overlays it "
