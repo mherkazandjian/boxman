@@ -396,6 +396,60 @@ print("active", len(multiprocessing.active_children()))
         assert not after.exists()
         assert "Traceback" not in err, err
 
+    def test_a_stop_during_a_revert_releases_and_stamps_the_lock_and_ends_its_waiter(
+            self, tmp_path):
+        """#305 holds the revert lock of #303 across ``snapshot-revert``, in
+        a try/finally: a stop of the revert's command, the worker stopped by
+        its parent, must still release and stamp it, and a worker waiting
+        for the same lock must not be left waiting."""
+        import fcntl
+        import time
+
+        from tests.test_utils_shell import _TRAPS_SIGINT, _program, _running
+
+        up, waiting = tmp_path / "up", tmp_path / "waiting"
+        started = time.time()
+        out = _run_scenario(f"""
+import os
+os.environ["HOME"] = {str(tmp_path)!r}
+from boxman.providers.libvirt.revert_locks import RevertLock
+from boxman.utils import shell
+
+def hold():
+    with RevertLock(["/isos/nixos"]) as lock:
+        lock.reverting()
+        # the snapshot-revert
+        shell.run({_program(_TRAPS_SIGINT, up)!r}, hide=True)
+
+def wait_for_it():
+    with RevertLock(["/isos/nixos"],
+                    on_wait=lambda key: open({str(waiting)!r}, "w").close()):
+        open({str(tmp_path / 'got-it')!r}, "w").close()
+""" + self._interrupted_once_up(waiting) + f"""
+import multiprocessing, time
+from tests.test_parallel_failures import _manager
+def holder():
+    hold()
+def waiter():
+    while not os.path.exists({str(up)!r}):
+        time.sleep(0.05)
+    wait_for_it()
+try:
+    _manager()._run_parallel([("vm01", holder, ()), ("vm02", waiter, ())])
+except KeyboardInterrupt:
+    print("interrupted")
+print("active", len(multiprocessing.active_children()))
+print("lock", RevertLock.path_for("/isos/nixos"))
+""")
+        assert "interrupted" in out and "active 0" in out, out
+        assert (tmp_path / "up.sigint").exists()
+        assert not _running(up)
+        assert not (tmp_path / "got-it").exists()
+        lock_file = out.split("lock ", 1)[1].split()[0]
+        with open(lock_file, "rb+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert int(held.read().decode()) >= int(started) + 1
+
     def test_with_a_terminal_a_worker_its_parent_stops_has_its_command_sent_its_sigint(
             self, tmp_path):
         """``stop_workers()`` stops a worker, after another's failure, say:

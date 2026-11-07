@@ -1192,6 +1192,43 @@ with shell.interrupt_on_signals():
         assert (tmp_path / "up.sigints").read_text().splitlines() == ["SIGINT"]
 
 
+class TestWhatAStopInterrupts:
+
+    def test_a_ledger_record_is_never_left_half_written(self, tmp_path):
+        """#305's ledger of overlays to remove writes each record to a
+        staging file, syncs it and renames it into place: a stop, which
+        raises the KeyboardInterrupt wherever the code is, never leaves a
+        record half written. A SIGTERM, at a moment of its own each time,
+        while records are written one after another."""
+        import random
+        import signal
+
+        from boxman.providers.libvirt.pending_overlays import PendingOverlays
+
+        ledger, layers = tmp_path / "ledger", tmp_path / "layers"
+        layers.mkdir()
+        for each in range(50):
+            (layers / f"nixos.{each}").write_text("overlay")
+        writing = tmp_path / "writing"
+        for round_ in range(8):
+            out, err, code = _interrupt(tmp_path, f"""
+import itertools
+from boxman.providers.libvirt.pending_overlays import PendingOverlays
+from boxman.utils import shell
+ledger = PendingOverlays(directory={str(ledger)!r}, scope="local qemu:///system")
+open({str(writing)!r}, "w").close()
+with shell.interrupt_on_signals():
+    for each in itertools.cycle(range(50)):
+        ledger.record("vm{round_}", [([{str(layers)!r} + f"/nixos.{{each}}"], "/isos/nixos.iso")])
+""", [], [_once(writing, lambda child: None), random.uniform(0.05, 0.4), writing],
+                how=["sigterm"])
+            assert code == -signal.SIGINT, err
+            writing.unlink()
+        records = PendingOverlays(directory=str(ledger), scope="local qemu:///system")
+        assert records.chains()
+        assert records.unreadable == {}
+
+
 class TestNoHandlerSwallowsACtrlC:
     """
     A KeyboardInterrupt is not an Exception, so ``except Exception`` lets
