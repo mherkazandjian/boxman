@@ -92,8 +92,9 @@ def _down(mgr, suspend=False):
     mgr.down(types.SimpleNamespace(suspend=suspend, vms='all', cluster=None))
 
 
-def _info(mgr):
-    return [c.args[0] for c in mgr.logger.info.call_args_list]
+def _messages(mgr):
+    return [c.args[0] for c in (mgr.logger.info.call_args_list
+                               + mgr.logger.status.call_args_list)]
 
 
 class TestDownLeavesAVmAlreadyDownAsItIs:
@@ -106,8 +107,8 @@ class TestDownLeavesAVmAlreadyDownAsItIs:
 
         assert session.saved == []
         assert f"VM '{VM1}' is already shut off; leaving it as it is" \
-            in _info(mgr)
-        assert 'infrastructure is down' in _info(mgr)
+            in _messages(mgr)
+        assert 'infrastructure is down' in _messages(mgr)
 
     def test_a_vm_saved_by_an_earlier_down_is_left_as_it_is(self):
         """
@@ -120,7 +121,7 @@ class TestDownLeavesAVmAlreadyDownAsItIs:
 
         assert session.saved == []
         assert f"VM '{VM1}' is already saved; leaving it as it is" \
-            in _info(mgr)
+            in _messages(mgr)
 
     def test_a_paused_vm_is_saved_and_said_to_come_back_running(self):
         """
@@ -133,7 +134,7 @@ class TestDownLeavesAVmAlreadyDownAsItIs:
 
         assert session.saved == [VM1]
         assert (f"VM '{VM1}' is paused; saving it, and the next 'up' "
-                f"brings it back running") in _info(mgr)
+                f"brings it back running") in _messages(mgr)
 
     def test_a_running_vm_is_saved(self):
         mgr, session = _manager({VM1: 'running'})
@@ -215,7 +216,7 @@ class TestDownSuspendLeavesAVmAlreadyDownAsItIs:
 
         assert session.suspended == []
         assert f"VM '{VM1}' is already suspended; leaving it as it is" \
-            in _info(mgr)
+            in _messages(mgr)
 
     @pytest.mark.parametrize('state, what', [('shut off', 'shut off'),
                                              ('managedsave', 'saved')])
@@ -226,7 +227,7 @@ class TestDownSuspendLeavesAVmAlreadyDownAsItIs:
 
         assert session.suspended == []
         assert f"VM '{VM1}' is already {what}; leaving it as it is" \
-            in _info(mgr)
+            in _messages(mgr)
 
     def test_a_running_vm_is_suspended(self):
         mgr, session = _manager({VM1: 'running'})

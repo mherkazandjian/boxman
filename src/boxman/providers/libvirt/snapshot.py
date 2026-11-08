@@ -4697,7 +4697,7 @@ class SnapshotManager:
         drop_set, kept = plan
 
         if not drop_set:
-            self.logger.info(
+            self.logger.status(
                 f"no snapshot is built on '{target_name}' on vm {vm_name}; "
                 f"nothing to collapse")
             return True
@@ -4712,7 +4712,7 @@ class SnapshotManager:
         keeps = self._collapse_keeps(vm_name, kept, disks)
 
         if dry_run:
-            self.logger.info(
+            self.logger.status(
                 f"[dry-run] {vm_name}: would drop {len(drop_set)} snapshot(s) "
                 f"({drop_set}), the line from '{target_name}' to the one the "
                 f"VM runs on; would keep {kept}")
@@ -4723,7 +4723,7 @@ class SnapshotManager:
                 new_base, same, why = self._collapse_base(
                     vm_name, target_name, disk_target, source)
                 if same:
-                    self.logger.info(
+                    self.logger.status(
                         f"[dry-run]   {source} is the overlay of "
                         f"'{target_name}' itself; nothing to rebase")
                 elif new_base is None:
@@ -4737,14 +4737,14 @@ class SnapshotManager:
                         f"be told where qemu-img runs; the collapse would "
                         f"stop here")
                 else:
-                    self.logger.info(
+                    self.logger.status(
                         f"[dry-run]   would rebase {source} onto {new_base}")
                     stranded = self._stranded_overlay(
                         vm_name, target_name, disk_target, new_base)
                     if stranded:
                         moved[disk_target] = (source, stranded)
                         retiring.append(stranded)
-                        self.logger.info(
+                        self.logger.status(
                             f"[dry-run]   '{target_name}' would record "
                             f"{source} as its overlay of {disk_target}, in "
                             f"place of {stranded}")
@@ -4763,10 +4763,10 @@ class SnapshotManager:
                     told.add(overlay)
                     reason = self._collapse_keep_reason(overlay, keeps)
                     if reason:
-                        self.logger.info(
+                        self.logger.status(
                             f"[dry-run]   would keep {overlay}: {reason}")
                     else:
-                        self.logger.info(f"[dry-run]   would remove {overlay}")
+                        self.logger.status(f"[dry-run]   would remove {overlay}")
             retiring = [p for p in dict.fromkeys(retiring)
                         if p not in told and os.path.isfile(p)]
             # what is left once the target records the heads (_settle_target)
@@ -4777,7 +4777,7 @@ class SnapshotManager:
             ) if retiring else None
             for path in retiring:
                 reason = self._collapse_keep_reason(path, settled)
-                self.logger.info(
+                self.logger.status(
                     f"[dry-run]   would keep {path}: {reason}" if reason
                     else f"[dry-run]   would remove {path}, merged into the "
                          f"head")

@@ -587,7 +587,7 @@ class TestListAndLogMarkIt:
                    return_value=snapshots):
             session.snapshot_list(VM)
 
-        lines = [str(c.args[0]) for c in session.logger.info.call_args_list]
+        lines = [str(c.args[0]) for c in session.logger.status.call_args_list]
         assert "  Snapshot: s1 - Description: off (disk only)" in lines
         assert "  Snapshot: s2 - Description: on" in lines
 

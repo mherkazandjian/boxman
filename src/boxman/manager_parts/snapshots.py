@@ -401,16 +401,16 @@ class SnapshotsMixin:
         # docker-compose clusters (docker commit-backed, D3)
         for cname, cluster in self._select_dc_clusters(cli_args):
             snaps = self.session_for_cluster(cname).snapshot_list_cluster(cname, cluster)
-            self.logger.info(f"cluster: {cname} (docker-compose)")
+            self.logger.status(f"cluster: {cname} (docker-compose)")
             if not snaps:
-                self.logger.info("  (no snapshots)")
+                self.logger.status("  (no snapshots)")
             for name in sorted(snaps, key=lambda k: snaps[k].get('created', '')):
                 snap = snaps[name]
-                self.logger.info(
+                self.logger.status(
                     f"  {name}  created={snap.get('created', '?')}  "
                     f"{snap.get('description', '')}".rstrip())
                 for box, tag in (snap.get('boxes') or {}).items():
-                    self.logger.info(f"      {box}: {tag}")
+                    self.logger.status(f"      {box}: {tag}")
 
     def snapshot_log(self, cli_args):
         """
@@ -1135,8 +1135,8 @@ class SnapshotsMixin:
                 f"collapse refused for {full_vm_name}: see the error above; "
                 f"its snapshots were left untouched")
         if not drops:
-            log.info(f"collapse: nothing is built on '{target}' on "
-                     f"{full_vm_name}; nothing to collapse")
+            log.status(f"collapse: nothing is built on '{target}' on "
+                       f"{full_vm_name}; nothing to collapse")
             return
 
         was_running = storage.is_running(full_vm_name)
@@ -1315,8 +1315,8 @@ class SnapshotsMixin:
         # render
         header = (f"{'VM':<48}{'DISK':<28}{'VIRTUAL':>10}{'ALLOC':>10}"
                   f"{'CHAIN':>6}{'SNAPS':>7}{'SNAPMEM':>10}{'RECLAIM~':>10}")
-        self.logger.info(header)
-        self.logger.info("-" * len(header))
+        self.logger.status(header)
+        self.logger.status("-" * len(header))
         for row in rows:
             line = (
                 f"{row['vm']:<48}"
@@ -1328,9 +1328,9 @@ class SnapshotsMixin:
                 f"{self._format_bytes(row['snap_mem']):>10}"
                 f"{self._format_bytes(row['reclaim_est']):>10}"
             )
-            self.logger.info(line)
+            self.logger.status(line)
         if not rows:
-            self.logger.info("(no qcow2 disks found on host)")
+            self.logger.status("(no qcow2 disks found on host)")
 
     def storage_trim(self, cli_args):
         """

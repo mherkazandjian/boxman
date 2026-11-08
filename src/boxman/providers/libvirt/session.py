@@ -2614,14 +2614,16 @@ class LibVirtSession(SessionConfigMixin):
         Returns:
             dict: Dictionary of snapshots per VM
         """
-        self.logger.info(f"list the snapshots for the vm: {vm_name}")
+        self.logger.status(f"list the snapshots for the vm: {vm_name}")
         snapshot_mgr = SnapshotManager(self.provider_config)
         snapshots = snapshot_mgr.list_snapshots(vm_name)
+        if not snapshots:
+            self.logger.status("  (no snapshots)")
         for snapshot in snapshots:
             # restoring a snapshot that saved no memory leaves the vm shut
             # off, which is worth knowing before restoring it
             kind = " (disk only)" if snapshot.get('disk_only') else ""
-            self.logger.info(
+            self.logger.status(
                 f"  Snapshot: {snapshot['name']} - Description: "
                 f"{snapshot['description']}{kind}")
 

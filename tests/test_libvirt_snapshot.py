@@ -3682,7 +3682,8 @@ class TestCollapseKeepsTheLiveDisk:
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs()), \
-             patch.object(sm.logger, "info") as info:
+             patch.object(sm.logger, "info") as info, \
+             patch.object(sm.logger, "status", info):
             assert sm.collapse_to("vm01", "s1", dry_run=True) is True
             assert sm.collapse_to("vm01", "s1",
                                   recorded_in_use=_nothing_else_records) is True
@@ -3712,7 +3713,8 @@ class TestCollapseKeepsTheLiveDisk:
 
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell", side_effect=shell), \
-             patch.object(sm.logger, "info") as info:
+             patch.object(sm.logger, "info") as info, \
+             patch.object(sm.logger, "status", info):
             assert sm.collapse_to("vm01", "s1", dry_run=True) is False
 
         assert not any("would remove" in str(c.args[0])
@@ -3753,7 +3755,8 @@ class TestCollapseKeepsTheLiveDisk:
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs()), \
              patch.object(sm, "_qemu_img_rebase", return_value=True), \
-             patch.object(sm.logger, "info") as info:
+             patch.object(sm.logger, "info") as info, \
+             patch.object(sm.logger, "status", info):
             assert sm.collapse_to("vm01", "s1",
                                   recorded_in_use=_nothing_else_records) is True
 
@@ -3770,7 +3773,8 @@ class TestCollapseKeepsTheLiveDisk:
                          {"vda": str(overlays["s1"])}, memory)
 
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
-             patch.object(sm.logger, "info") as info:
+             patch.object(sm.logger, "info") as info, \
+             patch.object(sm.logger, "status", info):
             assert sm.collapse_to("vm01", "s1", dry_run=True) is True
 
         lines = [str(c.args[0]) for c in info.call_args_list]
@@ -3919,7 +3923,8 @@ class TestCollapseKeepsTheLiveDisk:
         with patch.object(sm.virsh, "execute", side_effect=virsh), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=_shell_that_runs(calls)), \
-             patch.object(sm.logger, "info") as info:
+             patch.object(sm.logger, "info") as info, \
+             patch.object(sm.logger, "status", info):
             assert sm.collapse_to("vm01", "s1", dry_run=True) is True
 
         # nothing but the read-only identity and presence checks
@@ -5665,7 +5670,8 @@ class TestACollapseInASnapshotTree:
         execute, shell = _restoring(sm, vm)
         with execute, shell, \
              patch.object(sm.logger, "error") as error, \
-             patch.object(sm.logger, "info") as info:
+             patch.object(sm.logger, "info") as info, \
+             patch.object(sm.logger, "status", info):
             done = sm.collapse_to(vm.VM, target, dry_run=dry_run,
                                   recorded_in_use=vm.recorded)
         return (done, " ".join(str(c.args[0]) for c in error.call_args_list),
@@ -5967,7 +5973,8 @@ class TestADeleteAfterACollapse:
         execute, shell = _restoring(sm, vm)
         with execute, shell, \
              patch.object(sm.logger, "warning") as warning, \
-             patch.object(sm.logger, "info") as info:
+             patch.object(sm.logger, "info") as info, \
+             patch.object(sm.logger, "status", info):
             done = sm.collapse_to(vm.VM, target, dry_run=dry_run,
                                   recorded_in_use=vm.recorded)
         if running:
