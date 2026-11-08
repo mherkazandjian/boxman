@@ -61,6 +61,16 @@ def _dying_update_worker(*_args):
     os._exit(1)
 
 
+def _command_worker(up, after):
+    """Run, in one command, a program that takes a second over a SIGINT and
+    a next step after it (see tests/test_utils_shell.py)."""
+    from tests.test_utils_shell import _TRAPS_SIGINT, _program
+
+    from boxman.utils import shell
+    shell.run(f"{_program(_TRAPS_SIGINT, up)} && touch {after}", hide=True)
+    return "ran"
+
+
 class TestRunParallel:
 
     def test_success_collects_results(self):
@@ -192,15 +202,18 @@ class TestOnResult:
 
 
 
-def _run_scenario(code: str, timeout: float = 30):
+def _run_scenario(code: str, timeout: float = 30, stderr: bool = False):
     """Run *code* in a child python leading its own process group, so a
     real SIGINT can reach every process in it -- as a terminal's Ctrl-C
-    does -- without interrupting pytest. A hang is a failure, not a stall."""
+    does -- without interrupting pytest. A hang is a failure, not a stall.
+    Return what it printed, and with *stderr*, its stderr too."""
     import signal
     import subprocess
     import sys
+
+    from tests.test_utils_shell import _SIGINT_AS_PYTHON_SETS_IT
     proc = subprocess.Popen(
-        [sys.executable, "-c", code], stdout=subprocess.PIPE,
+        [sys.executable, "-c", _SIGINT_AS_PYTHON_SETS_IT + code], stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, start_new_session=True,
         env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})
     try:
@@ -209,7 +222,7 @@ def _run_scenario(code: str, timeout: float = 30):
         os.killpg(proc.pid, signal.SIGKILL)
         out, err = proc.communicate()
         pytest.fail(f"the interrupted batch hung\n{out}\n{err[-3000:]}")
-    return out
+    return (out, err) if stderr else out
 
 
 class TestARealCtrlC:
@@ -300,6 +313,170 @@ print("sigint handler restored", signal.getsignal(signal.SIGINT) is signal.defau
         assert "raised RuntimeError callback probe" in out
         assert "active 0" in out
         assert "sigint handler restored True" in out
+
+    @staticmethod
+    def _interrupted_once_up(up, whole_group=False):
+        """Scenario code that starts a thread to SIGINT the scenario's
+        Python alone, or its whole process group, once *up* exists."""
+        return f"""
+import os, signal, threading, time
+
+def interrupt():
+    deadline = time.monotonic() + 20
+    while not os.path.exists({str(up)!r}) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if {whole_group!r}:
+        os.killpg(os.getpgrp(), signal.SIGINT)
+    else:
+        os.kill(os.getpid(), signal.SIGINT)
+
+threading.Thread(target=interrupt, daemon=True).start()
+"""
+
+    @pytest.mark.parametrize("whole_group", [False, True],
+                             ids=["to-the-parent-alone", "to-the-whole-group"])
+    def test_a_ctrl_c_stops_the_command_a_worker_runs(self, whole_group, tmp_path):
+        """A SIGINT to the parent alone reached no worker: the parent's
+        SIGTERM ended the worker there and then, and the command it ran went
+        on alone, past boxman's exit (#294). The SIGTERM is a Ctrl-C to the
+        worker now, which stops its command first. A Ctrl-C at the terminal
+        reaches the worker too, which is stopping its command when the
+        parent's SIGTERM comes: taken for a second Ctrl-C, that would cut
+        the command's handler short."""
+        from tests.test_utils_shell import _running
+
+        up, after = tmp_path / "up", tmp_path / "after"
+        out = _run_scenario(self._interrupted_once_up(up, whole_group) + f"""
+import multiprocessing
+from tests.test_parallel_failures import _command_worker, _manager
+try:
+    _manager()._run_parallel([("vm01", _command_worker, ({str(up)!r}, {str(after)!r}))])
+except KeyboardInterrupt:
+    print("interrupted")
+print("active", len(multiprocessing.active_children()))
+""")
+        assert "interrupted" in out
+        assert "active 0" in out
+        assert (tmp_path / "up.sigints").read_text().splitlines() == ["SIGINT"]
+        assert (tmp_path / "up.sigint").exists()
+        assert not _running(up)
+        assert not after.exists()
+
+    def test_a_ctrl_c_stops_the_commands_the_disk_workers_run(self, tmp_path):
+        """``configure_vm_disks`` joins workers of its own: interrupted
+        there, it left them configuring disks on their own once boxman had
+        gone, and the interpreter's exit waited for them (#294). Stopped,
+        they exit 130, without a traceback each (#294 review)."""
+        from tests.test_utils_shell import _running
+
+        up, after = tmp_path / "up", tmp_path / "after"
+        out, err = _run_scenario(self._interrupted_once_up(up) + f"""
+import multiprocessing
+from unittest.mock import patch
+from boxman.providers.libvirt.session import LibVirtSession
+from tests.test_parallel_failures import _command_worker
+
+def configure(self, disk_config, workdir, disk_prefix):
+    return _command_worker({str(up)!r}, {str(after)!r}) == "ran"
+
+session = LibVirtSession(config={{"provider": {{"libvirt": {{"use_sudo": False}}}}}})
+with patch("boxman.providers.libvirt.session.DiskManager.configure_from_disk_config",
+           configure):
+    try:
+        session.configure_vm_disks(vm_name="vm01", disks=[{{"name": "disk01"}}],
+                                   workdir={str(tmp_path)!r}, disk_prefix="vm01")
+    except KeyboardInterrupt:
+        print("interrupted")
+print("active", len(multiprocessing.active_children()))
+""", stderr=True)
+        assert "interrupted" in out
+        assert "active 0" in out
+        assert (tmp_path / "up.sigint").exists()
+        assert not _running(up)
+        assert not after.exists()
+        assert "Traceback" not in err, err
+
+    def test_a_stop_during_a_revert_releases_and_stamps_the_lock_and_ends_its_waiter(
+            self, tmp_path):
+        """#305 holds the revert lock of #303 across ``snapshot-revert``, in
+        a try/finally: a stop of the revert's command, the worker stopped by
+        its parent, must still release and stamp it, and a worker waiting
+        for the same lock must not be left waiting."""
+        import fcntl
+        import time
+
+        from tests.test_utils_shell import _TRAPS_SIGINT, _program, _running
+
+        up, waiting = tmp_path / "up", tmp_path / "waiting"
+        started = time.time()
+        out = _run_scenario(f"""
+import os
+os.environ["HOME"] = {str(tmp_path)!r}
+from boxman.providers.libvirt.revert_locks import RevertLock
+from boxman.utils import shell
+
+def hold():
+    with RevertLock(["/isos/nixos"]) as lock:
+        lock.reverting()
+        # the snapshot-revert
+        shell.run({_program(_TRAPS_SIGINT, up)!r}, hide=True)
+
+def wait_for_it():
+    with RevertLock(["/isos/nixos"],
+                    on_wait=lambda key: open({str(waiting)!r}, "w").close()):
+        open({str(tmp_path / 'got-it')!r}, "w").close()
+""" + self._interrupted_once_up(waiting) + f"""
+import multiprocessing, time
+from tests.test_parallel_failures import _manager
+def holder():
+    hold()
+def waiter():
+    while not os.path.exists({str(up)!r}):
+        time.sleep(0.05)
+    wait_for_it()
+try:
+    _manager()._run_parallel([("vm01", holder, ()), ("vm02", waiter, ())])
+except KeyboardInterrupt:
+    print("interrupted")
+print("active", len(multiprocessing.active_children()))
+print("lock", RevertLock.path_for("/isos/nixos"))
+""")
+        assert "interrupted" in out and "active 0" in out, out
+        assert (tmp_path / "up.sigint").exists()
+        assert not _running(up)
+        assert not (tmp_path / "got-it").exists()
+        lock_file = out.split("lock ", 1)[1].split()[0]
+        with open(lock_file, "rb+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert int(held.read().decode()) >= int(started) + 1
+
+    def test_with_a_terminal_a_worker_its_parent_stops_has_its_command_sent_its_sigint(
+            self, tmp_path):
+        """``stop_workers()`` stops a worker, after another's failure, say:
+        the worker's runner took that for a Ctrl-C at the terminal, which the
+        command has had itself, and sent it nothing for STOP_TIMEOUT (#294
+        review)."""
+        from tests.test_utils_shell import _TRAPS_SIGINT, _interrupt, _program
+
+        up = tmp_path / "up"
+        out, err, code = _interrupt(tmp_path, f"""
+import multiprocessing, os, time
+from boxman.manager import _parallel_worker
+from boxman.utils.shell import run, stop_workers
+worker = multiprocessing.Process(target=_parallel_worker, args=(
+    multiprocessing.Queue(), "vm01", run, ({_program(_TRAPS_SIGINT, up)!r},)))
+worker.start()
+deadline = time.monotonic() + 20
+while not os.path.exists({str(up)!r}) and time.monotonic() < deadline:
+    time.sleep(0.05)
+started = time.monotonic()
+stop_workers([worker])
+print("stopped", round(time.monotonic() - started, 1), "exit", worker.exitcode, flush=True)
+""", [], [], terminal=True)
+        stopped = out.split()
+        assert stopped[:1] == ["stopped"] and float(stopped[1]) < 5, (out, err)
+        assert stopped[2:] == ["exit", "130"], (out, err)
+        assert (tmp_path / "up.sigint").exists()
 
 
 class TestRestoreRetryLoop:

@@ -85,6 +85,7 @@ from typing import Any
 from boxman import log
 from boxman.exceptions import ConfigError
 from boxman.utils.env_loader import load_workspace_env
+from boxman.utils.shell import default_stop_signals
 
 #: Names (VMs, clusters, hosts) that will be interpolated into a shell
 #: command must match this pattern. Alphanumerics, underscore, hyphen,
@@ -265,12 +266,13 @@ class TaskRunner:
         log.info(f"workdir: {workdir or os.getcwd()}")
         log.info(f"command: {command}")
 
-        result = subprocess.run(
-            command,
-            shell=True,
-            env=self.env,
-            cwd=workdir,
-        )
+        with default_stop_signals():
+            result = subprocess.run(
+                command,
+                shell=True,
+                env=self.env,
+                cwd=workdir,
+            )
 
         return result.returncode
 
@@ -321,12 +323,13 @@ class TaskRunner:
         log.info(f"workdir: {workdir or os.getcwd()}")
         log.info(f"command: {ansible_cmd}")
 
-        result = subprocess.run(
-            command,
-            shell=True,
-            env=self.env,
-            cwd=workdir,
-        )
+        with default_stop_signals():
+            result = subprocess.run(
+                command,
+                shell=True,
+                env=self.env,
+                cwd=workdir,
+            )
 
         return result.returncode
 
@@ -374,10 +377,11 @@ class TaskRunner:
         log.info(f"workdir: {workdir or os.getcwd()}")
         log.info(f"command: {shlex.join(command)}")
 
-        result = subprocess.run(
-            command,
-            env=self.env,
-            cwd=workdir,
-        )
+        with default_stop_signals():
+            result = subprocess.run(
+                command,
+                env=self.env,
+                cwd=workdir,
+            )
 
         return result.returncode
