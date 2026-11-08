@@ -2736,7 +2736,9 @@ class SnapshotManager:
         Say what a restore stopped during its revert leaves (#294): every
         backup of an overlay, kept, as the revert may have deleted the
         overlay -- libvirtd finishes a revert virsh has left -- and the
-        backup is the only copy then; and the guest, perhaps paused.
+        backup is the only copy then; and the guest, perhaps paused. Never
+        "remove" one whose overlay is there: another file may have taken
+        the overlay's name, and ``snapshot prune --dry-run`` tells.
         """
         if preserved:
             missing = [(o, b) for o, b in preserved if not self._is_regular_file(o)]
@@ -2750,8 +2752,9 @@ class SnapshotManager:
                 + ("" if not missing else " ("
                    + "; ".join(f"mv -fT {shlex.quote(b)} {shlex.quote(o)}"
                                for o, b in missing) + ")")
-                + "; one whose overlay is there is a spare copy and can be "
-                  "removed. Backups: "
+                + "; for one whose overlay is there, run `boxman snapshot "
+                  "prune --dry-run --min-age 0` (it changes nothing): it says "
+                  "whether it is a redundant copy or the only one. Backups: "
                 + ", ".join(f"{b} (of {o})" for o, b in preserved))
         self._report_pause_after_failed_revert(vm_name, paused)
 
@@ -3227,8 +3230,8 @@ class SnapshotManager:
                 f"it: if {src} is missing, it is the only copy of it, and "
                 f"goes back there (mv -fT {shlex.quote(dst)} "
                 f"{shlex.quote(src)}); if {src} is there, run `boxman "
-                f"snapshot prune --dry-run`: it says whether this is a "
-                f"redundant copy or the only one.")
+                f"snapshot prune --dry-run --min-age 0` (it changes nothing): "
+                f"it says whether this is a redundant copy or the only one.")
 
     def _reserve_backup_paths(self, pairs: list[tuple]) -> dict[str, tuple]:
         """

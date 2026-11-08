@@ -8151,6 +8151,12 @@ class TestRevertsOfVmsSharingAnImage:
         assert "stopped during its revert" in said
         assert all(b in said for b in backups)
         assert all(f"mv -fT {b} {b[:-len('.preserve')]}" in said for b in missing)
+        # one whose overlay is there may still be the only copy: another
+        # file can have taken the overlay's name, and prune tells
+        assert ("for one whose overlay is there, run `boxman snapshot prune "
+                "--dry-run --min-age 0` (it changes nothing): it says whether "
+                "it is a redundant copy or the only one") in said
+        assert "remove" not in said
 
     def test_an_interrupted_revert_still_releases_and_stamps_its_turn(
             self, sm, tmp_path):

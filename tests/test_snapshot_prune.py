@@ -1625,8 +1625,9 @@ class TestTheWarningsPointAtPrune:
             f"It is most likely left over from an interrupted restore — "
             f"check it: if {overlay} is missing, it is the only copy of it, "
             f"and goes back there (mv -fT {left} {overlay}); if {overlay} is "
-            f"there, run `boxman snapshot prune --dry-run`: it says whether "
-            f"this is a redundant copy or the only one.")
+            f"there, run `boxman snapshot prune --dry-run --min-age 0` (it "
+            f"changes nothing): it says whether this is a redundant copy or "
+            f"the only one.")
         assert "remove" not in said
 
     def test_the_overlays_a_revert_put_back_are_prunes(self, sm, tmp_path):
