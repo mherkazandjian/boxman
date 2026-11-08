@@ -505,3 +505,88 @@ def test_network_tracking_is_off_without_hooks(mgr):
     m.up(_args())
     assert getattr(m, "_networks_created", None) is None
     assert not m.record.exists()
+
+
+# ---- a Ctrl-C during a hook -----------------------------------------------------------
+#: a boxman up with the hook *stopped* in the phase argv[2], followed by
+#: *later* in the same phase; the up body and libvirt are stubs that note
+#: what they did in the file "events", and the up runs under the handlers
+#: boxman's main() sets up, as the real boxman up does
+_HOOKED_UP_IN_A_CHILD = """
+import logging, shlex, sys
+from pathlib import Path
+from types import SimpleNamespace
+from boxman.manager import BoxmanManager
+from boxman.utils import shell
+from tests.test_up_hooks import _config
+tmp, phase, hook = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+def note(what):
+    with open(tmp / "events", "a") as events:
+        events.write(what + "\\n")
+later = {"command": 'echo "$BOXMAN_HOOK later" >> ' + shlex.quote(str(tmp / "hooks.log"))}
+other = "post_up" if phase == "pre_up" else "pre_up"
+m = BoxmanManager.__new__(BoxmanManager)
+m.config = _config(tmp, {phase: ["stopped", "later"], other: ["later"]},
+                   {"stopped": {"command": hook}, "later": later})
+m.config_path = str(tmp / "conf.yml")
+m.logger = logging.getLogger("test-up-hooks")
+m.cache = SimpleNamespace(cache_dir=str(tmp / "cache"))
+m.report_clone_degradations = lambda: None
+def inventory():
+    note("inventory")
+    return {"domains": {}, "networks": {}}
+m.project_inventory = inventory
+def body(cli_args):
+    note("up")
+    (tmp / "workspace").mkdir(exist_ok=True)
+m._up = body
+print("lock", m.up_lock_path(), flush=True)
+with shell.interrupt_on_signals():
+    m.up(SimpleNamespace(force=False))
+note("returned")
+"""
+
+
+@pytest.mark.parametrize("phase", ["pre_up", "post_up"])
+def test_a_ctrl_c_during_a_hook_stops_the_hook_and_boxman_up(tmp_path, phase):
+    """A Ctrl-C at the terminal while a hook runs (#302): the hook has the
+    terminal's SIGINT and is stopped, boxman up ends by SIGINT there, the
+    hooks after it and, during pre_up, up itself never run, and the
+    project's up lock is free again, held by no hook left behind."""
+    import fcntl
+    import signal
+
+    from tests.test_utils_shell import (
+        _TRAPS_SIGINT,
+        _gone_within,
+        _interrupt,
+        _program,
+        _running,
+    )
+
+    up = tmp_path / "up"
+    try:
+        out, err, code = _interrupt(
+            tmp_path, _HOOKED_UP_IN_A_CHILD, [tmp_path, phase, _program(_TRAPS_SIGINT, up)],
+            [up], how="terminal")
+        assert code == -signal.SIGINT, err
+        assert (tmp_path / "up.stopping").exists()
+        assert _gone_within(up, 5)
+    finally:
+        # a hook a failing run left behind would sleep on for a minute
+        if _running(up):
+            os.kill(int(up.read_text()), signal.SIGKILL)
+    log = tmp_path / "hooks.log"
+    events = tmp_path / "events"
+    if phase == "pre_up":
+        assert not log.exists()
+        assert not events.exists()
+        assert not (tmp_path / "workspace" / UP_RECORD_NAME).exists()
+    else:
+        assert log.read_text().splitlines() == ["pre_up later"]
+        assert events.read_text().splitlines() == ["inventory", "up", "inventory"]
+        record = json.loads((tmp_path / "workspace" / UP_RECORD_NAME).read_text())
+        assert record["status"] == "succeeded"
+    lock = out.split("lock ", 1)[1].split()[0]
+    with open(lock, "rb+") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -56,6 +56,11 @@ not run, and `boxman up` exits non-zero (2, like any boxman error).
   the next `boxman up` takes the "already running" path and runs the
   `post_up` hooks again, so `post_up` hooks should be safe to rerun.
 
+A Ctrl-C while a hook runs reaches the hook as well, as it does a
+`boxman run` task: the hook is stopped, the hooks after it do not run, and
+`boxman up` ends as any interrupted boxman command does (by SIGINT, exit
+status 130), with its up lock released.
+
 ## What a failed or partial `up` does
 
 - `boxman up` itself fails (a VM that never started, a partial state
