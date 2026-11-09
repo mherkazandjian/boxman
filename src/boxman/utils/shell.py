@@ -525,10 +525,14 @@ class _StoppingLocal(invoke.runners.Local):
 
     def _follow(self, number: int) -> None:
         """Send *number* to each process of the command that has not had
-        it (#309): one forked or exec'd since -- the next of ``a; b``, once
-        ``a`` has handled its SIGINT, or a child a shell forked as the signal
-        reached it, which the shell, waiting for it, then left to finish --
-        or one a shell left behind as it died, in the command's group."""
+        it, one forked or exec'd since (#309): a child a shell forked as the
+        signal reached it, which the shell, waiting for it, then left to
+        finish; ``b`` of ``a; b``, once ``a`` has handled its SIGINT; or one a
+        shell left behind as it died, in the command's group. For a runner on
+        another thread, stopped as a stop began (:meth:`wait`): its command
+        may have started after the Ctrl-C, and a scan's reads, which these
+        are, only read. A command's own cleanup, which a handler of the
+        signal may start, is left to finish elsewhere."""
         sent = self.sent.setdefault(number, {})
         new = {pid: running for pid, running in _running_now(self._members()).items()
                if sent.get(pid) != running}
@@ -551,11 +555,14 @@ class _StoppingLocal(invoke.runners.Local):
                 os.kill(pid, number)
 
     def _wait(self, timeout: float, number: int) -> None:
-        """Wait for the command to end, or *timeout*, sending *number* to
-        each of its processes that has not had it as it appears."""
+        """Wait for the command to end, or *timeout*; on another thread,
+        sending *number* to each of its processes that has not had it as it
+        appears (:meth:`_follow`)."""
+        follow = getattr(self, "from_another_thread", False)
         deadline = time.monotonic() + timeout
         while not self._ended() and time.monotonic() < deadline:
-            self._follow(number)
+            if follow:
+                self._follow(number)
             time.sleep(self.POLL)
 
     def _reap(self) -> None:
@@ -575,20 +582,16 @@ class _StoppingLocal(invoke.runners.Local):
         and SIGKILL if it still has not TERM_TIMEOUT after that. One in
         boxman's group had the SIGINT from the terminal already, and is not
         sent another, unless one of STOP_SIGNALS asked for the stop, a
-        worker's parent did, or the runner is on another thread. While it
-        waits, each signal goes to every process of the command that has not
-        had it as it appears (:meth:`_follow`). Another Ctrl-C, at any step,
-        moves on to the next at once. Either way, the command has ended, and
-        been reaped, when this returns.
+        worker's parent did, or the runner is on another thread; there, each
+        signal also goes to every process of the command that has not had it
+        as it appears (:meth:`_follow`). Another Ctrl-C, at any step, moves
+        on to the next at once. Either way, the command has ended, and been
+        reaped, when this returns.
         """
         if not self._started():
             return
         forward = (self.group is not None or _stop_by_a_signal
                    or getattr(self, "from_another_thread", False))
-        if not forward:
-            # what is there now had the terminal's SIGINT; what appears
-            # after it has not, and is sent one (#309)
-            self.sent[signal.SIGINT] = _running_now(self._members())
         steps = [(signal.SIGINT, forward, self.STOP_TIMEOUT),
                  (signal.SIGTERM, True, self.TERM_TIMEOUT)]
         step = 0

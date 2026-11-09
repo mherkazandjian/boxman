@@ -647,28 +647,20 @@ class TestRunStopsEveryCommand:
         assert not _running(up)
         assert not after.exists()
 
-    @pytest.mark.parametrize("how", ["alone", "terminal"],
-                             ids=["sigint-to-boxman-alone", "ctrl-c-at-the-terminal"])
-    def test_a_process_the_command_starts_during_its_stop_is_stopped_too(
-            self, how, tmp_path):
-        """``a; b``, where ``a`` handles its SIGINT and exits 3: the shell,
-        which had the SIGINT too, goes on to ``b``, which is forked after the
-        stop began and never had it. It ran until the SIGTERM, STOP_TIMEOUT
-        later; so did a read's command whose shell forked it as a forwarded
-        SIGINT reached the shell (#309). Each process of the command that
-        appears during a stop is sent the signal now."""
-        import time
+    def test_a_cleanup_the_commands_own_handler_starts_is_left_to_finish(self, tmp_path):
+        """A command whose handler of the SIGINT starts a cleanup of its own
+        (a shell's ``trap ... INT``): that process, forked after the stop
+        began, is not sent the SIGINT too, which would cut the cleanup short
+        (#309 review)."""
+        import os
 
-        up, then = tmp_path / "up", tmp_path / "then"
-        started = time.monotonic()
-        out, err, code = _interrupt(
-            tmp_path, _RUN_IN_A_CHILD,
-            [f"{_program(_TRAPS_SIGINT, up)}; {_program(_TRAPS_SIGINT, then)}"],
-            [up], how=how, env=self._env(STOP_TIMEOUT="10", TERM_TIMEOUT="1"))
+        up, cleaned = tmp_path / "up", tmp_path / "cleaned"
+        command = (f"trap 'sh -c \"sleep 1; touch {cleaned}\"' INT; "
+                   f"{_program(_TRAPS_SIGINT, up)}")
+        out, err, code = _interrupt(tmp_path, _RUN_IN_A_CHILD, [command], [up],
+                                    env=dict(os.environ, RUN="run"))
         assert (out.split(), code) == (["STOPPED"], 0), err
-        assert (tmp_path / "up.sigint").exists()
-        assert not _running(then)
-        assert time.monotonic() - started < 9
+        assert cleaned.exists()
 
     def test_an_interrupted_boxman_exits_by_sigint_and_takes_no_next_step(self, tmp_path):
         """The run returned the stopped command's result, and boxman went on
@@ -1022,6 +1014,21 @@ with shell.interrupt_on_signals():
 """
 
 
+#: a scan of two reads, read 0 running the command given, read 1 none
+_A_READ_RUNS_A_COMMAND = """
+import sys
+from boxman.providers.libvirt.scan_pool import InOrder
+from boxman.utils import shell
+def read(item):
+    if item == 0:
+        shell.run(sys.argv[1], hide=True, warn=True)
+    return item
+with shell.interrupt_on_signals():
+    with InOrder(read, range(2), 2) as outcomes:
+        print([outcome.result() for outcome in outcomes], flush=True)
+"""
+
+
 @pytest.mark.usefixtures("no_leftovers")
 class TestCommandsOnOtherThreads:
     """
@@ -1086,6 +1093,31 @@ class TestCommandsOnOtherThreads:
             for path in marks.glob("pid-*"):
                 if _running(path):
                     os.kill(int(path.read_text()), signal.SIGKILL)
+
+    @pytest.mark.parametrize("how", ["alone", "terminal"],
+                             ids=["sigint-to-boxman-alone", "ctrl-c-at-the-terminal"])
+    def test_a_process_a_reads_command_starts_during_its_stop_is_stopped_too(
+            self, how, tmp_path):
+        """A read's command that started as the stop began had its SIGINT
+        forwarded by the read's runner to the processes there then: one the
+        shell forked after that -- the command itself, when the SIGINT
+        reached the shell first, or ``b`` of ``a; b``, once ``a`` has handled
+        its SIGINT -- never had it, and ran until the SIGTERM, STOP_TIMEOUT
+        later (#309, a failure under load of the test above). Each that
+        appears during the stop is sent the signal now."""
+        import signal
+        import time
+
+        up, then = tmp_path / "up", tmp_path / "then"
+        started = time.monotonic()
+        out, err, code = _interrupt(
+            tmp_path, _A_READ_RUNS_A_COMMAND,
+            [f"{_program(_TRAPS_SIGINT, up)}; {_program(_TRAPS_SIGINT, then)}"],
+            [up], how=how)
+        assert code == -signal.SIGINT, (out, err)
+        assert (tmp_path / "up.sigint").exists()
+        assert not _running(then)
+        assert time.monotonic() - started < 9
 
     def test_a_read_whose_command_died_of_sigint_starts_no_next_command(self, tmp_path):
         """The terminal's Ctrl-C ended a read's command before the main
