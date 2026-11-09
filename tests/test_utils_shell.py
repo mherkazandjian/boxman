@@ -1490,18 +1490,56 @@ class TestWhatAStopReadsAndWaitsFor:
             named.kill()
             named.wait()
 
-    @pytest.mark.parametrize("handler", ["pythons", "interrupt_on_signals"])
-    def test_a_ctrl_c_in_the_cancel_on_the_way_out_still_cancels_and_waits(
-            self, tmp_path, handler):
+    def test_a_ctrl_c_as_the_items_are_handed_out_still_cancels_and_waits(self, tmp_path):
+        """A Ctrl-C as InOrder made its outcomes, once every item was
+        queued, left ``__enter__`` before the block was entered, so that no
+        way out ran: nothing was cancelled or waited for, and the reads ran
+        on after the scan (#311 review). It is taken where the outcomes are
+        made now, and the way out runs from there."""
+        out, err, code = _interrupt(tmp_path, """
+import signal, threading, time
+from boxman.providers.libvirt import scan_pool
+from boxman.utils import shell
+started, ended, lock = [], [], threading.Lock()
+def read(item):
+    with lock:
+        started.append(item)
+    time.sleep(0.05)
+    with lock:
+        ended.append(item)
+    return item
+made, entered = [], []
+real = scan_pool._Outcome.__init__
+def outcome(self, *args):
+    if not made:
+        # a Ctrl-C, its handler run here, as the first outcome is made
+        signal.raise_signal(signal.SIGINT)
+    made.append(True)
+    real(self, *args)
+scan_pool._Outcome.__init__ = outcome
+try:
+    with shell.interrupt_on_signals():
+        with scan_pool.InOrder(read, range(200), 4) as outcomes:
+            entered.append(True)
+except KeyboardInterrupt:
+    now = (len(started), len(ended))
+    time.sleep(0.3)
+    print("STOPPED", len(entered), *now, len(started), flush=True)
+""", [], [])
+        stopped = out.split()
+        assert stopped[:2] == ["STOPPED", "0"], (out, err)
+        # the reads under way were waited for, and none began after
+        assert stopped[2] == stopped[3] == stopped[4] and int(stopped[2]) < 200, (out, err)
+
+    def test_a_ctrl_c_in_the_cancel_on_the_way_out_still_cancels_the_items_left(self, tmp_path):
         """InOrder's way out cancelled the items not yet started outside the
         guard that waits for the rest: a further Ctrl-C there left items in
-        the queue, and returned without waiting, so the pool read on past the
-        scan (#311 review). A KeyboardInterrupt is not raised inside the
-        pool's workings now; the cancel goes on, the reads under way are
-        waited for, and the scan ends with the first."""
+        the queue, and the pool read on past the scan (#311 review). A
+        Ctrl-C is not raised inside the pool's workings now: the cancel goes
+        on, and that second Ctrl-C ends the scan once it is done."""
         out, err, code = _interrupt(tmp_path, """
-import contextlib, signal, sys, threading, time
-from concurrent.futures import ThreadPoolExecutor
+import signal, threading, time
+from boxman.providers.libvirt import scan_pool
 from boxman.providers.libvirt.scan_pool import InOrder
 from boxman.utils import shell
 started, lock = [], threading.Lock()
@@ -1510,42 +1548,35 @@ def read(item):
         started.append(item)
     time.sleep(0.05)
     return item
-real, cut = ThreadPoolExecutor.shutdown, []
-def shutdown(pool, wait=True, *, cancel_futures=False):
-    if not wait and not cut:
+real, cut = scan_pool._Reads.cancel, []
+def cancel(pool):
+    if not cut:
         # a further Ctrl-C, its handler run here, inside the cancel
         cut.append(True)
         signal.raise_signal(signal.SIGINT)
-    return real(pool, wait=wait, cancel_futures=cancel_futures)
-ThreadPoolExecutor.shutdown = shutdown
-handling = (shell.interrupt_on_signals() if sys.argv[1] == "interrupt_on_signals"
-            else contextlib.nullcontext())
+    return real(pool)
+scan_pool._Reads.cancel = cancel
 try:
-    with handling:
+    with shell.interrupt_on_signals():
         with InOrder(read, range(200), 4) as outcomes:
             outcomes[0].result()
             raise KeyboardInterrupt
 except KeyboardInterrupt:
     ended = len(started)
     time.sleep(0.3)
-    print("STOPPED", len(cut), ended, len(started), signal.getsignal(signal.SIGINT).__name__,
-          flush=True)
-""", [handler], [])
+    print("STOPPED", len(cut), ended, len(started), flush=True)
+""", [], [])
         stopped = out.split()
         assert stopped[:2] == ["STOPPED", "1"], (out, err)
         # no read began after the scan, and few before its end
         assert stopped[2] == stopped[3] and int(stopped[2]) < 200, (out, err)
-        # Python's own handler is back
-        assert stopped[4] == "default_int_handler", (out, err)
 
-    def test_ctrl_cs_on_the_way_out_still_wait_for_the_reads_under_way(self, tmp_path):
-        """A further Ctrl-C on the way out cut the wait for the reads under
-        way short, and the scan ended while they read on (#311 review). A
-        hundred Ctrl-Cs here, at the main thread, while the scan waits on its
-        way out: it waits for those reads still, ends with them, and starts
-        no more."""
+    def test_the_first_ctrl_c_waits_on_the_way_out_for_the_reads_under_way(self, tmp_path):
+        """A Ctrl-C reaches the main thread as it waits for an outcome: the
+        way out cancels the items not yet started, and waits for the reads
+        under way, which end with the scan."""
         out, err, code = _interrupt(tmp_path, """
-import random, signal, threading, time
+import signal, threading, time
 from boxman.providers.libvirt.scan_pool import InOrder
 from boxman.utils import shell
 main = threading.get_ident()
@@ -1557,12 +1588,10 @@ def read(item):
     with lock:
         ended.append(item)
     return item
-def ctrl_cs():
-    time.sleep(0.1)
-    for _ in range(100):
-        signal.pthread_kill(main, signal.SIGINT)
-        time.sleep(random.uniform(0.0002, 0.003))
-threading.Thread(target=ctrl_cs, daemon=True).start()
+def ctrl_c():
+    time.sleep(0.2)
+    signal.pthread_kill(main, signal.SIGINT)
+threading.Thread(target=ctrl_c, daemon=True).start()
 began = time.monotonic()
 try:
     with shell.interrupt_on_signals():
@@ -1573,10 +1602,46 @@ except KeyboardInterrupt:
 """, [], [])
         stopped = out.split()
         assert stopped[:1] == ["STOPPED"], (out, err)
-        # the reads under way ended before the scan did, and no more began
         assert 1.0 <= float(stopped[1]) < 3, (out, err)
         assert stopped[2] == stopped[3] and int(stopped[2]) <= 16, (out, err)
 
+    @pytest.mark.parametrize("second", ["SIGINT", "SIGTERM"])
+    def test_a_second_ctrl_c_on_the_way_out_ends_the_scan_at_once(self, tmp_path, second):
+        """Every Ctrl-C on the way out was held until the reads under way
+        had ended, a SIGTERM too: a read stuck in Python kept boxman from
+        ending until it was killed (#311 review). The first waits for the
+        reads; a second, or a SIGTERM, ends the wait, and the scan, at
+        once, the reads still running left to the stop, as before #311."""
+        out, err, code = _interrupt(tmp_path, f"""
+import os, signal, threading, time
+from boxman.providers.libvirt.scan_pool import InOrder
+from boxman.utils import shell
+began = time.monotonic()
+sent = []
+def read(item):
+    if item == 0:
+        threading.Event().wait()
+    return item
+def signals():
+    for at, number in ((0.3, signal.SIGINT), (1.0, signal.{second})):
+        time.sleep(at - (time.monotonic() - began))
+        sent.append(time.monotonic())
+        os.kill(os.getpid(), number)
+threading.Thread(target=signals, daemon=True).start()
+try:
+    with shell.interrupt_on_signals():
+        with InOrder(read, range(4), 4) as outcomes:
+            [outcome.result() for outcome in outcomes]
+except KeyboardInterrupt:
+    now = time.monotonic()
+    print("STOPPED", len(sent), round(now - sent[-1], 2), flush=True)
+# the stuck read's thread is not waited for
+os._exit(0)
+""", [], [])
+        stopped = out.split()
+        # not on the first: after the second, at once
+        assert stopped[:2] == ["STOPPED", "2"], (out, err)
+        assert float(stopped[2]) < 1.0, (out, err)
 
     def test_a_ctrl_c_in_the_wait_for_a_read_leaves_no_lock_of_its_held(self, tmp_path):
         """A KeyboardInterrupt raised in ``concurrent.futures.wait``, or in
@@ -1590,45 +1655,47 @@ except KeyboardInterrupt:
 import random, signal, threading, time
 from concurrent.futures import Future
 from boxman.providers.libvirt import scan_pool
+from boxman.utils import shell
 # no sleep in the wait: every Ctrl-C lands in what it does to look
 scan_pool.POLL_S = 0
 main = threading.get_ident()
-future, done = Future(), threading.Event()
+future, done, held = Future(), threading.Event(), shell.CtrlCsHeldBack()
 def ctrl_cs():
     # once the main thread is in the loop below
     time.sleep(0.2)
     while not done.is_set():
         signal.pthread_kill(main, signal.SIGINT)
         time.sleep(random.uniform(0.0002, 0.003))
-taken = held = 0
+taken = held_locks = 0
 other = []
 end = time.monotonic() + 2.2
 def looks():
     global taken
     while time.monotonic() < end:
         try:
-            scan_pool._Outcome(future).result()
+            scan_pool._Outcome(future, held).result()
         except KeyboardInterrupt:
             taken += 1
         except Exception as error:
             other.append(type(error).__name__)
         held_now()
 def held_now():
-    global held
+    global held_locks
     if future._condition._is_owned():
-        held += 1
+        held_locks += 1
         while future._condition._is_owned():
             future._condition.release()
-threading.Thread(target=ctrl_cs, daemon=True).start()
-while time.monotonic() < end:
-    try:
-        looks()
-    except KeyboardInterrupt:
-        # one raised outside the wait, by Python's own handler
-        held_now()
-done.set()
-signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
-print("TAKEN", taken, "HELD", held, "OTHER", len(other), flush=True)
+with shell.interrupt_on_signals():
+    threading.Thread(target=ctrl_cs, daemon=True).start()
+    while time.monotonic() < end:
+        try:
+            looks()
+        except KeyboardInterrupt:
+            # one raised outside the wait, by the handler as ever
+            held_now()
+    done.set()
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+print("TAKEN", taken, "HELD", held_locks, "OTHER", len(other), flush=True)
 """, [], [])
         counts = out.split()
         assert counts[:1] == ["TAKEN"], (out, err)
@@ -1652,6 +1719,9 @@ class TestNoHandlerSwallowsACtrlC:
         ("boxman/manager.py", "_stop_parallel"),
         # another Ctrl-C hurries the stop on, to its end
         ("boxman/utils/shell.py", "_stop"),
+        # a scan's read hands what it raised, a KeyboardInterrupt included,
+        # to its outcome, which raises it on the main thread
+        ("boxman/providers/libvirt/scan_pool.py", "_work"),
     }
 
     BROAD = ("BaseException", "KeyboardInterrupt")
@@ -1706,31 +1776,3 @@ class TestNoHandlerSwallowsACtrlC:
                                 for name in self._names(arg))):
                     offenders.append(f"{module}:{node.lineno} suppress in {where[1]}")
         assert not offenders, sorted(set(offenders))
-
-    def test_each_ctrl_c_held_back_is_raised_by_the_code_within(self):
-        """Within ``ctrl_c_held_back`` the handlers raise no
-        KeyboardInterrupt: the code that holds a Ctrl-C back looks at
-        ``taken``, and raises it (#311 review)."""
-        import ast
-        from pathlib import Path
-
-        src = Path(__file__).resolve().parents[1] / "src"
-        users = []
-        for path in sorted(src.rglob("*.py")):
-            tree = ast.parse(path.read_text())
-            for function in ast.walk(tree):
-                if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)
-                         and getattr(node.func, "id", getattr(node.func, "attr", None))
-                         == "ctrl_c_held_back"]
-                if not calls:
-                    continue
-                users.append(function.name)
-                looks = any(isinstance(node, ast.Attribute) and node.attr == "taken"
-                            for node in ast.walk(function))
-                raises = any(isinstance(node, ast.Raise)
-                             and "KeyboardInterrupt" in ast.unparse(node)
-                             for node in ast.walk(function))
-                assert looks and raises, f"{path.name}: {function.name}"
-        assert sorted(users) == ["__enter__", "__exit__", "result"], users

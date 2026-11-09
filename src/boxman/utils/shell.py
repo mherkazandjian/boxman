@@ -91,69 +91,49 @@ def stop_commands() -> None:
     _begin_stop()
 
 
-class HeldBack:
-    """What :func:`ctrl_c_held_back` gives the code within: ``taken``,
-    whether a Ctrl-C was taken meanwhile, its KeyboardInterrupt left for
-    that code to raise."""
-
-    taken = False
+#: the main thread's CtrlCsHeldBack, the innermost last
+_HOLDING: list[CtrlCsHeldBack] = []
 
 
-#: the main thread's :func:`ctrl_c_held_back`, the innermost last
-_HOLDING: list[HeldBack] = []
-
-
-def _held_back() -> bool:
-    """For a handler, once it has begun the stop: whether the main thread
-    is within :func:`ctrl_c_held_back`, which is then told of the Ctrl-C,
-    and raises its KeyboardInterrupt itself."""
-    if not _HOLDING:
-        return False
-    _HOLDING[-1].taken = True
-    return True
-
-
-def _on_sigint_held_back(number: int, frame: Any) -> None:
-    """Python's own SIGINT handler, within :func:`ctrl_c_held_back`."""
-    _begin_stop()
-    if not _held_back():
-        # one taken as the holding back ends: Python's is put back here
-        signal.signal(signal.SIGINT, signal.default_int_handler)
-        signal.default_int_handler(number, frame)
-
-
-@contextlib.contextmanager
-def ctrl_c_held_back() -> Iterator[HeldBack]:
+class CtrlCsHeldBack:
     """
     Within it, on the main thread, a Ctrl-C -- or a SIGTERM, SIGHUP or
-    SIGQUIT under :func:`interrupt_on_signals` -- begins the stop there and
-    then, as ever, and the commands are stopped; its KeyboardInterrupt is
-    not raised, but ``taken`` set on what it gives, for the code within to
-    raise where it holds nothing.
+    SIGQUIT -- under :func:`interrupt_on_signals` begins the stop there and
+    then, as ever; its KeyboardInterrupt is not raised, but counted in
+    ``taken``, for the code within to raise where it holds nothing. Entered
+    again, it counts on.
 
     For the main thread's waits on threads of its own (a scan's pool): a
     KeyboardInterrupt raised in ``threading.Condition.__enter__`` once it has
     the lock leaves the lock held -- a future's, the pool's -- and the
     thread that needs it waits for good, and the main thread for that
     thread; one raised in ``ThreadPoolExecutor.shutdown`` can leave an item
-    neither run nor cancelled (#311 review). Under a SIGINT handler other
-    than Python's or :func:`interrupt_on_signals`', or off the main thread,
-    where no signal is handled, it changes nothing.
+    neither run nor cancelled (#311 review). Under another SIGINT handler,
+    Python's own included, or off the main thread, where no signal is
+    handled, it changes nothing: boxman runs under interrupt_on_signals.
     """
-    held = HeldBack()
-    if not _on_main_thread():
-        yield held
-        return
-    swapped = signal.getsignal(signal.SIGINT) is signal.default_int_handler
-    if swapped:
-        signal.signal(signal.SIGINT, _on_sigint_held_back)
-    _HOLDING.append(held)
-    try:
-        yield held
-    finally:
-        _HOLDING.remove(held)
-        if swapped:
-            signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    def __init__(self) -> None:
+        self.taken = 0
+
+    def __enter__(self) -> CtrlCsHeldBack:
+        if _on_main_thread():
+            _HOLDING.append(self)
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        if self in _HOLDING:
+            _HOLDING.remove(self)
+
+
+def _held_back() -> bool:
+    """For a handler, once it has begun the stop: whether the main thread
+    is within a :class:`CtrlCsHeldBack`, which then counts the Ctrl-C, and
+    raises its KeyboardInterrupt itself."""
+    if not _HOLDING:
+        return False
+    _HOLDING[-1].taken += 1
+    return True
 
 
 def _has_terminal() -> bool:
@@ -209,10 +189,16 @@ def _tree(pid: int) -> dict[int, str]:
     reading every process (#311 review: a stop that did that on every tick
     took seconds of CPU)."""
     if _children_listed():
-        found = [pid]
-        for each in found:
-            found.extend(_children(each))
-        return {each: fields[19] for each in found if (fields := _stat(each))}
+        # each with the parent it was listed under: a PID listed, then
+        # ended and given to another process, has another parent
+        tree: dict[int, str] = {}
+        walk: list[tuple[int, int | None]] = [(pid, None)]
+        for each, parent in walk:
+            fields = _stat(each)
+            if fields and (parent is None or int(fields[1]) == parent):
+                tree[each] = fields[19]
+                walk.extend((child, each) for child in _children(each))
+        return tree
     try:
         names = [int(name) for name in os.listdir("/proc") if name.isdigit()]
     except OSError:
@@ -557,8 +543,9 @@ class _StoppingLocal(invoke.runners.Local):
                 self.interrupted = True
                 # it may have started after the terminal's Ctrl-C, before
                 # the main thread's handler set _STOPPING: it is sent the
-                # SIGINT itself (a scan's reads only read, and take a second
-                # one with no harm)
+                # SIGINT itself, and so is each process of it that appears
+                # meanwhile (_follow); a scan's reads only read, and lose
+                # nothing by that
                 self.from_another_thread = True
                 self._stop()
                 continue
@@ -623,9 +610,11 @@ class _StoppingLocal(invoke.runners.Local):
         finish; ``b`` of ``a; b``, once ``a`` has handled its SIGINT; or one a
         shell left behind as it died, in the command's group. For a runner on
         another thread, stopped as a stop began (:meth:`wait`): its command
-        may have started after the Ctrl-C, and a scan's reads, which these
-        are, only read. A command's own cleanup, which a handler of the
-        signal may start, is left to finish elsewhere."""
+        may have started after the Ctrl-C. A cleanup that a handler of the
+        signal starts is a new process too, and has the signal, and one the
+        group's last sweep finds has it a second time: a scan's reads, which
+        these are, only read, and lose nothing by either. On the main thread
+        a command's own cleanup is left to finish."""
         sent = self.sent.setdefault(number, {})
         new = {pid: running for pid, running in _running_now(self._members()).items()
                if sent.get(pid) != running}
@@ -787,7 +776,7 @@ def interrupt_on_signals(worker: bool = False) -> Iterator[None]:
     they did. The handlers are Python ones, which commands do not inherit,
     and the ones found are put back on the way out. Off the main thread,
     where no signal is handled, it changes nothing. Within
-    :func:`ctrl_c_held_back`, the KeyboardInterrupt is left to the code
+    :class:`CtrlCsHeldBack`, the KeyboardInterrupt is left to the code
     there.
     """
     stopping = False
