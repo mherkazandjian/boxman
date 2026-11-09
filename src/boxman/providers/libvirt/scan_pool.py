@@ -25,7 +25,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as wait_for
 from typing import Any
 
-from boxman.utils.shell import stop_commands
+from boxman.utils.shell import HeldBack, ctrl_c_held_back, stop_commands
 
 #: the provider setting -- ``provider.libvirt`` in conf.yml, or
 #: ``providers.libvirt`` in boxman.yml -- for how many domains a scan reads
@@ -63,11 +63,16 @@ def scan_workers(provider_config: dict[str, Any], logger) -> int:
 POLL_S = 0.05
 
 
-def _wait_for_all(futures: list[Future]) -> None:
+def _wait_for_all(futures: list[Future], ctrl_c: HeldBack | None = None) -> None:
     """Wait for every one of *futures*, a slice at a time (:data:`POLL_S`),
-    so that a signal is handled meanwhile."""
-    while not all(future.done() for future in futures):
-        wait_for(futures, timeout=POLL_S)
+    so that a signal is handled meanwhile; given *ctrl_c*, what
+    :func:`~boxman.utils.shell.ctrl_c_held_back` gave, only until a Ctrl-C
+    is taken. A future the pool cancelled counts as ended, as ``done()``
+    says, though ``concurrent.futures.wait`` would not count it."""
+    pending = [future for future in futures if not future.done()]
+    while pending and not (ctrl_c is not None and ctrl_c.taken):
+        wait_for(pending, timeout=POLL_S)
+        pending = [future for future in pending if not future.done()]
 
 
 class _Outcome:
@@ -77,7 +82,12 @@ class _Outcome:
         self._future = future
 
     def result(self) -> Any:
-        _wait_for_all([self._future])
+        # a Ctrl-C meanwhile begins the stop there and then, and is raised
+        # here, once the wait holds nothing (#311 review)
+        with ctrl_c_held_back() as ctrl_c:
+            _wait_for_all([self._future], ctrl_c)
+        if ctrl_c.taken:
+            raise KeyboardInterrupt
         return self._future.result()
 
 
@@ -113,7 +123,14 @@ class InOrder:
     are stopped first, and the reads start no more (#294). The main thread
     waits a slice at a time (:data:`POLL_S`), for an outcome or on the way
     out, so that a Ctrl-C the kernel handed a read's thread is not left
-    until a read ends (#309).
+    until a read ends (#309). While it waits, or hands out or cancels the
+    items, a Ctrl-C begins the stop there and then, and its
+    KeyboardInterrupt is raised only once the wait is over, or the items
+    cancelled and the reads under way ended -- the stop of their commands
+    bounds that -- so that it is never raised inside the pool's own
+    workings, where it can leave an item neither read nor cancelled, or a
+    lock held that a read needs to end (#311 review). A further Ctrl-C on
+    the way out is the same stop: the KeyboardInterrupt raised is the first.
 
     With one worker, or one item, nothing runs on a thread: each item is
     read when its outcome is asked for, as before the pool.
@@ -132,29 +149,32 @@ class InOrder:
         self._pool = ThreadPoolExecutor(
             max_workers=min(self._workers, len(self._items)),
             thread_name_prefix="boxman-scan")
-        try:
-            self._futures = [self._pool.submit(self._read, item)
-                             for item in self._items]
-        except BaseException:
-            self._pool.shutdown(wait=True, cancel_futures=True)
-            raise
+        with ctrl_c_held_back() as ctrl_c:
+            try:
+                self._futures = [self._pool.submit(self._read, item)
+                                 for item in self._items]
+            except BaseException:
+                self._pool.shutdown(wait=True, cancel_futures=True)
+                raise
+        if ctrl_c.taken:
+            # the block is not entered, so not left: the reads are ended here
+            self.__exit__(KeyboardInterrupt, KeyboardInterrupt(), None)
+            raise KeyboardInterrupt
         return [_Outcome(future) for future in self._futures]
 
     def __exit__(self, *exc_info: Any) -> None:
         if self._pool is None:
             return
-        if exc_info[0] is not None and issubclass(exc_info[0], KeyboardInterrupt):
-            stop_commands()
-        self._pool.shutdown(wait=False, cancel_futures=True)
-        try:
+        stopping = exc_info[0] is not None and issubclass(exc_info[0], KeyboardInterrupt)
+        with ctrl_c_held_back() as ctrl_c:
+            if stopping:
+                stop_commands()
+            self._pool.shutdown(wait=False, cancel_futures=True)
             _wait_for_all(self._futures)
-        except KeyboardInterrupt:
-            # one handled on the way out: the commands still running are
-            # stopped, and still waited for
-            stop_commands()
+            # every read has ended: their threads' own ends are left
             self._pool.shutdown(wait=True)
-            raise
-        self._pool.shutdown(wait=True)
+        if ctrl_c.taken and not stopping:
+            raise KeyboardInterrupt
 
 
 class OnceEach:

@@ -91,6 +91,71 @@ def stop_commands() -> None:
     _begin_stop()
 
 
+class HeldBack:
+    """What :func:`ctrl_c_held_back` gives the code within: ``taken``,
+    whether a Ctrl-C was taken meanwhile, its KeyboardInterrupt left for
+    that code to raise."""
+
+    taken = False
+
+
+#: the main thread's :func:`ctrl_c_held_back`, the innermost last
+_HOLDING: list[HeldBack] = []
+
+
+def _held_back() -> bool:
+    """For a handler, once it has begun the stop: whether the main thread
+    is within :func:`ctrl_c_held_back`, which is then told of the Ctrl-C,
+    and raises its KeyboardInterrupt itself."""
+    if not _HOLDING:
+        return False
+    _HOLDING[-1].taken = True
+    return True
+
+
+def _on_sigint_held_back(number: int, frame: Any) -> None:
+    """Python's own SIGINT handler, within :func:`ctrl_c_held_back`."""
+    _begin_stop()
+    if not _held_back():
+        # one taken as the holding back ends: Python's is put back here
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.default_int_handler(number, frame)
+
+
+@contextlib.contextmanager
+def ctrl_c_held_back() -> Iterator[HeldBack]:
+    """
+    Within it, on the main thread, a Ctrl-C -- or a SIGTERM, SIGHUP or
+    SIGQUIT under :func:`interrupt_on_signals` -- begins the stop there and
+    then, as ever, and the commands are stopped; its KeyboardInterrupt is
+    not raised, but ``taken`` set on what it gives, for the code within to
+    raise where it holds nothing.
+
+    For the main thread's waits on threads of its own (a scan's pool): a
+    KeyboardInterrupt raised in ``threading.Condition.__enter__`` once it has
+    the lock leaves the lock held -- a future's, the pool's -- and the
+    thread that needs it waits for good, and the main thread for that
+    thread; one raised in ``ThreadPoolExecutor.shutdown`` can leave an item
+    neither run nor cancelled (#311 review). Under a SIGINT handler other
+    than Python's or :func:`interrupt_on_signals`', or off the main thread,
+    where no signal is handled, it changes nothing.
+    """
+    held = HeldBack()
+    if not _on_main_thread():
+        yield held
+        return
+    swapped = signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    if swapped:
+        signal.signal(signal.SIGINT, _on_sigint_held_back)
+    _HOLDING.append(held)
+    try:
+        yield held
+    finally:
+        _HOLDING.remove(held)
+        if swapped:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+
+
 def _has_terminal() -> bool:
     """Whether this process has a controlling terminal."""
     try:
@@ -105,17 +170,49 @@ def _stat(pid: int) -> list[str] | None:
     state first, the parent's PID second and the start time 20th; or None,
     for a process that is not there."""
     try:
-        with open(f"/proc/{pid}/stat") as stat:
-            # the name, in parentheses, may hold either itself
+        # the name, in parentheses, may hold either itself, and need not be
+        # UTF-8: the kernel cuts it at 15 bytes, inside a character as well
+        # (#311 review); it is not among the fields
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as stat:
             fields = stat.read().rsplit(")", 1)[1].split()
-    except (OSError, IndexError):
+    except (OSError, IndexError, ValueError):
         return None
     return fields if len(fields) > 19 else None
 
 
+def _children_listed() -> bool:
+    """Whether the kernel lists each thread's children
+    (``/proc/<pid>/task/<tid>/children``), as most do."""
+    return os.path.exists(f"/proc/{os.getpid()}/task/{os.getpid()}/children")
+
+
+def _children(pid: int) -> list[int]:
+    """The children of *pid*, from the lists of its threads."""
+    found: list[int] = []
+    try:
+        tasks = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return found
+    for task in tasks:
+        try:
+            with open(f"/proc/{pid}/task/{task}/children", "rb") as listed:
+                found.extend(int(each) for each in listed.read().split())
+        except (OSError, ValueError):
+            continue
+    return found
+
+
 def _tree(pid: int) -> dict[int, str]:
     """*pid*, and every process below it, each with its start time, which
-    tells it from a process given its PID later."""
+    tells it from a process given its PID later. Walked down from *pid*
+    through the kernel's lists of children; only where there are none, by
+    reading every process (#311 review: a stop that did that on every tick
+    took seconds of CPU)."""
+    if _children_listed():
+        found = [pid]
+        for each in found:
+            found.extend(_children(each))
+        return {each: fields[19] for each in found if (fields := _stat(each))}
     try:
         names = [int(name) for name in os.listdir("/proc") if name.isdigit()]
     except OSError:
@@ -142,16 +239,6 @@ def _running_now(members: dict[int, str]) -> dict[int, tuple[str, bytes]]:
         except OSError:
             continue
     return found
-
-
-def _group_members(group: int) -> dict[int, str]:
-    """Every process of process group *group*, with its start time."""
-    try:
-        names = [int(name) for name in os.listdir("/proc") if name.isdigit()]
-    except OSError:
-        return {}
-    return {each: fields[19] for each in names
-            if (fields := _stat(each)) and int(fields[2]) == group}
 
 
 def _alive(pid: int, start: str) -> bool:
@@ -364,6 +451,13 @@ class _StoppingLocal(invoke.runners.Local):
     KILL_TIMEOUT = 5
     #: how often a command being stopped is looked at
     POLL = 0.02
+    #: how often, on another thread, its processes that have not had the
+    #: stop's signal are looked for (:meth:`_follow`)
+    FOLLOW_EVERY = 0.1
+    #: how long a runner on another thread, whose command died of SIGINT,
+    #: waits for the stop the Ctrl-C begins on the main thread, which sets
+    #: _STOPPING within a slice of a scan's wait (scan_pool.POLL_S)
+    SIGINT_STOP_WAIT = 0.2
 
     def start(self, command: str, shell: str, env: dict[str, Any]) -> None:
         # invoke has the command only once Popen returns, and Popen forks,
@@ -410,10 +504,12 @@ class _StoppingLocal(invoke.runners.Local):
         #: in boxman's group: each process signalled, by PID, with its start
         #: time; one below the shell is passed on to init when the shell dies
         self.signalled: dict[int, str] = {}
-        #: for each signal of a stop, the processes it was sent to, or that
-        #: had it from the terminal, by PID, with their start times and what
-        #: they ran then
+        #: for each signal of a stop, the processes it was sent to, by PID,
+        #: with their start times and what they ran then
         self.sent: dict[int, dict[int, tuple[str, bytes]]] = {}
+        #: the signals of a stop sent to the group again, once its shell had
+        #: gone (:meth:`_follow`)
+        self.swept: set[int] = set()
         if self.using_pty:
             # pty.fork() makes it a session leader, and so a group leader
             super().start(command, shell, env)
@@ -500,15 +596,12 @@ class _StoppingLocal(invoke.runners.Local):
         return False
 
     def _members(self) -> dict[int, str]:
-        """The command's processes now, each with its start time: its
-        group's, or its shell and every process below it, while the shell
-        is there to find them by (once reaped, its PID may be another
-        process's)."""
-        if self.group is not None:
-            return _group_members(self.group)
+        """The command's processes now, each with its start time: its shell
+        and every process below it, while the shell is there to find them
+        by (once reaped, its PID may be another process's)."""
         if self.process_is_finished:
             return {}
-        return _tree(self.process.pid)
+        return _tree(self.pid if self.using_pty else self.process.pid)
 
     def _signal(self, number: int) -> None:
         # taken before the signal: a process forked meanwhile has it twice,
@@ -536,12 +629,24 @@ class _StoppingLocal(invoke.runners.Local):
         sent = self.sent.setdefault(number, {})
         new = {pid: running for pid, running in _running_now(self._members()).items()
                if sent.get(pid) != running}
-        if not new:
-            return
-        sent.update(new)
-        if self.group is None:
-            self.signalled.update({pid: start for pid, (start, _cmd) in new.items()})
-        self._kill(number, [pid for pid, (start, _cmd) in new.items() if _alive(pid, start)])
+        if new:
+            sent.update(new)
+            pids = [pid for pid, (start, _cmd) in new.items() if _alive(pid, start)]
+            if self.group is None:
+                self.signalled.update({pid: start for pid, (start, _cmd) in new.items()})
+                self._kill(number, pids)
+            else:
+                for pid in pids:
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.kill(pid, number)
+        elif (self.group is not None and self.process_is_finished
+                and number not in self.swept):
+            # the shell has gone, and what it left in the group is no longer
+            # below it: the group has the signal once more, once, and a
+            # process that had it already has it a second time
+            self.swept.add(number)
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(self.group, number)
 
     @staticmethod
     def _kill(number: int, pids: list[int]) -> None:
@@ -559,9 +664,11 @@ class _StoppingLocal(invoke.runners.Local):
         sending *number* to each of its processes that has not had it as it
         appears (:meth:`_follow`)."""
         follow = getattr(self, "from_another_thread", False)
-        deadline = time.monotonic() + timeout
+        now = time.monotonic()
+        deadline, followed = now + timeout, now
         while not self._ended() and time.monotonic() < deadline:
-            if follow:
+            if follow and time.monotonic() - followed >= self.FOLLOW_EVERY:
+                followed = time.monotonic()
                 self._follow(number)
             time.sleep(self.POLL)
 
@@ -625,7 +732,7 @@ class _StoppingLocal(invoke.runners.Local):
             # an UnexpectedExit, for one: a stopped command did not exit 0;
             # on another thread, one the terminal's Ctrl-C ended first
             if self.interrupted or (not _on_main_thread() and (
-                    _STOPPING.is_set() or self._ended_by_sigint(failure.result))):
+                    _STOPPING.is_set() or self._stopped_by_a_ctrl_c(failure.result))):
                 raise KeyboardInterrupt from None
             raise
         except KeyboardInterrupt:
@@ -640,21 +747,20 @@ class _StoppingLocal(invoke.runners.Local):
             # ended, or let go of (disown, asynchronous): not the guardian's
             if getattr(self, "group", None) is not None:
                 _guard(self.group, False)
-        if self.interrupted or (not _on_main_thread() and self._ended_by_sigint(result)):
+        if self.interrupted or (not _on_main_thread() and self._stopped_by_a_ctrl_c(result)):
             raise KeyboardInterrupt
         return result
 
-    @staticmethod
-    def _ended_by_sigint(result: invoke.runners.Result) -> bool:
-        """Whether *result* is a command's that died of SIGINT, or a shell's
-        that reports one that did. On a thread other than the main one that
-        is the terminal's Ctrl-C, come before the main thread's handler has
-        begun the stop: the stop begins here, and the thread starts no next
-        command, which the Ctrl-C would not reach (#309)."""
+    def _stopped_by_a_ctrl_c(self, result: invoke.runners.Result) -> bool:
+        """Whether *result*, on a thread other than the main one, is that of
+        a command the terminal's Ctrl-C ended: it died of SIGINT, or its
+        shell reports one that did, and the stop the Ctrl-C began on the
+        main thread comes within SIGINT_STOP_WAIT. Its thread then starts no
+        next command, which the Ctrl-C would not reach (#309). A command that
+        merely exits 130 is no Ctrl-C, and no stop comes (#311 review)."""
         if getattr(result, "exited", None) not in (-signal.SIGINT, 128 + signal.SIGINT):
             return False
-        _begin_stop()
-        return True
+        return _STOPPING.wait(self.SIGINT_STOP_WAIT)
 
 
 def stop_timeout() -> float:
@@ -680,7 +786,9 @@ def interrupt_on_signals(worker: bool = False) -> Iterator[None]:
     background job, stays ignored, and the commands started inherit that, as
     they did. The handlers are Python ones, which commands do not inherit,
     and the ones found are put back on the way out. Off the main thread,
-    where no signal is handled, it changes nothing.
+    where no signal is handled, it changes nothing. Within
+    :func:`ctrl_c_held_back`, the KeyboardInterrupt is left to the code
+    there.
     """
     stopping = False
 
@@ -688,7 +796,8 @@ def interrupt_on_signals(worker: bool = False) -> Iterator[None]:
         nonlocal stopping
         stopping = True
         _begin_stop()
-        signal.default_int_handler(number, frame)
+        if not _held_back():
+            signal.default_int_handler(number, frame)
 
     def on_stop_signal(number: int, frame: Any) -> None:
         nonlocal stopping
@@ -701,7 +810,7 @@ def interrupt_on_signals(worker: bool = False) -> Iterator[None]:
         handler = signal.getsignal(signal.SIGINT)
         if callable(handler):
             handler(signal.SIGINT, frame)
-        else:
+        elif not _held_back():
             raise KeyboardInterrupt
 
     handlers = {signal.SIGINT: on_sigint, **{number: on_stop_signal for number in STOP_SIGNALS}}
