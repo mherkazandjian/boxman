@@ -22,6 +22,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_for
 from typing import Any
 
 from boxman.utils.shell import stop_commands
@@ -54,6 +55,32 @@ def scan_workers(provider_config: dict[str, Any], logger) -> int:
     return value
 
 
+#: how long the main thread waits on the reads at a time. A signal -- a
+#: Ctrl-C -- that the kernel hands one of the reads' threads is handled by
+#: the main thread's Python handler only once that thread runs again, and a
+#: wait without a timeout never lets it: the stop began only when a read
+#: ended, after the reads had started their next commands (#309)
+POLL_S = 0.05
+
+
+def _wait_for_all(futures: list[Future]) -> None:
+    """Wait for every one of *futures*, a slice at a time (:data:`POLL_S`),
+    so that a signal is handled meanwhile."""
+    while not all(future.done() for future in futures):
+        wait_for(futures, timeout=POLL_S)
+
+
+class _Outcome:
+    """A read's outcome, waited for a slice at a time (:data:`POLL_S`)."""
+
+    def __init__(self, future: Future) -> None:
+        self._future = future
+
+    def result(self) -> Any:
+        _wait_for_all([self._future])
+        return self._future.result()
+
+
 class _WhenAsked:
     """One read, run when its outcome is asked for: what :class:`InOrder`
     hands out when it reads one item at a time, so that nothing past the
@@ -83,7 +110,10 @@ class InOrder:
     way to end: no read outlives the scan that asked for it. Reads are short
     (one domain's commands), so the wait is too. On a KeyboardInterrupt,
     which reaches the main thread alone, the commands the reads are running
-    are stopped first, and the reads start no more (#294).
+    are stopped first, and the reads start no more (#294). The main thread
+    waits a slice at a time (:data:`POLL_S`), for an outcome or on the way
+    out, so that a Ctrl-C the kernel handed a read's thread is not left
+    until a read ends (#309).
 
     With one worker, or one item, nothing runs on a thread: each item is
     read when its outcome is asked for, as before the pool.
@@ -103,17 +133,28 @@ class InOrder:
             max_workers=min(self._workers, len(self._items)),
             thread_name_prefix="boxman-scan")
         try:
-            return [self._pool.submit(self._read, item)
-                    for item in self._items]
+            self._futures = [self._pool.submit(self._read, item)
+                             for item in self._items]
         except BaseException:
             self._pool.shutdown(wait=True, cancel_futures=True)
             raise
+        return [_Outcome(future) for future in self._futures]
 
     def __exit__(self, *exc_info: Any) -> None:
-        if self._pool is not None:
-            if exc_info[0] is not None and issubclass(exc_info[0], KeyboardInterrupt):
-                stop_commands()
-            self._pool.shutdown(wait=True, cancel_futures=True)
+        if self._pool is None:
+            return
+        if exc_info[0] is not None and issubclass(exc_info[0], KeyboardInterrupt):
+            stop_commands()
+        self._pool.shutdown(wait=False, cancel_futures=True)
+        try:
+            _wait_for_all(self._futures)
+        except KeyboardInterrupt:
+            # one handled on the way out: the commands still running are
+            # stopped, and still waited for
+            stop_commands()
+            self._pool.shutdown(wait=True)
+            raise
+        self._pool.shutdown(wait=True)
 
 
 class OnceEach:

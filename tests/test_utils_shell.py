@@ -647,6 +647,29 @@ class TestRunStopsEveryCommand:
         assert not _running(up)
         assert not after.exists()
 
+    @pytest.mark.parametrize("how", ["alone", "terminal"],
+                             ids=["sigint-to-boxman-alone", "ctrl-c-at-the-terminal"])
+    def test_a_process_the_command_starts_during_its_stop_is_stopped_too(
+            self, how, tmp_path):
+        """``a; b``, where ``a`` handles its SIGINT and exits 3: the shell,
+        which had the SIGINT too, goes on to ``b``, which is forked after the
+        stop began and never had it. It ran until the SIGTERM, STOP_TIMEOUT
+        later; so did a read's command whose shell forked it as a forwarded
+        SIGINT reached the shell (#309). Each process of the command that
+        appears during a stop is sent the signal now."""
+        import time
+
+        up, then = tmp_path / "up", tmp_path / "then"
+        started = time.monotonic()
+        out, err, code = _interrupt(
+            tmp_path, _RUN_IN_A_CHILD,
+            [f"{_program(_TRAPS_SIGINT, up)}; {_program(_TRAPS_SIGINT, then)}"],
+            [up], how=how, env=self._env(STOP_TIMEOUT="10", TERM_TIMEOUT="1"))
+        assert (out.split(), code) == (["STOPPED"], 0), err
+        assert (tmp_path / "up.sigint").exists()
+        assert not _running(then)
+        assert time.monotonic() - started < 9
+
     def test_an_interrupted_boxman_exits_by_sigint_and_takes_no_next_step(self, tmp_path):
         """The run returned the stopped command's result, and boxman went on
         with its next step, and exited 0. Now the KeyboardInterrupt ends
@@ -949,6 +972,56 @@ with shell.interrupt_on_signals():
 """
 
 
+#: the same scan, with the SIGINT handed to a thread other than the main
+#: one, as the kernel may hand a signal sent to the process: a thread of the
+#: child's own sends it to itself once the reads' first commands are up, and
+#: the child says how long after that its main thread had the
+#: KeyboardInterrupt
+_A_THREAD_TAKES_THE_SIGINT = """
+import os, signal, sys, threading, time
+marks = sys.argv[1]
+sent = []
+def take_it():
+    first = [f"{marks}/pid-{item}-0" for item in range(8)]
+    while not all(os.path.exists(path) for path in first):
+        time.sleep(0.01)
+    sent.append(time.monotonic())
+    signal.pthread_kill(threading.get_ident(), signal.SIGINT)
+threading.Thread(target=take_it, daemon=True).start()
+try:
+""" + "".join("    " + line + "\n" if line else "\n"
+              for line in _SCANS_ON_THE_POOL.strip("\n").split("\n")) + """
+except KeyboardInterrupt:
+    print("STOPPED", round(time.monotonic() - sent[0], 2), flush=True)
+    raise
+"""
+
+
+#: the same scan, where read 0's first command dies of a SIGINT, as the
+#: terminal's Ctrl-C ends it, and nothing signals boxman itself: it
+#: creates ``died`` first, and the others wait for that before they start
+_A_READS_COMMAND_DIES_OF_SIGINT = """
+import os, sys, time
+from boxman.providers.libvirt.scan_pool import InOrder
+from boxman.utils import shell
+marks = sys.argv[1]
+def read(item):
+    if item == 0:
+        open(f"{marks}/died", "w").close()
+        shell.run("sh -c 'kill -INT $$'", hide=True, warn=True)
+    else:
+        while not os.path.exists(f"{marks}/died"):
+            time.sleep(0.01)
+    for command in range(1, 3):
+        shell.run(f"sh -c 'echo $$ > {marks}/pid-{item}-{command}; exec sleep 5' "
+                  f"&& touch {marks}/done-{item}-{command}", hide=True, warn=True)
+    return item
+with shell.interrupt_on_signals():
+    with InOrder(read, range(8), 8) as outcomes:
+        print([outcome.result() for outcome in outcomes], flush=True)
+"""
+
+
 @pytest.mark.usefixtures("no_leftovers")
 class TestCommandsOnOtherThreads:
     """
@@ -977,6 +1050,68 @@ class TestCommandsOnOtherThreads:
             assert sorted(path.name for path in marks.iterdir()) == sorted(
                 path.name for path in first)
             assert not [path for path in first if _running(path)]
+        finally:
+            for path in marks.glob("pid-*"):
+                if _running(path):
+                    os.kill(int(path.read_text()), signal.SIGKILL)
+
+    @pytest.mark.parametrize("terminal", [False, True],
+                             ids=["without-a-terminal", "with-a-terminal"])
+    def test_a_sigint_a_reads_thread_takes_still_stops_the_scan_at_once(
+            self, terminal, tmp_path):
+        """The kernel may hand a signal sent to boxman to any of its
+        threads, and Python handles it on the main thread alone, the next
+        time that thread runs: waiting on a read's outcome without a
+        timeout, it ran only once a read had ended, and the stop began
+        then, after every read had started its next command (#309, a
+        failure of the test above on CI). The main thread waits a slice at
+        a time now. The SIGINT goes to a thread other than the main one
+        here, every time."""
+        import os
+        import signal
+
+        marks = tmp_path / "marks"
+        marks.mkdir()
+        first = [marks / f"pid-{item}-0" for item in range(8)]
+        try:
+            out, err, code = _interrupt(
+                tmp_path, _A_THREAD_TAKES_THE_SIGINT, [marks], [], terminal=terminal)
+            assert code == -signal.SIGINT, err
+            stopped = out.split()
+            assert stopped[:1] == ["STOPPED"] and float(stopped[1]) < 2, (out, err)
+            assert sorted(path.name for path in marks.iterdir()) == sorted(
+                path.name for path in first)
+            assert not [path for path in first if _running(path)]
+        finally:
+            for path in marks.glob("pid-*"):
+                if _running(path):
+                    os.kill(int(path.read_text()), signal.SIGKILL)
+
+    def test_a_read_whose_command_died_of_sigint_starts_no_next_command(self, tmp_path):
+        """The terminal's Ctrl-C ended a read's command before the main
+        thread's handler had begun the stop, and the read went on to its next
+        command, which the Ctrl-C had not reached (#309, a failure of the
+        test above under load). A read whose command died of SIGINT begins
+        the stop itself now, and the scan ends at once."""
+        import os
+        import signal
+        import time
+
+        marks = tmp_path / "marks"
+        marks.mkdir()
+        try:
+            started = time.monotonic()
+            out, err, code = _interrupt(
+                tmp_path, _A_READS_COMMAND_DIES_OF_SIGINT, [marks], [])
+            assert code == -signal.SIGINT, (out, err)
+            assert time.monotonic() - started < 4
+            # read 0 starts no next command; another read may have started
+            # one before the stop began, and it was stopped: none got to a
+            # second, or to the end of any
+            assert not list(marks.glob("pid-0-*"))
+            assert not list(marks.glob("pid-*-2"))
+            assert not list(marks.glob("done-*"))
+            assert not [path for path in marks.glob("pid-*") if _running(path)]
         finally:
             for path in marks.glob("pid-*"):
                 if _running(path):
