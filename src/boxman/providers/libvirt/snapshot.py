@@ -11,6 +11,7 @@ import shlex
 import stat
 import tempfile
 import time
+from dataclasses import dataclass, field
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -44,6 +45,22 @@ class _Backup(tuple):
         pair = super().__new__(cls, (original, backup))
         pair.linked = linked
         return pair
+
+
+@dataclass
+class IsoOverlayRemoval:
+    """
+    What a removal of the overlays libvirt made of CDROM images did
+    (:meth:`SnapshotManager._remove_iso_overlays`): each one removed, and
+    each one kept with why -- every one, when whether a snapshot names them
+    or a domain uses them could not be told (*decided* False). *failed*
+    names those whose removal was tried and did not work.
+    """
+
+    removed: list[str] = field(default_factory=list)
+    kept: dict[str, str] = field(default_factory=dict)
+    failed: list[str] = field(default_factory=list)
+    decided: bool = True
 
 
 class SnapshotManager:
@@ -673,11 +690,12 @@ class SnapshotManager:
     def _remove_iso_overlays(self, vm_name: str,
                              chains: list[tuple[list[str], str]],
                              files_in_use, identities=None,
-                             gone: bool = False) -> None:
+                             gone: bool = False) -> IsoOverlayRemoval:
         """
         Remove the overlays of *chains* — ``(overlays top first, the ISO
         under them)`` — that nothing needs any more, each above the one it
-        is built on.
+        is built on; what was removed and what was kept, and why
+        (:class:`IsoOverlayRemoval`).
 
         Kept, together with every layer under it: one a domain uses
         (*files_in_use*, ``LibVirtSession.files_in_use``, asked now, after
@@ -696,8 +714,9 @@ class SnapshotManager:
         present = list(dict.fromkeys(
             layer for layers, _iso in chains for layer in layers
             if os.path.lexists(layer)))
+        outcome = IsoOverlayRemoval()
         if not present:
-            return
+            return outcome
         left = f"left beside their ISO: {', '.join(present)}"
         snapshots = {} if gone else self._snapshot_xmls(vm_name)
         held = files_in_use(present) if snapshots is not None else None
@@ -712,9 +731,13 @@ class SnapshotManager:
             self.logger.warning(
                 f"{vm_name}: whether a snapshot of it names these overlays, "
                 f"or a domain uses them, cannot be told, so they are {left}")
-            return
+            outcome.decided = False
+            outcome.kept = dict.fromkeys(
+                present, "whether a snapshot names it, or a domain uses it, "
+                         "cannot be told")
+            return outcome
 
-        kept: dict[str, str] = {}
+        kept = outcome.kept
         for layers, iso in chains:
             for i, layer in enumerate(layers):
                 if not os.path.lexists(layer):
@@ -735,10 +758,12 @@ class SnapshotManager:
                     continue
                 if not self._remove_file(layer):
                     kept[layer] = "it could not be removed"
+                    outcome.failed.append(layer)
                     for below in layers[i + 1:]:
                         kept.setdefault(below, f"{layer} is built on it")
                     break
                 removed.add(layer)
+                outcome.removed.append(layer)
                 self.logger.info(
                     f"{vm_name}: removed {layer}, an overlay libvirt made of "
                     f"{iso} that nothing needs")
@@ -746,6 +771,7 @@ class SnapshotManager:
             if os.path.lexists(layer):
                 self.logger.warning(f"{vm_name}: kept {layer} beside its ISO: "
                                     f"{why}")
+        return outcome
 
     def _put_cdroms_back_on_their_isos(self, vm_name: str, files_in_use=None,
                                        also=(), pending=(),
@@ -905,7 +931,8 @@ class SnapshotManager:
         self._settle_pending(vm_name, ledger)
 
     def remove_pending_iso_overlays(self, vm_name: str, files_in_use,
-                                    gone: bool = False) -> None:
+                                    gone: bool = False,
+                                    only=None) -> IsoOverlayRemoval:
         """
         Remove the overlays of its CDROM images that restores of *vm_name*
         left for later (:mod:`.pending_overlays`), behind the checks a
@@ -915,22 +942,33 @@ class SnapshotManager:
         files_in_use``), asked once for all of them.
         Then drop the record of each that is gone, or is no longer the file
         recorded; one kept stays recorded, and is named at every removal.
+        Returns what was removed and what was kept.
+
+        With *only*, a set of overlays, a chain whose top is not one of them
+        is left whole: ``snapshot prune`` removes what its prompt listed,
+        and a chain a restore recorded since, or topped with another
+        overlay, is not that.
 
         A teardown of the VM calls this, with *gone* once its domain is
-        confirmed undefined. A take removes them on its way
-        (:meth:`_flatten_cdrom_overlays`). Housekeeping: what it cannot do
-        is warned about, never raised.
+        confirmed undefined, and so does ``snapshot prune``. A take removes
+        them on its way (:meth:`_flatten_cdrom_overlays`). Housekeeping:
+        what it cannot do is warned about, never raised.
         """
         ledger = self._ledger()
         waiting = ledger.chains(vm_name)
         self._name_unreadable_records(ledger)
+        if only is not None:
+            waiting = [chain for chain in waiting
+                       if next((layer for layer in chain.layers
+                                if os.path.lexists(layer)), None) in only]
         if not waiting:
-            return
-        self._remove_iso_overlays(
+            return IsoOverlayRemoval()
+        outcome = self._remove_iso_overlays(
             vm_name, [(chain.layers, chain.iso) for chain in waiting],
             files_in_use,
             identities=self._pending_identities(vm_name, ledger), gone=gone)
         self._settle_pending(vm_name, ledger)
+        return outcome
 
     def _record_pending(self, vm_name: str, ledger: PendingOverlays,
                         chains: list[tuple[list[str], str]],
@@ -1004,17 +1042,17 @@ class SnapshotManager:
         if now:
             self.logger.info(
                 f"{vm_name}: {', '.join(now)} left beside its ISO for later "
-                f"removal: the next `boxman snapshot take` of the VM, or its "
-                f"destroy, removes it once nothing uses it")
+                f"removal: `boxman snapshot prune`, the next `boxman snapshot "
+                f"take` of the VM, or its destroy, removes it once nothing "
+                f"uses it")
         waiting = [layer for chain in ledger.chains(vm_name)
                    for layer in chain.layers]
         if len(waiting) > len(now):
             self.logger.status(
                 f"{vm_name}: {len(waiting)} overlays libvirt made of its "
-                f"CDROM images wait beside them for removal: its next "
-                f"`boxman snapshot take`, or its destroy, removes them once "
-                f"nothing uses them (`boxman snapshot prune --dry-run` lists "
-                f"them)")
+                f"CDROM images wait beside them for removal: `boxman "
+                f"snapshot prune`, its next `boxman snapshot take`, or its "
+                f"destroy, removes them once nothing uses them")
 
     def _cdrom_overlay_chains(self,
                               vm_name: str) -> list[tuple[list[str], str]]:
@@ -2698,7 +2736,9 @@ class SnapshotManager:
         Say what a restore stopped during its revert leaves (#294): every
         backup of an overlay, kept, as the revert may have deleted the
         overlay -- libvirtd finishes a revert virsh has left -- and the
-        backup is the only copy then; and the guest, perhaps paused.
+        backup is the only copy then; and the guest, perhaps paused. Never
+        "remove" one whose overlay is there: another file may have taken
+        the overlay's name, and ``snapshot prune --dry-run`` tells.
         """
         if preserved:
             missing = [(o, b) for o, b in preserved if not self._is_regular_file(o)]
@@ -2712,8 +2752,9 @@ class SnapshotManager:
                 + ("" if not missing else " ("
                    + "; ".join(f"mv -fT {shlex.quote(b)} {shlex.quote(o)}"
                                for o, b in missing) + ")")
-                + "; one whose overlay is there is a spare copy and can be "
-                  "removed. Backups: "
+                + "; for one whose overlay is there, run `boxman snapshot "
+                  "prune --dry-run --min-age 0` (it changes nothing): it says "
+                  "whether it is a redundant copy or the only one. Backups: "
                 + ", ".join(f"{b} (of {o})" for o, b in preserved))
         self._report_pause_after_failed_revert(vm_name, paused)
 
@@ -3176,6 +3217,10 @@ class SnapshotManager:
                     f"({exc.strerror}); refusing to revert rather than write "
                     f"over something unexamined") from exc
 
+            # never "remove it": a leftover .preserve can be the only copy
+            # of an overlay the interrupted revert deleted, and one whose
+            # overlay is there can still be: another file may have taken
+            # the overlay's name since (prune calls that one unknown)
             raise SnapshotError(
                 f"the backup path {dst} already exists. Refusing to revert: "
                 f"a copy there would be written through a symlink or a hard "
@@ -3183,8 +3228,10 @@ class SnapshotManager:
                 f"then delete something this restore did not create. It is "
                 f"most likely left over from an interrupted restore — check "
                 f"it: if {src} is missing, it is the only copy of it, and "
-                f"goes back there (mv -fT); if {src} is there, it is a spare "
-                f"copy, to remove.")
+                f"goes back there (mv -fT {shlex.quote(dst)} "
+                f"{shlex.quote(src)}); if {src} is there, run `boxman "
+                f"snapshot prune --dry-run --min-age 0` (it changes nothing): "
+                f"it says whether this is a redundant copy or the only one.")
 
     def _reserve_backup_paths(self, pairs: list[tuple]) -> dict[str, tuple]:
         """
@@ -3321,14 +3368,44 @@ class SnapshotManager:
             # behind, so it must not be the one that dies quietly
             self.logger.warning(
                 f"could not run the overlay backup cleanup "
-                f"({type(exc).__name__}: {exc}); remove these by hand: "
-                f"{', '.join(backups)}")
+                f"({type(exc).__name__}: {exc}); {self._unreaped(backups)}")
             return
         if not result.ok:
             self.logger.warning(
                 f"could not remove the overlay backups "
-                f"({(result.stderr or '').strip()}); remove them by hand: "
-                f"{', '.join(backups)}")
+                f"({(result.stderr or '').strip()}); "
+                f"{self._unreaped(backups)}")
+
+    @staticmethod
+    def _unreaped(backups: list[str]) -> str:
+        """
+        What to do with those of *backups* -- ``.preserve`` files a restore
+        made and no longer needs -- that its cleanup left. ``boxman snapshot
+        prune`` removes a spare copy or an unfilled reservation once it has
+        told it is one; a second name of its overlay, a hard link, it keeps
+        (removing it frees nothing), and those go by hand.
+        """
+        links, others = [], []
+        for path in backups:
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                others.append(path)
+                continue
+            (links if stat.S_ISREG(st.st_mode) and st.st_nlink > 1
+             else others).append(path)
+        said = []
+        if others:
+            said.append(f"`boxman snapshot prune` removes each of these "
+                        f"that is a spare copy or an unfilled reservation: "
+                        f"{', '.join(others)}")
+        if links:
+            said.append(f"these are second names of their overlays (hard "
+                        f"links), which prune keeps: remove them by hand: "
+                        f"{', '.join(links)}")
+        return "; ".join(said) or "none of them is left"
 
     def _name_overlays_no_snapshot_records(self, vm_name: str,
                                            originals: list[str]) -> None:
@@ -3356,11 +3433,13 @@ class SnapshotManager:
                       if original not in names
                       and os.path.realpath(original) not in names]
         if unrecorded:
+            # a rename sets ctime: prune counts them from now, --min-age
             self.logger.warning(
                 f"{vm_name}: the revert recorded new overlays in place of "
                 f"{', '.join(unrecorded)}, put back: no snapshot of it "
-                f"records them any more, and nothing removes them. Remove "
-                f"them by hand once no other domain uses them.")
+                f"records them any more. `boxman snapshot prune` removes "
+                f"them once nothing uses them, an hour from now (or sooner "
+                f"with --min-age).")
 
     def _restore_preserved_overlays(
             self, preserved: list[tuple],
@@ -3945,8 +4024,9 @@ class SnapshotManager:
             if why:
                 self.logger.warning(
                     f"not removing {', '.join(files)}, the memory image of "
-                    f"deleted snapshot '{snap}' of {vm_name}: {why}. Remove "
-                    f"it by hand once no snapshot records it.")
+                    f"deleted snapshot '{snap}' of {vm_name}: {why}. `boxman "
+                    f"snapshot prune` removes it once no snapshot records "
+                    f"it.")
                 continue
             for path in files:
                 result = self.virsh.execute_shell(
@@ -3959,7 +4039,8 @@ class SnapshotManager:
                     self.logger.warning(
                         f"could not remove {path}, the memory image of "
                         f"deleted snapshot '{snap}' of {vm_name}: "
-                        f"{(result.stderr or '').strip()}")
+                        f"{(result.stderr or '').strip()}. `boxman snapshot "
+                        f"prune` lists it.")
 
     @staticmethod
     def _why_a_memory_image_stays(image: str, files: dict,
@@ -4065,6 +4146,8 @@ class SnapshotManager:
             # libvirt unlinked the .raw its record names, not the .raw.zst
             self._remove_memory_images(vm_name, {snapshot_name: image},
                                        recorded_in_use)
+            self._name_overlays_the_delete_left(
+                vm_name, snapshot_name, snapshots.get(snapshot_name))
             return True
 
         err_lower = (simple.stderr or "").lower()
@@ -4076,6 +4159,66 @@ class SnapshotManager:
         # External snapshot — needs the rebase/blockcommit dance.
         return self._delete_external_snapshot(
             vm_name, snapshot_name, recorded_in_use=recorded_in_use)
+
+    def _name_overlays_the_delete_left(self, vm_name: str,
+                                       snapshot_name: str,
+                                       xml_before: str | None) -> None:
+        """
+        Name in a warning each overlay that snapshot *snapshot_name* of
+        *vm_name* recorded -- *xml_before*, its XML read before libvirt's
+        own delete of it -- that the delete left, and that nothing of the VM
+        needs now: no snapshot of it names it, and no disk the VM runs on
+        is built on it. libvirt's delete of a leaf that is not the current
+        snapshot unlinks the overlay its parent's take made (#289), not its
+        own, which an earlier restore put back (#290).
+
+        Only its records of the VM's disks: an overlay of a CDROM's image
+        sits beside the image, where prune removes nothing itself.
+
+        A hint: when the snapshots, the VM's disks or a chain cannot be
+        read, nothing is said. ``snapshot prune`` asks everything again.
+        """
+        try:
+            root = ET.fromstring(xml_before or "")
+        except ET.ParseError:
+            return
+        recorded = [(disk.get("name"), source.get("file"))
+                    for section in ("disks", "revertDisks")
+                    for disk in root.findall(f"{section}/disk")
+                    for source in disk.findall("source")
+                    if source.get("file")]
+        if not any(os.path.isfile(path) for _name, path in recorded):
+            return
+        disks = self._data_disk_targets(vm_name)
+        targets = {target for target, _source in disks}
+        left = list(dict.fromkeys(path for name, path in recorded
+                                  if name in targets and os.path.isfile(path)))
+        snapshots = self._snapshot_xmls(vm_name) if left else None
+        if snapshots is None:
+            return
+        needed: set[str] = set()
+        for xml in snapshots.values():
+            try:
+                needed.update(s.get("file") for s in ET.fromstring(xml).iter(
+                    "source") if s.get("file"))
+            except ET.ParseError:
+                return
+        layers = CDROMManager(vm_name, provider_config=self.provider_config)
+        for _target, source in disks:
+            chain = layers.image_layers(source)
+            if chain is None:
+                return
+            needed.update(path for path, _format in chain)
+        needed |= {os.path.realpath(path) for path in needed}
+        left = [path for path in left if path not in needed
+                and os.path.realpath(path) not in needed]
+        if left:
+            self.logger.warning(
+                f"{vm_name}: libvirt's delete of snapshot '{snapshot_name}' "
+                f"left {', '.join(left)}, which it recorded: no snapshot of "
+                f"the VM records them now, and it runs on none of them. "
+                f"`boxman snapshot prune` removes them once nothing uses "
+                f"them.")
 
     def _delete_external_snapshot(self,
                                   vm_name: str,
@@ -4749,7 +4892,7 @@ class SnapshotManager:
                             f"{source} as its overlay of {disk_target}, in "
                             f"place of {stranded}")
                     retiring.extend(self._merged_layers(
-                        vm_name, source, new_base))
+                        vm_name, source, new_base) or [])
             if stops:
                 # before anything is rebased or removed
                 return False
@@ -4805,6 +4948,7 @@ class SnapshotManager:
         # the images each rebase merges into its head
         moved: dict[str, tuple[str, str]] = {}
         merged: dict[str, tuple[str, list[str]]] = {}
+        unread: list[tuple[str, str]] = []
         for disk_target, head_path, new_base, same in rebases:
             if same:
                 continue
@@ -4812,8 +4956,10 @@ class SnapshotManager:
                 vm_name, target_name, disk_target, new_base)
             if stranded:
                 moved[disk_target] = (head_path, stranded)
-            merged[disk_target] = (head_path, self._merged_layers(
-                vm_name, head_path, new_base))
+            layers = self._merged_layers(vm_name, head_path, new_base)
+            if layers is None:
+                unread.append((head_path, new_base))
+            merged[disk_target] = (head_path, layers or [])
         for disk_target, head_path, new_base, same in rebases:
             if same:
                 # nothing stands between them: the head is the target's own
@@ -4843,16 +4989,26 @@ class SnapshotManager:
                 if keeps is None:
                     self.logger.warning(
                         f"not removing {overlay} of dropped snapshot "
-                        f"'{snap}' on {vm_name}: {reason}. Remove it by hand "
-                        f"once nothing uses it.")
+                        f"'{snap}' on {vm_name}: {reason}. `boxman snapshot "
+                        f"prune` removes it once nothing uses it.")
                     continue
                 if reason:
                     self.logger.info(
                         f"keeping {overlay} of dropped snapshot '{snap}': "
                         f"{reason}")
                     continue
-                self.virsh.execute_shell(
+                result = self.virsh.execute_shell(
                     f"rm -f '{overlay}'", warn=True)
+                if os.path.lexists(overlay):
+                    # its record goes next, and then nothing names it
+                    self.logger.warning(
+                        f"could not remove {overlay} of dropped snapshot "
+                        f"'{snap}' on {vm_name}"
+                        + (f": {(result.stderr or '').strip()}"
+                           if result is not None and not result.ok
+                           and (result.stderr or '').strip() else "")
+                        + ". `boxman snapshot prune` removes it once nothing "
+                          "uses it.")
             # read before its record goes; removed once every dropped one's
             # has, so the scan no longer counts them (_remove_memory_images)
             image = self._memory_path_from_xml(vm_name, snap)
@@ -4869,6 +5025,16 @@ class SnapshotManager:
 
         if moved or merged:
             self._settle_target(vm_name, target_name, moved, merged, disks)
+        for head_path, new_base in unread:
+            # a revert's overlay under the head, after a restore of the
+            # target and a take (#292): merged into the head, recorded by
+            # nothing now, and not known here to be removed
+            self.logger.warning(
+                f"{vm_name}: the backing chain of {head_path} could not be "
+                f"read down to {new_base}, so the images the rebase merged "
+                f"into it are left where they are, if there were any; "
+                f"`boxman snapshot prune` lists those nothing records or "
+                f"uses.")
 
         self.logger.info(
             f"collapsed {len(drop_set)} snapshot(s) on vm {vm_name}; "
@@ -4912,12 +5078,12 @@ class SnapshotManager:
         return None if ok else f"its redefine failed ({error})"
 
     def _merged_layers(self, vm_name: str, head: str,
-                       new_base: str) -> list[str]:
+                       new_base: str) -> list[str] | None:
         """
         The images between *head* and *new_base* in the head's chain, top
         first: what a rebase of the head onto *new_base* merges into it.
-        None of them when the chain cannot be read, or does not reach
-        *new_base*.
+        None when the chain cannot be read, or does not reach *new_base*:
+        which images those are cannot be told.
         """
         layers = CDROMManager(
             vm_name, provider_config=self.provider_config).image_layers(head)
@@ -4927,7 +5093,7 @@ class SnapshotManager:
                     or self._one_file_where_qemu_runs(path, new_base)):
                 return between
             between.append(path)
-        return []
+        return None
 
     def _settle_target(self, vm_name: str, target_name: str,
                        moved: dict[str, tuple[str, str]],
@@ -4965,7 +5131,8 @@ class SnapshotManager:
                     f"though it runs on {', '.join(heads.values())}, built on "
                     f"the disks '{target_name}' was taken on: {why}. A delete "
                     f"or a restore of it still works, and leaves those files "
-                    f"behind; remove them by hand once nothing uses them.")
+                    f"behind; `boxman snapshot prune` removes them once "
+                    f"nothing uses them.")
             else:
                 self.logger.info(
                     f"'{target_name}' on {vm_name} records "
@@ -4986,7 +5153,8 @@ class SnapshotManager:
                 if keeps is None:
                     self.logger.warning(
                         f"not removing {path}, merged into {head}: {reason}. "
-                        f"Remove it by hand once nothing uses it.")
+                        f"`boxman snapshot prune` removes it once nothing "
+                        f"uses it.")
                     continue
                 if reason:
                     self.logger.info(
@@ -5001,4 +5169,5 @@ class SnapshotManager:
                 else:
                     self.logger.warning(
                         f"could not remove {path}, merged into {head}: "
-                        f"{(result.stderr or '').strip()}")
+                        f"{(result.stderr or '').strip()}. `boxman snapshot "
+                        f"prune` removes it once nothing uses it.")

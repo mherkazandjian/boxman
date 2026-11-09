@@ -16,7 +16,7 @@ section has the quick-start.
 | `boxman storage compress-snapshots` | zstd-compress (or `--decompress`) snapshot memory `.raw` files retroactively | any | yes |
 | `boxman storage pools` | list libvirt's storage pools; `--prune` removes the ones left on directories that are gone | any | only `--prune` |
 | `boxman snapshot collapse --to <name>` | merge the snapshots between `<name>` and the live head into the head; every other snapshot remains revertable, and it refuses while another branch is built on `<name>` | off — auto-shutdown by default | yes |
-| `boxman snapshot prune --dry-run` | list the files snapshots left behind that no snapshot records and no domain uses, each removable, kept (with the reason) or unknown | any | no (this version only lists) |
+| `boxman snapshot prune` | remove the files snapshots left behind that no snapshot records and no domain uses, after a prompt that lists them; each file is removable, kept (with the reason) or unknown | any | yes (`--dry-run`: no) |
 
 `boxman snapshot take --compress-memory` is the *primary* surface for
 memory compression — it runs at snapshot creation time so no `.raw` is
@@ -429,16 +429,15 @@ clusters:
   on the parent's overlays (#287). Reverting to a snapshot with no children,
   libvirt deletes its overlays and records the new ones in their place: the
   old ones are put back all the same, since whether another domain needs
-  one cannot be told while it is gone, and named in a warning. Nothing
-  removes them until `destroy`; `boxman snapshot prune --dry-run` lists
-  them, and says whether each one can go (below).
+  one cannot be told while it is gone, and named in a warning, which points
+  at `boxman snapshot prune` (below).
 
 ---
 
-## `boxman snapshot prune --dry-run`
+## `boxman snapshot prune`
 
 Snapshots leave files behind that no snapshot records and no domain uses,
-and nothing removes them until `destroy`:
+and nothing else removes them until `destroy`:
 
 - the overlays a restore puts back after the revert recorded new ones in
   their place: a snapshot's own overlays, once it is restored with nothing
@@ -455,10 +454,11 @@ and nothing removes them until `destroy`:
   `.preserve.copy` scratch copies and its reservation scaffolds;
 - memory images no snapshot records any more.
 
-`snapshot prune --dry-run` lists them, each `removable`, `kept` with the
-reason, or `unknown`, and what removing the removable ones would reclaim.
-This version only lists: without `--dry-run` it refuses, and removing what
-it lists comes in a later version.
+`snapshot prune` lists them, each `removable`, `kept` with the reason, or
+`unknown`, and what removing the removable ones would reclaim; then it
+removes the removable ones, after a prompt that lists them. `--dry-run`
+lists and changes nothing. The warnings that name such files when a
+restore, a delete or a collapse leaves them point at it.
 
 ```console
 $ boxman snapshot prune --vms nixos01 --dry-run --min-age 0
@@ -483,6 +483,87 @@ dry run: nothing was changed
 With the default `--min-age 1h` the same files read `too recent (changed
 2m ago; --min-age 1h)`, but for the only copy, which says how to put it
 back. SIZE is what a file takes on disk (`st_blocks`).
+
+### Removing them
+
+Here the memory directory was made read-only after the listing, so its
+two files could not go:
+
+```console
+$ boxman snapshot prune --vms nixos01 --min-age 0
+...the table...
+These files will be removed (reclaiming 13.5M):
+
+  <ws>/overlays/<vm>.1794013309
+  <ws>/overlays/<vm>.m1.preserve
+  <ws>/overlays/<vm>.m2.preserve
+  <ws>/overlays/<vm>.p2
+  <ws>/overlays/<vm>_data.1794013309
+  <ws>/overlays/<vm>_data.p2
+  <ws>/overlays/<vm>_data.t2
+  /mnt/mem/nixos/<vm>_snapshot_m1.raw.zst
+  /mnt/mem/nixos/<vm>_snapshot_m2.raw
+
+And these overlays of CD-ROM images, which restores left for later removal, each once a scan of every domain finds nothing uses it, as `boxman snapshot take` removes them:
+
+  <cache>/nixos-minimal-25.05-cecb98c4.1794013309
+  <cache>/nixos-minimal-25.05-cecb98c4.1794013314
+
+Proceed? [y/N] y
+removed <ws>/overlays/<vm>.1794013309 (196.0K)
+removed <ws>/overlays/<vm>.m1.preserve (1.0M)
+removed <ws>/overlays/<vm>.m2.preserve (4.0K)
+removed <ws>/overlays/<vm>.p2 (196.0K)
+removed <ws>/overlays/<vm>_data.1794013309 (196.0K)
+removed <ws>/overlays/<vm>_data.p2 (196.0K)
+removed <ws>/overlays/<vm>_data.t2 (196.0K)
+could not remove /mnt/mem/nixos/<vm>_snapshot_m1.raw.zst: it could not be removed (Permission denied)
+could not remove /mnt/mem/nixos/<vm>_snapshot_m2.raw: it could not be removed (Permission denied)
+removed <cache>/nixos-minimal-25.05-cecb98c4.1794013309 (200.0K)
+removed <cache>/nixos-minimal-25.05-cecb98c4.1794013314 (200.0K)
+reclaimed 2.4M (9 files)
+ERROR: could not prune 2 file(s): /mnt/mem/nixos/<vm>_snapshot_m1.raw.zst: it could not be removed (Permission denied); /mnt/mem/nixos/<vm>_snapshot_m2.raw: it could not be removed (Permission denied)
+$ echo $?
+2
+```
+
+- **The prompt.** "No input available, aborted." at the end of input, and
+  "Aborted." for anything but `y`, both exiting 0 with nothing changed.
+  `-y` skips it.
+- **Each file goes only while it is still the file listed**: it is moved
+  into a private directory beside it and unlinked there only if it is the
+  inode the listing read (`remove_if_unchanged`, as a teardown removes).
+  A file renamed over it since stays, under its name.
+- **Newest layer first.** A file that stays -- replaced since, or whose
+  removal failed -- keeps every listed file it is built on, all the way
+  down, so no image is left built on one that is gone. Directory pools on
+  the directories are refreshed afterwards.
+- **`PATH ...`**: only those files, all or nothing. A path that is not
+  `removable`, or that prune does not list, stops everything:
+  `nothing was pruned: <path>: <why>`, exit 2, under `--dry-run` too. A
+  removable file not named counts as staying, so a named one it is built
+  on is refused: `<file> (not named) is built on it`.
+- **The overlays of CD-ROM images that restores left for later removal**
+  (an overlay `<ISO stem>.<epoch>` beside the ISO, recorded in
+  `~/.config/boxman/cache/pending-iso-overlays/`) go too, without a
+  `PATH` and unless `--kind` leaves overlays out: through the very removal
+  the VM's next `snapshot take` runs, behind its checks (still the file
+  recorded, no snapshot of the VM names it, no domain uses it), on one
+  scan of every domain taken then, shared by the VMs. The prompt lists
+  them apart; one a domain uses stays on record and is said to. Prune
+  never removes a file beside an image itself, nor one such a record
+  names. A VM that has no domain any more is left to `destroy`.
+- **Exit status**: 0, also with nothing to prune. 2 when a scan fails
+  (nothing is pruned), when a `PATH` is refused, or when a removal fails:
+  after every other removal, naming each file that stayed.
+
+`--min-age 0` also counts what a snapshot command running at that moment
+may still need: the overlay a revert has just made and not yet recorded,
+or a restore's backup copy between the copy and the revert. Keep the
+default, or use `0` only while no `snapshot take`, `restore`, `delete`
+or `collapse` of those VMs runs. (A restore's backups are hard links of
+their overlays wherever the filesystem allows it, which prune keeps at
+any `--min-age`: two names, and removing one frees nothing.)
 
 ### Where it looks
 
@@ -562,9 +643,11 @@ nothing on the connection names is not seen.
 |---|---|
 | `--cluster C`, `--vms a,b` | Whose files to list, as `snapshot take` selects VMs. Files of the project's other VMs in the same directories are never listed. |
 | `--kind overlay,memory,preserve` | Which kinds to list; default all three. A file of a kind left out stays, and so does what it is built on. |
-| `--min-age AGE` | Seconds, or `30m`, `1h`, `2d`; default `1h`. |
+| `--min-age AGE` | Seconds, or `30m`, `1h`, `2d`; default `1h`. `0` only while no snapshot command of those VMs runs (above). |
 | `--all` | Also list the files a snapshot records or a domain uses, as `kept`; by default only their count is shown. |
-| `--dry-run` | List, change nothing. Required in this version. |
+| `--dry-run` | List, change nothing. |
+| `-y`, `--yes` | Skip the prompt. |
+| `PATH ...` | Remove only these files, all or nothing; the table shows only their rows. |
 
 Under the docker runtime only the cluster workdirs are scanned (the
 snapshot directories are local-runtime only); libvirt and the images are

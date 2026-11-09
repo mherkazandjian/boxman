@@ -294,26 +294,34 @@ class TestStorageDispatch:
         assert args.reverse is True
         assert args.no_graph is True
 
-    def test_snapshot_prune_help_says_it_lists_only(self, capsys):
+    def test_snapshot_prune_help_says_what_it_removes_and_how(self, capsys):
         assert _run_cli(["snapshot", "prune", "--help"]) == 0
         out = " ".join(capsys.readouterr().out.split())
-        assert "This version lists only: run it with --dry-run" in out
+        assert "This version lists only" not in out
+        assert ("Then it removes the removable ones, after a prompt that "
+                "lists them (-y skips it)") in out
+        assert "Given PATHs, only those, all or nothing." in out
+        assert "--min-age 0 also counts what a snapshot command" in out
 
     def test_snapshot_prune_dispatch(self):
         from boxman.scripts.app import _CLI_HANDLERS, parse_args
         args = parse_args().parse_args(["snapshot", "prune"])
         assert (args.handler, args.dry_run, args.kinds, args.min_age,
-                args.show_all, args.cluster, args.vms) == (
-            'snapshot_prune', False, None, 3600, False, None, "all")
+                args.show_all, args.cluster, args.vms, args.yes,
+                args.paths) == (
+            'snapshot_prune', False, None, 3600, False, None, "all", False,
+            [])
         assert 'snapshot_prune' in _CLI_HANDLERS
 
     def test_snapshot_prune_flags(self):
         from boxman.scripts.app import parse_args
         args = parse_args().parse_args([
             "snapshot", "prune", "--cluster", "c1", "--vms", "node01",
-            "--kind", "preserve", "--min-age", "0", "--all", "--dry-run"])
+            "--kind", "preserve", "--min-age", "0", "--all", "--dry-run",
+            "-y", "/ws/a.s1", "/ws/a.s2"])
         assert (args.cluster, args.vms, args.min_age, args.show_all,
-                args.dry_run) == ("c1", "node01", 0, True, True)
+                args.dry_run, args.yes, args.paths) == (
+            "c1", "node01", 0, True, True, True, ["/ws/a.s1", "/ws/a.s2"])
         assert args.kinds == ("preserve-backup", "preserve-scratch",
                               "preserve-reservation")
 
