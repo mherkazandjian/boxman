@@ -14,8 +14,10 @@ from boxman.providers.libvirt.disk import disk_path_for
 from boxman.providers.libvirt.disk_cleanup import (
     MOUNTINFO,
     FilesInUse,
+    last_scan_failure,
     memory_image_name,
     mount_points,
+    with_scan_failure,
 )
 from boxman.providers.libvirt.disk_ownership import disk_logical_name
 from boxman.providers.libvirt.pending_overlays import (
@@ -131,6 +133,8 @@ class SnapshotPruneMixin:
         domains = session.domains()
         references = session.snapshot_references()
         held = session.files_held()
+        # why G1 failed, where the in-use scan behind it did and said why
+        held_failure = last_scan_failure() if held is None else None
         vms = self._prune_vm_facts(domains, held)
         known = {name for name, _uuid in (domains or [])} | set(vms)
         dirs, excluded, failures = self._prune_dirs(
@@ -151,7 +155,8 @@ class SnapshotPruneMixin:
                     for entry in listing.entries
                     if entry.kind == MEMORY_IMAGE and entry.lstat is not None},
             domains=domains or [], mounts=mount_points(MOUNTINFO),
-            failures=failures, pending=self._pending_files(ledger))
+            failures=failures, pending=self._pending_files(ledger),
+            held_failure=held_failure)
         now = time.time()
         entries = decide(listing, vms, known, scans, now, min_age, kinds)
         # the advisory lock probe, of the overlays it would list as
@@ -361,10 +366,12 @@ class SnapshotPruneMixin:
                 reclaimed += sizes.get(layer, 0)
                 gone += 1
             if not outcome.decided:
-                problems.append(
-                    f"the overlays of the CD-ROM images of {vm}: whether a "
-                    f"snapshot names them, or a domain uses them, could not "
-                    f"be told")
+                problem = (f"the overlays of the CD-ROM images of {vm}: "
+                           f"whether a snapshot names them, or a domain uses "
+                           f"them, could not be told")
+                # the shared scan ran, and failed: it said why
+                problems.append(with_scan_failure(problem)
+                                if taken and taken[0] is None else problem)
             problems += [f"{layer}: it could not be removed"
                          for layer in outcome.failed]
         return reclaimed, gone, problems

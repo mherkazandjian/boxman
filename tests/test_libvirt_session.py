@@ -33,7 +33,12 @@ from boxman.exceptions import ConfigError
 from boxman.providers.libvirt import disk_cleanup
 from boxman.providers.libvirt.commands import LibVirtCommandBase
 from boxman.providers.libvirt.net import Network
-from boxman.providers.libvirt.session import _ABSENT, LibVirtSession
+from boxman.providers.libvirt.session import (
+    _ABSENT,
+    LibVirtSession,
+    _command_error,
+    _ScanFailedError,
+)
 from conftest import domain_listing, domain_uuid
 from fake_libvirt_host import FakeHost
 from fake_libvirt_host import Result as FakeResult
@@ -119,6 +124,15 @@ def _remove_vm_a(layout, in_use):
         identities=disk_cleanup.file_identities([a]))
     return disk_cleanup.remove_vm_storage(
         inventory, [str(layout.work)], lambda: in_use)
+
+
+def _probed(command: str) -> str:
+    """The path an absence probe asks about, run as it is or through
+    ``sudo -n sh -c`` (``LibVirtSession._source_absent``)."""
+    argv = shlex.split(command)
+    if argv[:4] == ["sudo", "-n", "sh", "-c"]:
+        argv = shlex.split(argv[4])
+    return argv[3]
 
 
 def _sudo_policy(cmd, provider: dict | None) -> None:
@@ -931,7 +945,7 @@ class TestBackingChains:
 
         def shell(command, **kwargs):
             if _ABSENT in command:
-                probed = shlex.split(command)[3]
+                probed = _probed(command)
                 return _result(stdout=_ABSENT if probed in absent else "")
             source = command.rsplit(" ", 1)[1].strip("'")
             if source not in chains:
@@ -997,7 +1011,7 @@ class TestInUseWithAMissingSource:
             if command.startswith(_SUDO_STAT):
                 return _answer_sudo_stat(command, sudo, calls)
             if _ABSENT in command:
-                probed = shlex.split(command)[3]
+                probed = _probed(command)
                 calls.append(f"probe {probed}")
                 return _result(stdout=_ABSENT if probed in absent else "")
             source = command.rsplit(" ", 1)[1].strip("'")
@@ -1260,11 +1274,12 @@ class TestInUseWithAMissingSource:
             stdout=domain_listing(args, "vm-b") if args[0] == "list"
             else "running\n")
 
-        held = _session({})._held_below(virsh, "vm-b", domain_uuid("vm-b"),
-                                        "/pool/gone.qcow2", True, {})
+        with pytest.raises(_ScanFailedError) as failed:
+            _session({})._held_below(virsh, "vm-b", domain_uuid("vm-b"),
+                                     "/pool/gone.qcow2", True, {})
 
-        assert held is None
-        assert "volume" in captured_logs.text
+        assert "volume" in str(failed.value)
+        assert "/pool/gone.qcow2" in str(failed.value)
 
 
 class TestInUseByIdentity:
@@ -1996,8 +2011,9 @@ class TestListedDomains:
 
 class TestAbsenceProbe:
     """How a source is confirmed absent (#208 review round 3, 4): through
-    the command wrapper qemu-img runs through, never with sudo, and only on
-    the probe's own positive answer."""
+    the command wrapper qemu-img runs through, as qemu-img ran -- through
+    ``sudo -n`` where it got sudo (#294) -- and only on the probe's own
+    positive answer."""
 
     def _commands(self, provider, probe_says=_ABSENT, probe_ok=True):
         seen = []
@@ -2013,11 +2029,27 @@ class TestAbsenceProbe:
             chains = _session(provider).backing_chains(["/ws/seed.iso"])
         return chains, seen
 
-    def test_it_never_adds_sudo_even_where_qemu_img_gets_it(self):
+    def test_it_runs_through_sudo_n_where_qemu_img_gets_sudo(self):
+        """A directory only root may search shows root whether the source
+        is there, and qemu-img read it as root: sudo never prompts (-n)."""
         chains, (qemu_img, probe) = self._commands({"use_sudo": True})
         assert chains == {}
         assert qemu_img.startswith("sudo qemu-img ")
-        assert not probe.startswith("sudo")
+        assert probe.startswith("sudo -n sh -c ")
+        assert _probed(probe) == "/ws/seed.iso"
+
+    @pytest.mark.parametrize("provider", [
+        {}, {"use_sudo": True, "sudo_skip_commands": ["qemu-img"]}],
+        ids=["no use_sudo", "qemu-img skips sudo"])
+    def test_it_adds_no_sudo_where_qemu_img_gets_none(self, provider):
+        chains, commands = self._commands(provider)
+        assert chains == {}
+        assert not any(command.startswith("sudo") for command in commands)
+
+    def test_a_probe_sudo_refuses_proves_nothing(self):
+        chains, _ = self._commands({"use_sudo": True}, probe_says="",
+                                   probe_ok=False)
+        assert chains is None
 
     def test_it_runs_where_qemu_img_runs(self):
         chains, commands = self._commands({
@@ -2034,6 +2066,27 @@ class TestAbsenceProbe:
     def test_anything_but_its_answer_is_not_absence(self, says, ok):
         chains, _ = self._commands({}, probe_says=says, probe_ok=ok)
         assert chains is None
+
+
+class TestCommandError:
+    """Why a command failed, as a failed in-use scan names it (#294,
+    finding 3): its last line of stderr, qemu-img's repeat dropped."""
+
+    @pytest.mark.parametrize("stderr, why", [
+        ("qemu-img: Could not open '/x/d.qcow2': Could not open "
+         "'/x/d.qcow2': Permission denied\n",
+         "Could not open '/x/d.qcow2': Permission denied"),
+        ("qemu-img: Could not open '/x/top': Could not open backing file: "
+         "Could not open '/y/base': Permission denied\n",
+         "Could not open '/x/top': Could not open backing file: Could not "
+         "open '/y/base': Permission denied"),
+        ("error: failed to get domain 'vm'\nerror: Domain not found\n\n",
+         "error: Domain not found"),
+        ("", "exit status 3"),
+    ], ids=["the file itself", "a backing file", "virsh", "nothing"])
+    def test_its_last_line_without_qemu_imgs_repeat(self, stderr, why):
+        failed = _result(ok=False, stderr=stderr, return_code=3)
+        assert _command_error(failed) == why
 
 
 @pytest.mark.skipif(shutil.which("qemu-img") is None, reason="needs qemu-img")

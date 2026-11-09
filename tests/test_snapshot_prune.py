@@ -31,7 +31,7 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from boxman.exceptions import SnapshotError
-from boxman.providers.libvirt.disk_cleanup import FilesInUse
+from boxman.providers.libvirt.disk_cleanup import FilesInUse, ScanFailure
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.providers.libvirt.snapshot import SnapshotManager
 from boxman.providers.libvirt.snapshot_prune import (
@@ -115,6 +115,7 @@ class _Box:
         self.mounts: set[str] | None = set()
         self.failures: list[str] = []
         self.pending = FilesInUse()
+        self.held_failure: ScanFailure | None = None
 
     def _make(self, name: str, data: bytes = b"data") -> str:
         path = self.wd / name
@@ -146,7 +147,7 @@ class _Box:
                       headers=headers, owners=self.owners,
                       locked=self.locked, domains=self.domains,
                       mounts=self.mounts, failures=list(self.failures),
-                      pending=self.pending)
+                      pending=self.pending, held_failure=self.held_failure)
         entries = decide(listing, self.vms, self.known, scans,
                          time.time() + later, min_age, kinds)
         self.listing, self.scans = listing, scans
@@ -560,6 +561,21 @@ class TestFailsClosed:
         entry = box.decide()[f"{VM}.s1"]
         assert entry.status == UNKNOWN
         assert why in entry.reason
+
+    def test_an_in_use_scan_that_failed_is_named(self, box):
+        """G1 failed because the in-use scan did, which said why: the
+        domain and the file are named, not just "see the warnings" (#294,
+        finding 3)."""
+        box.overlay(f"{VM}.s1")
+        box.held = None
+        box.held_failure = ScanFailure(
+            "could not read the backing chain of /u/other/d.qcow2, a disk "
+            "of domain vm-foreign (Permission denied)", "set use_sudo: true")
+        entry = box.decide()[f"{VM}.s1"]
+        assert entry.status == UNKNOWN
+        assert ("what the domains use could not be told: could not read the "
+                "backing chain of /u/other/d.qcow2, a disk of domain "
+                "vm-foreign (Permission denied)") in entry.reason
 
     def test_a_header_that_cannot_be_read_makes_everything_unknown(
             self, box):

@@ -23,10 +23,13 @@ below were captured:
   format).
 
 A command wrapped as ``docker exec --user root <container> bash -c '...'``
-or prefixed with ``sudo`` runs as root, which reads every file unless
+or prefixed with ``sudo`` (``sudo -n``, ``sudo -n sh -c '...'`` too) runs
+as root, which reads every file, and searches every directory, unless
 :attr:`FakeHost.root_reads` is off (a container root without
-``CAP_DAC_OVERRIDE``). Every command is logged, in order, in
-:attr:`FakeHost.log` as ``(identity, what, args)``.
+``CAP_DAC_OVERRIDE``). The user may not search the directories in
+:attr:`FakeHost.hidden` (another user's 0700 home): what is below one the
+user can neither read nor tell is there. Every command is logged, in order,
+in :attr:`FakeHost.log` as ``(identity, what, args)``.
 """
 
 from __future__ import annotations
@@ -92,8 +95,13 @@ class FakeHost:
         self.never_listed: set[str] = set()
         #: whether root reads every file (see the module docstring)
         self.root_reads = True
+        #: directories only root may search (see the module docstring)
+        self.hidden: set[str] = set()
         #: whether ``sudo`` is refused (a password would be needed)
         self.sudo_refused = False
+        #: the commands ``sudo`` refuses, where it runs the others (a
+        #: sudoers rule that names only those)
+        self.sudo_refuses: set[str] = set()
         #: (what, first argument) -> something to do, once, just before that
         #: command runs (what: a virsh subcommand or ``qemu-img``)
         self.before: dict[tuple[str, str], Callable[[], None]] = {}
@@ -154,10 +162,14 @@ class FakeHost:
         if command.startswith("sudo "):
             if self.sudo_refused:
                 return Result(stderr="sudo: a password is required\n", code=1)
-            command = command[len("sudo "):]
+            command = command[len("sudo "):].removeprefix("-n ")
+            if shlex.split(command)[0] in self.sudo_refuses:
+                return Result(stderr="sudo: a password is required\n", code=1)
             root = True
         who = "root" if root else "user"
         argv = shlex.split(command)
+        if argv[:2] == ["sh", "-c"]:
+            argv = shlex.split(argv[2])
         if argv[0] == "if" and "exit" in argv:
             return self._absence_probe(who, argv)
         if argv[0] == "if":
@@ -187,13 +199,20 @@ class FakeHost:
     def _reads(self, root: bool, image: Image) -> bool:
         return image.readable or (root and self.root_reads)
 
+    def _reached(self, root: bool, path: str) -> bool:
+        """Whether *path* is below no directory of :attr:`hidden`, or root
+        searches those."""
+        return (root and self.root_reads) or not any(
+            path.startswith(directory.rstrip("/") + "/")
+            for directory in self.hidden)
+
     @staticmethod
     def _echoed(argv: list[str]) -> str:
         return argv[argv.index("echo") + 1].rstrip(";")
 
     def _test(self, root: bool, operator: str, path: str) -> bool:
         """``[ <operator> <path> ]`` on this host."""
-        image = self.files.get(path)
+        image = self.files.get(path) if self._reached(root, path) else None
         if operator == "-e":
             return image is not None
         if operator == "-r":
@@ -223,18 +242,20 @@ class FakeHost:
         return Result(stdout=self._echoed(argv) + "\n" if value else "")
 
     def _absence_probe(self, who: str, argv: list[str]) -> Result:
-        """The absence probe: prints its marker when the path is not there
-        (every directory on the way searchable)."""
+        """The absence probe: prints its marker when the path is not there,
+        and it may search every directory on the way."""
         path = argv[3]
         self.log.append((who, "absence-probe", (path,)))
         return Result(stdout="" if path in self.files
+                      or not self._reached(who == "root", path)
                       else self._echoed(argv) + "\n")
 
     def _qemu_img(self, root: bool, source: str) -> Result:
         chain, path = [], source
         while path is not None:
             image = self.files.get(path)
-            why = ("No such file or directory" if image is None
+            why = ("Permission denied" if not self._reached(root, path)
+                   else "No such file or directory" if image is None
                    else "Permission denied"
                    if not self._reads(root, image) else None)
             if why:

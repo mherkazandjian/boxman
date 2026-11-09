@@ -20,6 +20,7 @@ from boxman.exceptions import SnapshotError, SnapshotRecoveryError
 
 from .cdrom import CDROMManager, media_disk_xml
 from .commands import VirshCommand
+from .disk_cleanup import with_scan_failure
 from .pending_overlays import PendingOverlays, identity_of, ledger_scope
 from .revert_locks import RevertLock, RevertLockTimeoutError, overlay_key
 from .virsh_parse import parse_domblklist
@@ -728,13 +729,17 @@ class SnapshotManager:
             except ET.ParseError:
                 snapshots = None
         if snapshots is None or held is None:
+            # with the snapshots read, the in-use scan was asked, and failed
+            failed = ("" if snapshots is None else
+                      f" ({with_scan_failure('the in-use scan failed')})")
             self.logger.warning(
                 f"{vm_name}: whether a snapshot of it names these overlays, "
-                f"or a domain uses them, cannot be told, so they are {left}")
+                f"or a domain uses them, cannot be told{failed}, so they are "
+                f"{left}")
             outcome.decided = False
             outcome.kept = dict.fromkeys(
-                present, "whether a snapshot names it, or a domain uses it, "
-                         "cannot be told")
+                present, f"whether a snapshot names it, or a domain uses it, "
+                         f"cannot be told{failed}")
             return outcome
 
         kept = outcome.kept
@@ -1712,8 +1717,11 @@ class SnapshotManager:
             identities[path] = (st.st_dev, st.st_ino)
         in_use = paths_in_use() if paths_in_use is not None else None
         if in_use is None:
-            return (f"could not check whether a domain uses "
-                    f"{', '.join(leftovers)}")
+            unchecked = (f"could not check whether a domain uses "
+                         f"{', '.join(leftovers)}")
+            # the in-use scan was asked, and failed
+            return (unchecked if paths_in_use is None
+                    else with_scan_failure(unchecked))
         recorded = recorded_in_use() if recorded_in_use is not None else None
         if recorded is None:
             return (f"could not check whether a snapshot of another domain "

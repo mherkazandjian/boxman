@@ -23,6 +23,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
@@ -822,6 +823,60 @@ class FilesInUse(dict):
         return why
 
 
+@dataclass(frozen=True)
+class ScanFailure:
+    """
+    Why a host-wide in-use scan (``LibVirtSession.disk_paths_in_use``)
+    failed closed: *problem*, what could not be read and why, naming the
+    domain and the file where there is one, and *remedy*, how to get past
+    it. The scan says it once, as a warning (:meth:`warning`), and leaves
+    it for the callers that keep files because of it to name
+    (:func:`last_scan_failure`).
+    """
+
+    problem: str
+    remedy: str
+
+    def __str__(self) -> str:
+        return self.problem
+
+    def warning(self) -> str:
+        """What the scan warns of: the problem, that every file is kept
+        because of it, and how to get past it."""
+        return (f"{self.problem}: which files other domains use cannot be "
+                f"told, so every file this command would remove is kept — "
+                f"{self.remedy}")
+
+
+#: per thread: why the last in-use scan it ran failed
+#: (:func:`last_scan_failure`)
+_scans = threading.local()
+
+
+def last_scan_failure() -> ScanFailure | None:
+    """
+    Why the last host-wide in-use scan this thread ran failed closed, or
+    ``None`` when it did not fail, or none ran. The scan still answers
+    ``None``; a caller handed that answer names this with the files it
+    keeps. Per thread, like ``errno``: a scan run in another thread leaves
+    it be.
+    """
+    return getattr(_scans, "failure", None)
+
+
+def record_scan_failure(failure: ScanFailure | None) -> None:
+    """Set what :func:`last_scan_failure` answers in this thread: the
+    in-use scan does, as it begins and when it fails."""
+    _scans.failure = failure
+
+
+def with_scan_failure(text: str) -> str:
+    """*text*, which says the in-use scan this thread just asked failed,
+    with why it did (:func:`last_scan_failure`) when that is known."""
+    failure = last_scan_failure()
+    return f"{text}: {failure}" if failure else text
+
+
 class _Identities:
     """
     Which file each path names, as ``(st_dev, st_ino)``: one file under two
@@ -1044,7 +1099,8 @@ def remove_vm_storage(
     whole (:func:`_refuse_incomplete_chains`), and an unreadable chain
     keeps everything; nothing another domain uses directly or as a backing
     file is removed (*paths_in_use* is asked once, and ``None`` keeps
-    everything); and no memory image (:func:`is_memory_image`) — with
+    everything, each file naming why: :func:`last_scan_failure`); and no
+    memory image (:func:`is_memory_image`) — with
     *overlay_dirs*, no file at all — that a snapshot of another domain
     records: neither its name nor this VM's own record makes it this VM's
     alone, as two VMs' names can give one file name (*recorded_in_use*,
@@ -1346,12 +1402,15 @@ def remove_vm_storage(
     if admission.admitted:
         in_use = paths_in_use()
         used_ids = getattr(in_use, "identities", {})
+        # each file kept says what failed the scan, as the scan named it
+        unscanned = (with_scan_failure("could not check whether another "
+                                       "domain uses it")
+                     if in_use is None else "")
         for resolved, path in list(admission.admitted.items()):
             if resolved not in admission.admitted:
                 continue     # withdrawn meanwhile, under another name
             if in_use is None:
-                admission.refuse(path, "could not check whether another "
-                                       "domain uses it")
+                admission.refuse(path, unscanned)
                 continue
             domain = in_use.get(resolved) or next(
                 (used_ids[identity]

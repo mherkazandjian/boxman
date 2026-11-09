@@ -794,6 +794,20 @@ definitions, every layer below them, and its block jobs. It reads every
 domain because one project's file can be another's base (the ISO cache, a
 shared template). A file whose use cannot be told is kept.
 
+When one domain cannot be read, the scan keeps every file the command
+would remove. It says so once, in a warning that names the domain, the file
+and the error, and the files kept and `destroy`'s error name it too:
+
+```
+WARNING: could not read the backing chain of /data/other/disk.qcow2, a disk of domain other-vm (Could not open '/data/other/disk.qcow2': Permission denied): which files other domains use cannot be told, so every file this command would remove is kept — make /data/other/disk.qcow2 readable, fix or undefine domain other-vm, or set use_sudo: true
+```
+
+This is usually another user's VM, with its disk in a directory you may not
+read. With `use_sudo: true`, `qemu-img` reads it as root. A disk that was
+deleted from such a directory is then confirmed gone through `sudo -n`, and
+holds nothing in a domain that is shut off. `destroy` keeps the storage
+pools on a workspace it keeps.
+
 On a host with many domains this scan costs a few `virsh` and `qemu-img`
 calls per domain. boxman reads up to 8 domains at once, and up to 8 disks of
 one domain, each as it would alone. It credits a file to the first domain
@@ -868,6 +882,7 @@ boxman storage optimize --dry-run
 | `compact` refuses with "vm … is running and --no-shutdown was passed" | You opted out of auto-shutdown but the VM is up | Drop `--no-shutdown`, or shut the VM down manually first |
 | `virt-sparsify not found in the runtime` | `guestfs-tools` not installed in the active runtime | Install `guestfs-tools` with `dnf` (RHEL/Rocky) or `apt` (Debian/Ubuntu); or use `--method convert`; or switch to the docker runtime which already includes it |
 | `zstd not found in runtime` (during compress / decompress) | `zstd` missing on the host or in the runtime | Install zstd; the docker runtime image already includes it |
+| `could not read the backing chain of …, a disk of domain …` (every file kept) | The in-use scan cannot read that domain's disk: usually another user's VM, with its disk in a directory you may not read | Make the file readable, fix or undefine that domain, or set `use_sudo: true` ([The in-use scan](#the-in-use-scan)) |
 | `df` shows huge `SNAPMEM` | Snapshot memory dumps not compressed | `boxman storage compress-snapshots` |
 | `df` shows huge `ALLOC` and `CHAIN > 1` | Sparse holes in overlays | `boxman storage compact` (auto picks sparsify) |
 | `df` shows huge `ALLOC` and `CHAIN = 1` and no snapshots | Allocated-but-zero clusters in the head qcow2 | `boxman storage compact --method convert-compressed` for the most aggressive shrink |

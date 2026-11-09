@@ -28,7 +28,11 @@ from boxman.exceptions import SnapshotError, SnapshotRecoveryError
 from boxman.providers.libvirt import revert_locks
 from boxman.providers.libvirt.cdrom import CDROMManager
 from boxman.providers.libvirt.commands import LibVirtCommandBase, VirshCommand
-from boxman.providers.libvirt.disk_cleanup import FilesInUse
+from boxman.providers.libvirt.disk_cleanup import (
+    FilesInUse,
+    ScanFailure,
+    record_scan_failure,
+)
 from boxman.providers.libvirt.pending_overlays import PendingOverlays
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.providers.libvirt.snapshot import SnapshotManager, _Backup
@@ -6932,6 +6936,26 @@ class TestForceClearProtectsFilesInUse:
 
         assert ok is False and rm == [] and os.path.isfile(mem)
         assert "could not check whether a domain uses" in errors
+
+    def test_a_scan_that_fails_is_named(
+            self, sm: SnapshotManager, tmp_path: Path):
+        """The scan said why it failed: the refusal names it (#294,
+        finding 3)."""
+        mem = self._touch(tmp_path / "vm01_snapshot_snapX.raw")
+        failure = ScanFailure("could not read the backing chain of "
+                              "/u/other/d.qcow2, a disk of domain vm-foreign "
+                              "(Permission denied)", "set use_sudo: true")
+
+        def scan():
+            record_scan_failure(failure)
+            return None
+
+        ok, _rm, errors = self._clear(sm, tmp_path,
+                                      MagicMock(side_effect=scan))
+
+        assert ok is False and os.path.isfile(mem)
+        assert (f"could not check whether a domain uses {mem}: {failure}"
+                in errors)
 
     def test_with_nothing_left_over_nothing_is_asked(
             self, sm: SnapshotManager, tmp_path: Path):

@@ -2607,8 +2607,10 @@ class TestASiblingGoneMidScan:
             t.deprovision()
 
         assert boot.exists()
+        # the file kept names what failed the scan (#294, finding 3)
         assert (f'left {boot} in place because could not check whether '
-                f'another domain uses it') in t.warnings
+                f'another domain uses it: domain vm-sibling was renamed '
+                f'vm-renamed while the in-use scan read it') in t.warnings
         assert 'domain vm-sibling was renamed vm-renamed' in captured_logs.text
 
 
