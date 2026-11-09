@@ -29,6 +29,7 @@ from .commands import LibVirtCommandBase, VirshCommand
 from .destroy_vm import DestroyVM, shutdown_and_wait
 from .disk import DiskManager
 from .disk_cleanup import (
+    RECORDED_KEPT,
     FilesInUse,
     ScanFailure,
     record_scan_failure,
@@ -67,6 +68,10 @@ from .virsh_parse import (
 #: what :func:`_absence_probe` prints once it has established that a path
 #: has no directory entry at all
 _ABSENT = "boxman-source-absent"
+
+#: what :func:`_absence_probe` prints once it has established that a path
+#: has one
+_PRESENT = "boxman-source-present"
 
 
 #: a domain's UUID, as ``virsh list --uuid`` prints it
@@ -183,27 +188,59 @@ def _backing_store_files(disk: ET.Element) -> tuple[list[str] | None, str]:
 
 def _absence_probe(path: str) -> str:
     """
-    The shell probe behind :meth:`LibVirtSession._source_absent`, for an
-    absolute, normalised *path*: it prints :data:`_ABSENT` only when *path*
-    has no directory entry (``-e`` follows a symlink, so ``-L`` catches a
-    dangling one) and the nearest ancestor that does exist is a directory
-    the probe can search. That directory shows the same entries to
-    everyone; one it cannot search, or one on the way that is not a
-    directory, proves nothing and prints nothing.
+    The shell probe behind :meth:`LibVirtSession._probe_source`, for an
+    absolute, normalised *path*.
+
+    It prints :data:`_PRESENT` when *path* has a directory entry: it can be
+    looked up (``-e`` follows a symlink, so ``-L`` catches a dangling one),
+    or its name is listed in its directory. It prints :data:`_ABSENT` only
+    when there is none: the nearest ancestor that can be looked up is a
+    directory the probe can search and list, and the next name on the way
+    to *path* is not in that listing. Anything else prints nothing: an
+    ancestor it cannot list, one on the way that is not a directory, a
+    listing that failed, or a directory on the way whose name is listed
+    but that cannot be looked up.
+
+    A lookup that fails does not tell "no such file" from "not allowed".
+    Root is refused a user's FUSE mount that was not mounted with
+    ``allow_root``, and anyone can be refused by an LSM or a network
+    filesystem, though the name is there. So a failed lookup proves
+    nothing; only a listing that does not hold the name does. The listing
+    is ``find``'s, matching the name literally (``\\``, ``*``, ``?`` and
+    ``[`` escaped, in the C locale). A name it prints is listed, whatever
+    else failed; a listing without it proves absence only when ``find``
+    succeeded, as it does not on a directory it cannot read, nor on an
+    entry it cannot look up (that FUSE mount).
     """
     def exists(p: str) -> str:
         return f"[ -e {shlex.quote(p)} ] || [ -L {shlex.quote(p)} ]"
 
-    steps = [f"if {exists(path)}; then exit 0; fi"]
-    ancestor = path
-    while (parent := os.path.dirname(ancestor)) != ancestor:
-        ancestor = parent
-        quoted = shlex.quote(ancestor)
+    steps = [f"if {exists(path)}; then echo {_PRESENT}; exit 0; fi"]
+    child = path
+    while (parent := os.path.dirname(child)) != child:
+        quoted = shlex.quote(parent)
+        name = re.sub(r"([\\*?\[])", r"\\\1", os.path.basename(child))
+        # a listed name that cannot be looked up: there, if it is *path*;
+        # a directory on the way, which may or may not hold it, otherwise
+        listed = f"echo {_PRESENT}" if child == path else ":"
         steps.append(
-            f"if {exists(ancestor)}; then "
-            f"if [ -d {quoted} ] && [ -x {quoted} ]; then echo {_ABSENT}; "
+            f"if {exists(parent)}; then "
+            f"if [ -d {quoted} ] && [ -x {quoted} ]; then "
+            f"found=$(LC_ALL=C find {shlex.quote(os.path.join(parent, '.'))} "
+            f"-mindepth 1 -maxdepth 1 -name {shlex.quote(name)} -print "
+            f"2>/dev/null); listing=$?; "
+            f"if [ -n \"$found\" ]; then {listed}; "
+            f"elif [ \"$listing\" -eq 0 ]; then echo {_ABSENT}; fi; "
             f"fi; exit 0; fi")
+        child = parent
     return "; ".join(steps)
+
+
+def _probe_answer(result) -> str:
+    """What an absence probe that ran told: :data:`_ABSENT`,
+    :data:`_PRESENT`, or ``""`` when it could not tell, or did not run."""
+    answer = (result.stdout or "").strip() if result.ok else ""
+    return answer if answer in (_ABSENT, _PRESENT) else ""
 
 
 def _command_error(result) -> str:
@@ -312,8 +349,7 @@ class _ChainReads:
     The scan's domains are read side by side (:mod:`.scan_pool`), all
     through one of these: the command wrappers keep no state between
     commands, and the pools' targets are read under a lock, by the first
-    thread to need them, and only once. Why a chain could not be read is
-    kept by its source (:attr:`unread`), for the scan to name.
+    thread to need them, and only once.
     """
 
     #: :attr:`_pool_targets` before the pools were first read
@@ -328,16 +364,13 @@ class _ChainReads:
         self._pool_targets: Any = self._UNREAD
         #: held while the pools' targets are read, the first time only
         self._pool_targets_read = threading.Lock()
-        #: source -> why its chain could not be read, in short
-        #: (:meth:`LibVirtSession._read_backing_chain`)
-        self.unread: dict[str, str] = {}
 
     @property
     def sudo(self) -> bool:
         """Whether ``qemu-img`` runs under ``sudo`` here (``use_sudo``, or
-        ``qemu-img`` in ``force_sudo_commands``): a source whose chain it
-        could not read is then probed for absence through ``sudo`` too
-        (:meth:`LibVirtSession._source_absent`)."""
+        ``qemu-img`` in ``force_sudo_commands``): where the user cannot tell
+        whether a source whose chain it could not read is there, it is then
+        asked through ``sudo`` (:meth:`LibVirtSession._probe_source`)."""
         return bool(self.cmd.sudo_prefix("qemu-img"))
 
     def refresh(self, pool: str, refreshed: dict[str, bool]) -> bool:
@@ -1414,15 +1447,16 @@ class LibVirtSession(SessionConfigMixin):
         with InOrder(lambda source: self._backing_chain_files(reads, source),
                      ordered, self._scan_workers()) as chains:
             for source, outcome in zip(ordered, chains, strict=True):
-                chain = outcome.result()
+                chain, why = outcome.result()
                 if chain is None:
-                    if not self._source_absent(source, sudo=reads.sudo):
+                    found, note = self._probe_source(source, sudo=reads.sudo)
+                    if found != _ABSENT:
                         # not proved absent — which a source spelled
                         # otherwise than normalised never is — so possibly
                         # there
                         self._raise_if_gone(virsh, domain, uuid)
-                        raise _ScanFailedError(
-                            self._unread_chain(reads, domain, source))
+                        raise _ScanFailedError(self._unread_chain(
+                            reads, domain, source, why, found, note))
                     held = self._held_below(virsh, domain, uuid, source,
                                             source in volumes, live)
                     for path in held:
@@ -1446,21 +1480,31 @@ class LibVirtSession(SessionConfigMixin):
         return used
 
     @staticmethod
-    def _unread_chain(reads: _ChainReads, domain: str,
-                      source: str) -> ScanFailure:
-        """Why the in-use scan fails at *source*, a disk of *domain* whose
-        backing chain could not be read and that is not confirmed absent:
-        the reason the read gave (:attr:`_ChainReads.unread`), and the ways
-        past it -- ``use_sudo`` among them where ``qemu-img`` runs without
-        it."""
-        why = reads.unread.get(source, "qemu-img could not read it")
-        remedy = (f"make {source} readable, or fix or undefine domain "
-                  f"{domain}" if reads.sudo else
-                  f"make {source} readable, fix or undefine domain {domain}, "
-                  f"or set use_sudo: true")
-        return ScanFailure(
-            f"could not read the backing chain of {source}, a disk of domain "
-            f"{domain} ({why})", remedy)
+    def _unread_chain(reads: _ChainReads, domain: str, source: str, why: str,
+                      found: str, note: str) -> ScanFailure:
+        """
+        Why the in-use scan fails at *source*, a disk of *domain* whose
+        backing chain could not be read (*why*, as the read told it), and
+        which the probe found (*found*, :meth:`_probe_source`) there, or could
+        not tell (*note*, why its run through sudo failed, if it did); and the
+        ways past it. A file that may not be there is not asked to be made
+        readable, and ``use_sudo`` is offered only where ``qemu-img`` runs
+        without it.
+        """
+        problem = (f"could not read the backing chain of {source}, a disk of "
+                   f"domain {domain} ({why})")
+        if found == _PRESENT:
+            ways = [f"make {source} readable",
+                    f"fix or undefine domain {domain}"]
+        else:
+            problem += (", and whether that file is there cannot be told"
+                        + (f" ({note})" if note else ""))
+            ways = [f"fix or undefine domain {domain}",
+                    f"make the directories on the way to {source} readable"]
+        if not reads.sudo:
+            ways.append("set use_sudo: true")
+        return ScanFailure(problem,
+                           ", ".join(ways[:-1]) + ", or " + ways[-1])
 
     def _raise_if_gone(self, virsh, domain: str, uuid: str) -> None:
         """
@@ -1644,11 +1688,9 @@ class LibVirtSession(SessionConfigMixin):
                     f"destination its live definition names no file for",
                     f"retry once the job has ended (virsh blockjob {domain} "
                     f"{dev})"))
-            chain = self._backing_chain_files(reads, destination)
+            chain, why = self._backing_chain_files(reads, destination)
             if chain is None:
                 self._raise_if_gone(virsh, domain, uuid)
-                why = reads.unread.get(destination,
-                                       "qemu-img could not read it")
                 raise _ScanFailedError(ScanFailure(
                     f"a block job on domain {domain} holds {destination} "
                     f"(disk {dev}), whose backing chain could not be read "
@@ -1795,7 +1837,7 @@ class LibVirtSession(SessionConfigMixin):
         reads = _ChainReads(self.provider_config)
         chains: dict[str, list[str]] = {}
         for source in sources:
-            images = self._read_backing_chain(reads, source)
+            images, _why = self._read_backing_chain(reads, source)
             if images is None:
                 if self._source_absent(source, sudo=reads.sudo):
                     continue
@@ -1867,58 +1909,71 @@ class LibVirtSession(SessionConfigMixin):
             f"detach {missing} from {domain}, or shut that VM down"))
 
     def _source_absent(self, path: str, sudo: bool = False) -> bool:
+        """Whether *path* positively does not exist where ``qemu-img``
+        reads it (:meth:`_probe_source`)."""
+        return self._probe_source(path, sudo=sudo)[0] == _ABSENT
+
+    def _probe_source(self, path: str, sudo: bool = False) -> tuple[str, str]:
         """
-        Whether *path* positively does not exist where ``qemu-img`` reads it.
+        Whether *path* exists where ``qemu-img`` reads it: ``(answer,
+        note)``, the answer :data:`_ABSENT`, :data:`_PRESENT`, or ``""``
+        when it cannot be told, and a note saying why the probe through
+        ``sudo`` could not run, when it could not.
 
         Asked through the same command wrapper ``qemu-img`` runs through,
         so under the docker-compose runtime it is answered inside the
         runtime container, whose mounts are not this host's — and never
         inferred from ``qemu-img``'s error text. Only a path with no
-        directory entry at all, under a directory the probe can search,
-        is absent (:func:`_absence_probe`); anything else — the path is
-        there, a directory on the way cannot be searched, the probe itself
-        fails — is not. Only an absolute, normalised path is probed, so the
-        directories checked are the ones it resolves through.
+        directory entry at all is absent (:func:`_absence_probe`): its name
+        is not in the listing of the nearest directory on its way the probe
+        can look up, search and read. Only an absolute, normalised path is
+        probed, so the directories checked are the ones it resolves
+        through.
 
-        Whoever it runs as, a directory it can search holds the same
-        entries for everyone, and one it cannot search proves nothing: who
-        it runs as decides only which directories it can search, never
-        what it finds in one. So it runs as the read before it did:
-        without ``sudo``, unless *sudo* — ``qemu-img`` ran under it
-        (:attr:`_ChainReads.sudo`) — and then through ``sudo -n``, so a
-        file deleted from a directory only root may search (another user's
-        0700 home) is told absent where root read the chain. ``-n``: sudo
-        never prompts for a password; it fails, and a probe that fails
-        proves nothing.
+        Asked as the user first, as before. Only when that cannot tell, and
+        *sudo* — ``qemu-img`` ran under it (:attr:`_ChainReads.sudo`) — it is
+        asked again through ``sudo -n``: a file deleted from a directory only
+        root may read (another user's 0700 home) is then told absent. Root
+        lists what the user lists; it may be refused what the user is not
+        (a FUSE mount), which the listing tells apart from a missing file.
+        ``-n``: sudo never prompts for a password; it fails, and a probe
+        that does not run proves nothing.
         """
         if not os.path.isabs(path) or os.path.normpath(path) != path:
-            return False
+            return "", ""
         probe = LibVirtCommandBase(override_config_use_sudo=False,
                                    provider_config=self.provider_config)
         command = _absence_probe(path)
-        if sudo:
-            command = f"sudo -n sh -c {shlex.quote(command)}"
-        result = probe.execute_shell(command, warn=True)
-        return bool(result.ok) and (result.stdout or "").strip() == _ABSENT
+        answer = _probe_answer(probe.execute_shell(command, warn=True))
+        if answer or not sudo:
+            return answer, ""
+        result = probe.execute_shell(f"sudo -n sh -c {shlex.quote(command)}",
+                                     warn=True)
+        if not result.ok:
+            return "", (f"sudo -n would not run the probe: "
+                        f"{_command_error(result)}")
+        return _probe_answer(result), ""
 
     def path_absent(self, path: str) -> bool:
         """
         Whether *path* positively does not exist where this session's
-        libvirt sees it (:meth:`_source_absent`): no directory entry, under a
-        directory the probe can search, asked through the runtime's wrapper
+        libvirt sees it (:meth:`_source_absent`): its name is not listed in
+        the directory it would be in, asked through the runtime's wrapper
         and without ``sudo``. Anything else is not absent, a path not
         absolute and normalised included. ``destroy`` retires a storage pool
         only once its target is (#277).
         """
         return self._source_absent(path)
 
-    def _read_backing_chain(self, reads: _ChainReads,
-                            source: str) -> list[dict] | None:
+    def _read_backing_chain(self, reads: _ChainReads, source: str
+                            ) -> tuple[list[dict] | None, str]:
         """
         ``qemu-img info --backing-chain`` of *source*, head first, or
         ``None`` when it cannot be read or its answer is not a non-empty
-        list of images that each name their file. ``-U`` reads images a
-        running guest holds locked.
+        list of images that each name their file; with why it is ``None``,
+        in short (``""`` otherwise): ``qemu-img``'s error, and whether
+        libvirt could not read it either. ``-U`` reads images a running
+        guest holds locked.
 
         When ``qemu-img`` ran as the user — its wrapper added no ``sudo`` —
         and could not open *source* because the user may not read it
@@ -1929,10 +1984,6 @@ class LibVirtSession(SessionConfigMixin):
         reason — the file is readable, or ``qemu-img`` ran as root through
         ``sudo`` — is not second-guessed, and neither is an answer that does
         not parse: ``None``, as before.
-
-        Why it is ``None`` is kept in ``reads.unread``, by *source*, in
-        short: ``qemu-img``'s error, and whether libvirt could not read it
-        either.
         """
         qemu_img = (f"qemu-img info --backing-chain --output=json -U "
                     f"{shlex.quote(source)}")
@@ -1942,26 +1993,26 @@ class LibVirtSession(SessionConfigMixin):
             if (not reads.cmd.sudo_prefix(qemu_img)
                     and self._source_unreadable(reads, source)):
                 chain = self._libvirt_backing_chain(reads, source)
-                if chain is None:
-                    reads.unread[source] = (f"{why}, and libvirt could not "
-                                            f"describe it either")
-                return chain
-            reads.unread[source] = why
-            return None
+                return chain, ("" if chain is not None else
+                               f"{why}, and libvirt could not describe it "
+                               f"either")
+            return None, why
+        unfollowed = "qemu-img printed no backing chain it can follow"
         try:
             chain = json.loads(result.stdout)
         except json.JSONDecodeError:
-            chain = None
+            return None, unfollowed
         if isinstance(chain, dict):
             chain = [chain]
-        if (not isinstance(chain, list) or not chain
-                or not all(isinstance(image, dict)
-                           and isinstance(image.get('filename'), str)
-                           and image['filename'] for image in chain)):
-            reads.unread[source] = ("qemu-img printed no backing chain it "
-                                    "can follow")
-            return None
-        return chain
+        if not isinstance(chain, list) or not chain:
+            return None, unfollowed
+        for image in chain:
+            if not isinstance(image, dict):
+                return None, unfollowed
+            filename = image.get('filename')
+            if not isinstance(filename, str) or not filename:
+                return None, unfollowed
+        return chain, ""
 
     def _source_unreadable(self, reads: _ChainReads, path: str) -> bool:
         """
@@ -2052,29 +2103,29 @@ class LibVirtSession(SessionConfigMixin):
                               f"{(dumped.stderr or '').strip()}")
         return image
 
-    def _backing_chain_files(self, reads: _ChainReads,
-                             source: str) -> list[str] | None:
+    def _backing_chain_files(self, reads: _ChainReads, source: str
+                             ) -> tuple[list[str] | None, str]:
         """
         *source* and every image below it — the images and the backing
         files they name — each as it was named (by the domain, ``qemu-img``
-        or libvirt), or ``None`` when the chain cannot be read (see
-        :meth:`_read_backing_chain`).
+        or libvirt), or ``None`` when the chain cannot be read; with why it
+        cannot (see :meth:`_read_backing_chain`).
 
         Not resolved here: a resolved path is only as good as the lookups on
         the way, and one the user may not make can turn it into the name of
         another file (:meth:`_identify`), so each name is kept as given and
         resolved where it is recorded.
         """
-        images = self._read_backing_chain(reads, source)
+        images, why = self._read_backing_chain(reads, source)
         if images is None:
-            return None
+            return None, why
         names = {source}
         for image in images:
             names.add(image['filename'])
             backing = image.get('full-backing-filename')
             if isinstance(backing, str) and backing:
                 names.add(backing)
-        return sorted(names)
+        return sorted(names), ""
 
     def start_vm(self, vm_name: str) -> bool:
         """
@@ -2837,11 +2888,7 @@ class LibVirtSession(SessionConfigMixin):
                 paths += [*its_overlays, *(layer for chain in chains.values()
                                            for layer in chain)]
             found = FilesInUse()
-            try:
-                self._record_in_use(found, domain, paths)
-            except _ScanFailedError as failed:
-                self.logger.warning(failed.failure.warning())
-                return None
+            self._record_in_use(found, domain, paths)
             return found
 
         recorded = FilesInUse()
@@ -2852,6 +2899,11 @@ class LibVirtSession(SessionConfigMixin):
                 except _DomainGoneError:
                     continue
                 except _DomainRenamedError:
+                    return None
+                except _ScanFailedError as failed:
+                    # said once, here, as the first domain listed decides
+                    self.logger.warning(failed.failure.warning(
+                        RECORDED_KEPT))
                     return None
                 if found is None:
                     return None
@@ -3363,7 +3415,7 @@ class LibVirtSession(SessionConfigMixin):
         read."""
         if path.endswith(".zst") or self._source_absent(path, sudo=reads.sudo):
             return []
-        return self._backing_chain_files(reads, path)
+        return self._backing_chain_files(reads, path)[0]
 
     def _record_named(self, scan: FilesInUse, who: str,
                       paths: list[str]) -> bool:

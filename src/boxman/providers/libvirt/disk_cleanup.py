@@ -823,6 +823,17 @@ class FilesInUse(dict):
         return why
 
 
+#: what a failed in-use scan keeps (``LibVirtSession.disk_paths_in_use``)
+IN_USE_KEPT = ("which files other domains use cannot be told, so every file "
+               "this command would remove is kept")
+
+#: what a failed scan of what snapshots record keeps
+#: (``LibVirtSession.snapshot_files_in_use``)
+RECORDED_KEPT = ("which files the snapshots of other domains record cannot "
+                 "be told, so every file this command would remove that a "
+                 "snapshot could record is kept")
+
+
 @dataclass(frozen=True)
 class ScanFailure:
     """
@@ -840,12 +851,10 @@ class ScanFailure:
     def __str__(self) -> str:
         return self.problem
 
-    def warning(self) -> str:
-        """What the scan warns of: the problem, that every file is kept
-        because of it, and how to get past it."""
-        return (f"{self.problem}: which files other domains use cannot be "
-                f"told, so every file this command would remove is kept — "
-                f"{self.remedy}")
+    def warning(self, kept: str = IN_USE_KEPT) -> str:
+        """What the scan warns of: the problem, what is *kept* because of
+        it, and how to get past it."""
+        return f"{self.problem}: {kept} — {self.remedy}"
 
 
 #: per thread: why the last in-use scan it ran failed

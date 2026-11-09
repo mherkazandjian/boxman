@@ -23,7 +23,11 @@ import pytest
 from boxman.exceptions import ConfigError, SnapshotError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt import snapshot_prune
-from boxman.providers.libvirt.disk_cleanup import FilesInUse
+from boxman.providers.libvirt.disk_cleanup import (
+    FilesInUse,
+    ScanFailure,
+    record_scan_failure,
+)
 from boxman.providers.libvirt.pending_overlays import PendingOverlays
 from boxman.providers.libvirt.snapshot import IsoOverlayRemoval
 from boxman.providers.libvirt.snapshot_prune import (
@@ -56,10 +60,12 @@ class _Session:
         self.locked: set[str] = set()
         self.calls: list[tuple] = []
         #: what the removal of the overlays left for later keeps, and why;
-        #: those it fails to remove; whether it can tell nothing
+        #: those it fails to remove; whether it can tell nothing, or why not
         self.drain_keeps: dict[str, str] = {}
         self.drain_fails: set[str] = set()
-        self.drain_undecided = False
+        self.drain_undecided: bool | str = False
+        #: why the in-use scan fails, when it does
+        self.scan_failure: ScanFailure | None = None
 
     def domains(self):
         self.calls.append(("domains",))
@@ -96,6 +102,9 @@ class _Session:
 
     def disk_paths_in_use(self):
         self.calls.append(("disk_paths_in_use",))
+        if self.scan_failure is not None:
+            record_scan_failure(self.scan_failure)
+            return None
         return FilesInUse(self.held)
 
     def remove_pending_iso_overlays(self, vm, scan=None, gone=False,
@@ -109,6 +118,8 @@ class _Session:
         in_use = scan() if scan is not None else None
         if self.drain_undecided:
             outcome.decided = False
+            if isinstance(self.drain_undecided, str):
+                outcome.undecided = self.drain_undecided
             outcome.kept = dict.fromkeys(only or (), "cannot be told")
             return outcome
         for layer in sorted(only or ()):
@@ -467,6 +478,25 @@ class TestTheOverlaysOfCdromImagesLeftForLater:
         project.session.drain_undecided = True
         with pytest.raises(SnapshotError, match="could not be told"):
             project.prune(dry_run=False, yes=True)
+        assert os.path.exists(overlay)
+
+    def test_one_left_undecided_is_named_with_its_own_reason(self, project):
+        """Its snapshots could not be read, while the scan failed too: the
+        VM is named with why its overlays could not be decided, not with the
+        scan's failure, which another VM's removal met (#294 review)."""
+        _iso, overlay = self._left(project)
+        project.session.scan_failure = ScanFailure(
+            "could not read the backing chain of /u/other/d.qcow2, a disk of "
+            "domain vm-foreign (Permission denied)", "set use_sudo: true")
+        project.session.drain_undecided = (
+            "whether a snapshot names them, or a domain uses them, cannot be "
+            "told")
+        with pytest.raises(SnapshotError) as raised:
+            project.prune(dry_run=False, yes=True)
+        assert (f"the overlays of the CD-ROM images of {VM}: whether a "
+                f"snapshot names them, or a domain uses them, cannot be "
+                f"told") in str(raised.value)
+        assert "vm-foreign" not in str(raised.value)
         assert os.path.exists(overlay)
 
     def test_a_vms_with_no_domain_any_more_are_left_to_destroy(

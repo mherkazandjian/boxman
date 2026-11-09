@@ -17,7 +17,6 @@ from boxman.providers.libvirt.disk_cleanup import (
     last_scan_failure,
     memory_image_name,
     mount_points,
-    with_scan_failure,
 )
 from boxman.providers.libvirt.disk_ownership import disk_logical_name
 from boxman.providers.libvirt.pending_overlays import (
@@ -366,12 +365,12 @@ class SnapshotPruneMixin:
                 reclaimed += sizes.get(layer, 0)
                 gone += 1
             if not outcome.decided:
-                problem = (f"the overlays of the CD-ROM images of {vm}: "
-                           f"whether a snapshot names them, or a domain uses "
-                           f"them, could not be told")
-                # the shared scan ran, and failed: it said why
-                problems.append(with_scan_failure(problem)
-                                if taken and taken[0] is None else problem)
+                # why this VM's were not, as the removal told it: the scan
+                # failed, or this VM's snapshots could not be read
+                problems.append(
+                    f"the overlays of the CD-ROM images of {vm}: "
+                    + (outcome.undecided or "whether a snapshot names them, "
+                       "or a domain uses them, could not be told"))
             problems += [f"{layer}: it could not be removed"
                          for layer in outcome.failed]
         return reclaimed, gone, problems

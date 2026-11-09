@@ -30,11 +30,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from boxman.exceptions import ConfigError
-from boxman.providers.libvirt import disk_cleanup
+from boxman.providers.libvirt import commands, disk_cleanup
 from boxman.providers.libvirt.commands import LibVirtCommandBase
 from boxman.providers.libvirt.net import Network
 from boxman.providers.libvirt.session import (
     _ABSENT,
+    _PRESENT,
     LibVirtSession,
     _command_error,
     _ScanFailedError,
@@ -2011,17 +2012,23 @@ class TestListedDomains:
 
 class TestAbsenceProbe:
     """How a source is confirmed absent (#208 review round 3, 4): through
-    the command wrapper qemu-img runs through, as qemu-img ran -- through
-    ``sudo -n`` where it got sudo (#294) -- and only on the probe's own
-    positive answer."""
+    the command wrapper qemu-img runs through, and only on the probe's own
+    positive answer -- as the user first, and through ``sudo -n`` only
+    where the user cannot tell and qemu-img got sudo (#294)."""
 
-    def _commands(self, provider, probe_says=_ABSENT, probe_ok=True):
+    def _commands(self, provider, user_says=_ABSENT, user_ok=True,
+                  root_says=_ABSENT, root_ok=True):
+        """Ask whether ``/ws/seed.iso``, which qemu-img cannot open, is
+        there: the probe as the user answers *user_says*, through sudo
+        *root_says*; *_ok* says whether each ran."""
         seen = []
 
         def run(command, **kwargs):
             seen.append(command)
             if _ABSENT in command:
-                return _result(stdout=probe_says, ok=probe_ok)
+                if command.startswith("sudo "):
+                    return _result(stdout=root_says, ok=root_ok)
+                return _result(stdout=user_says, ok=user_ok)
             return _result(ok=False, stderr="Could not open")
 
         with patch("boxman.providers.libvirt.commands._shell_run",
@@ -2029,26 +2036,43 @@ class TestAbsenceProbe:
             chains = _session(provider).backing_chains(["/ws/seed.iso"])
         return chains, seen
 
-    def test_it_runs_through_sudo_n_where_qemu_img_gets_sudo(self):
-        """A directory only root may search shows root whether the source
-        is there, and qemu-img read it as root: sudo never prompts (-n)."""
-        chains, (qemu_img, probe) = self._commands({"use_sudo": True})
-        assert chains == {}
+    @pytest.mark.parametrize("says, chains", [(_ABSENT, {}),
+                                              (_PRESENT, None)])
+    def test_what_the_user_can_tell_takes_no_sudo(self, says, chains):
+        """As before #294: a sudoers rule that does not allow sh changes
+        nothing where the user can tell."""
+        told, (qemu_img, probe) = self._commands({"use_sudo": True},
+                                                 user_says=says)
+        assert told == chains
         assert qemu_img.startswith("sudo qemu-img ")
-        assert probe.startswith("sudo -n sh -c ")
-        assert _probed(probe) == "/ws/seed.iso"
+        assert not probe.startswith("sudo")
+
+    def test_where_the_user_cannot_tell_it_runs_through_sudo_n(self):
+        """A directory only root may read shows root whether the source is
+        there, and qemu-img read it as root: sudo never prompts (-n)."""
+        chains, (_qemu_img, user, root) = self._commands(
+            {"use_sudo": True}, user_says="")
+        assert chains == {}
+        assert _probed(user) == "/ws/seed.iso"
+        assert root.startswith("sudo -n sh -c ")
+        assert _probed(root) == "/ws/seed.iso"
 
     @pytest.mark.parametrize("provider", [
         {}, {"use_sudo": True, "sudo_skip_commands": ["qemu-img"]}],
         ids=["no use_sudo", "qemu-img skips sudo"])
     def test_it_adds_no_sudo_where_qemu_img_gets_none(self, provider):
-        chains, commands = self._commands(provider)
-        assert chains == {}
+        chains, commands = self._commands(provider, user_says="")
+        assert chains is None
         assert not any(command.startswith("sudo") for command in commands)
 
-    def test_a_probe_sudo_refuses_proves_nothing(self):
-        chains, _ = self._commands({"use_sudo": True}, probe_says="",
-                                   probe_ok=False)
+    @pytest.mark.parametrize("says, ok", [(_ABSENT, False), ("", True),
+                                          (_PRESENT, True)],
+                             ids=["sudo refused", "root cannot tell either",
+                                  "root sees it"])
+    def test_a_probe_through_sudo_proves_only_what_it_answers(self, says, ok):
+        """A probe sudo would not run proves nothing, whatever it printed."""
+        chains, _ = self._commands({"use_sudo": True}, user_says="",
+                                   root_says=says, root_ok=ok)
         assert chains is None
 
     def test_it_runs_where_qemu_img_runs(self):
@@ -2062,10 +2086,147 @@ class TestAbsenceProbe:
             assert command.startswith("docker exec --user root rt bash -c ")
 
     @pytest.mark.parametrize("says, ok", [("", True), (_ABSENT, False),
+                                          (_PRESENT, True),
                                           ("something else", True)])
     def test_anything_but_its_answer_is_not_absence(self, says, ok):
-        chains, _ = self._commands({}, probe_says=says, probe_ok=ok)
+        chains, _ = self._commands({}, user_says=says, user_ok=ok)
         assert chains is None
+
+
+class TestTheProbeInARealShell:
+    """The absence probe, run by a real shell on names a shell would act on
+    (#294 review): it answers for the file named, whatever its name, and
+    runs nothing the name says -- as the user, and through the ``sudo -n sh
+    -c`` it is wrapped in for root (run here as the user, ``sudo -n``
+    dropped)."""
+
+    #: names of files a shell would act on; ``pw`` names what one made
+    NAMES = ["a$(touch pw1)", "a`touch pw2`", "a'$(touch pw3)'b",
+             'a"$(touch pw4)"b', "a\n$(touch pw5)\nb", "a;touch pw6;",
+             "a'; touch pw7; echo '", 'a"; touch pw8; echo "',
+             "a\\$(touch pw9)", "a|touch pw10", "a&&touch pw11", "a>pw12",
+             "-e", "-n x", "with space", "a$IFS${PATH}b",
+             # matched literally, not as patterns: each has a decoy below
+             "glob*", "a[b]", "a?c", "back\\slash"]
+
+    #: what each pattern above would match, were it not escaped
+    DECOYS = ["globfile", "ab", "abc", "backslash"]
+
+    @pytest.fixture
+    def shell(self, tmp_path, monkeypatch):
+        """Run each command in a real shell, in *tmp_path*; with
+        ``user_cannot_tell`` set, the probe as the user answers nothing, so
+        the one through sudo is asked."""
+        monkeypatch.chdir(tmp_path)
+        for decoy in self.DECOYS:
+            (tmp_path / decoy).write_bytes(b"decoy")
+        real = commands._shell_run
+        state = types.SimpleNamespace(user_cannot_tell=False, ran=[])
+
+        def run(command, **kwargs):
+            if command.startswith("sudo -n "):
+                command = command[len("sudo -n "):]
+            elif state.user_cannot_tell:
+                return _result()
+            state.ran.append(command)
+            return real(command, **kwargs)
+
+        with patch.object(commands, "_shell_run", side_effect=run):
+            yield state
+
+    @pytest.mark.parametrize("through_sudo", [False, True],
+                             ids=["as the user", "through sudo -n sh -c"])
+    def test_each_name_is_only_a_name(self, tmp_path, shell, through_sudo):
+        shell.user_cannot_tell = through_sudo
+        session = _session({"use_sudo": True})
+        for name in self.NAMES:
+            path = os.path.join(tmp_path, name)
+            assert session._probe_source(path, sudo=True) == (_ABSENT, ""), \
+                name
+            Path(path).write_bytes(b"there")
+            assert session._probe_source(path, sudo=True) == (_PRESENT, ""), \
+                name
+            os.remove(path)
+            below = os.path.join(path, "disk.qcow2")
+            assert session._probe_source(below, sudo=True)[0] == _ABSENT, \
+                name
+        assert not [f for f in os.listdir(tmp_path) if f.startswith("pw")]
+        assert any(command.startswith("sh -c ") for command in shell.ran) \
+            == through_sudo
+
+    def test_a_directory_it_cannot_read_tells_nothing(self, tmp_path, shell):
+        """Searchable, so a lookup in it fails only for a file that is not
+        there -- or one the lookup is refused (a FUSE mount): without its
+        listing, which of the two cannot be told."""
+        if os.geteuid() == 0:
+            pytest.skip("root reads every directory")
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        locked.chmod(0o111)
+        try:
+            assert _session({})._probe_source(
+                str(locked / "seed.iso")) == ("", "")
+        finally:
+            locked.chmod(0o700)
+
+
+@pytest.mark.integration
+class TestTheProbeOnARealFuseMount:
+    """Root is refused a user's FUSE mount that was not mounted with
+    ``allow_root``: looking anything up in it fails, as it does for a file
+    that is not there. The probe through sudo must not take one for the
+    other: the mount is listed in its directory, so what is in it cannot be
+    told (#294 review). A real fuse-overlayfs mount, a real ``sudo -n``;
+    skipped where either is not to be had."""
+
+    @pytest.fixture
+    def mount(self, tmp_path):
+        for tool in ("fuse-overlayfs", "fusermount"):
+            if shutil.which(tool) is None:
+                pytest.skip(f"needs {tool}")
+        if not os.path.exists("/dev/fuse"):
+            pytest.skip("needs /dev/fuse")
+        if os.geteuid() == 0:
+            pytest.skip("root mounts it, and is not refused it")
+        if subprocess.run(["sudo", "-n", "true"],
+                          capture_output=True).returncode:
+            pytest.skip("needs sudo -n")
+        lower, upper, work = (tmp_path / name
+                              for name in ("lower", "upper", "work"))
+        for directory in (lower, upper, work):
+            directory.mkdir()
+        (lower / "disk.qcow2").write_bytes(b"disk")
+        mnt = tmp_path / "home" / "remote"
+        mnt.mkdir(parents=True)
+        if subprocess.run(
+                ["fuse-overlayfs", "-o",
+                 f"lowerdir={lower},upperdir={upper},workdir={work}",
+                 str(mnt)], capture_output=True).returncode:
+            pytest.skip("could not mount fuse-overlayfs")
+        try:
+            yield mnt
+        finally:
+            subprocess.run(["fusermount", "-u", str(mnt)],
+                           capture_output=True)
+
+    def test_root_refused_the_mount_tells_nothing(self, mount):
+        real = commands._shell_run
+
+        def as_root_only(command, **kwargs):
+            # the user, who sees into the mount, is not asked
+            return real(command, **kwargs) if command.startswith(
+                "sudo ") else _result()
+
+        session = _session({"use_sudo": True})
+        with patch.object(commands, "_shell_run", side_effect=as_root_only):
+            for name in ("disk.qcow2", "gone.qcow2"):
+                assert session._probe_source(
+                    str(mount / name), sudo=True) == ("", ""), name
+            # beside the mount: root cannot list its directory whole
+            assert session._probe_source(
+                str(mount.parent / "gone.qcow2"), sudo=True) == ("", "")
+        assert session._probe_source(str(mount / "disk.qcow2"),
+                                     sudo=True) == (_PRESENT, "")
 
 
 class TestCommandError:

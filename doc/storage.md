@@ -799,14 +799,20 @@ would remove. It says so once, in a warning that names the domain, the file
 and the error, and the files kept and `destroy`'s error name it too:
 
 ```
-WARNING: could not read the backing chain of /data/other/disk.qcow2, a disk of domain other-vm (Could not open '/data/other/disk.qcow2': Permission denied): which files other domains use cannot be told, so every file this command would remove is kept — make /data/other/disk.qcow2 readable, fix or undefine domain other-vm, or set use_sudo: true
+WARNING: could not read the backing chain of /data/other/disk.qcow2, a disk of domain other-vm (Could not open '/data/other/disk.qcow2': Permission denied), and whether that file is there cannot be told: which files other domains use cannot be told, so every file this command would remove is kept — fix or undefine domain other-vm, make the directories on the way to /data/other/disk.qcow2 readable, or set use_sudo: true
 ```
 
 This is usually another user's VM, with its disk in a directory you may not
-read. With `use_sudo: true`, `qemu-img` reads it as root. A disk that was
-deleted from such a directory is then confirmed gone through `sudo -n`, and
-holds nothing in a domain that is shut off. `destroy` keeps the storage
-pools on a workspace it keeps.
+read. With `use_sudo: true`, `qemu-img` reads it as root. Where you cannot
+tell whether a disk is still there, boxman then asks again through
+`sudo -n sh -c`, which needs a sudo rule that lets `sh` run without a
+password; without one, the warning says sudo would not run it. A disk
+deleted from such a directory is then confirmed gone, and holds nothing in
+a domain that is shut off. A file counts as gone only when its name is
+missing from its directory's listing, never because looking it up failed:
+root is refused a user's FUSE mount that was not mounted with `allow_root`,
+and the files in one are kept. `destroy` keeps the storage pools on a
+workspace it keeps.
 
 On a host with many domains this scan costs a few `virsh` and `qemu-img`
 calls per domain. boxman reads up to 8 domains at once, and up to 8 disks of
