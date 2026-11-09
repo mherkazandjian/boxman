@@ -31,7 +31,12 @@ import pytest
 import fake_libvirt_pools
 from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
-from boxman.providers.libvirt.disk_cleanup import FilesInUse, StorageOutcome
+from boxman.providers.libvirt.disk_cleanup import (
+    FilesInUse,
+    ScanFailure,
+    StorageOutcome,
+    record_scan_failure,
+)
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.utils import retained_tree
 from fake_libvirt_pools import FakePools
@@ -1352,6 +1357,29 @@ class TestDestroySparesFilesInUse:
         mgr._retire_stale_teardown_locators.assert_not_called()
         mgr.unregister_from_cache.assert_not_called()
 
+    def test_a_scan_that_failed_is_named_in_the_error(self, tmp_path):
+        """The scan said why it failed -- which domain, which file -- and
+        the error names it, rather than pointing at warnings that may not
+        be there (#294, finding 3)."""
+        mgr, _workspace = self._manager(tmp_path)
+        failure = ScanFailure("could not read the backing chain of "
+                              "/u/other/d.qcow2, a disk of domain vm-foreign "
+                              "(Permission denied)", "set use_sudo: true")
+
+        def scan():
+            record_scan_failure(failure)
+            return None
+
+        mgr.provider.disk_paths_in_use.side_effect = scan
+
+        with pytest.raises(ProvisionError) as raised:
+            mgr.destroy(ARGS)
+
+        assert str(raised.value) == (
+            f"destroy did not complete — could not tell which files in the "
+            f"workspace other domains use, so none of it was removed: "
+            f"{failure}")
+
     @unless_root
     def test_a_directory_that_cannot_be_listed_keeps_everything(
             self, tmp_path):
@@ -1572,6 +1600,23 @@ class TestDestroyRetiresPools:
         assert self.virsh.retired() == []
         assert self.virsh.verbs("list") == []     # nothing left to ask
         mgr.unregister_from_cache.assert_called_once()
+
+    def test_a_scan_that_fails_keeps_every_pool_and_says_so(self, tmp_path):
+        """The workspace is kept whole, so the pools on it are too, and the
+        error says so (#294, finding 3)."""
+        mgr, workspace = self._manager(tmp_path)
+        self.virsh.define("cluster_1", str(workspace / "cluster_1"))
+        mgr.provider.disk_paths_in_use.return_value = None
+
+        with pytest.raises(ProvisionError, match="destroy did not complete"):
+            mgr.destroy(ARGS)
+
+        assert (workspace / "cluster_1" / "vm.qcow2").exists()
+        assert self.virsh.retired() == []
+        errors = " ".join(str(c.args[0])
+                          for c in mgr.logger.error.call_args_list)
+        assert ("keeping the workspace, template dirs, the libvirt storage "
+                "pools on them, generated files") in errors
 
     @pytest.mark.parametrize("kept", [False, True])
     def test_a_workspace_that_is_the_cluster_workdir(self, tmp_path, kept):

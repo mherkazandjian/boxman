@@ -17,6 +17,7 @@ from boxman.exceptions import (
     SSHAccessError,
 )
 from boxman.providers.libvirt.commands import VirshCommand
+from boxman.providers.libvirt.disk_cleanup import last_scan_failure
 from boxman.providers.libvirt.storage_pools import (
     Pool,
     domain_pool_refs,
@@ -1147,7 +1148,12 @@ class FlowsMixin:
         for session in sessions.values():
             found = session.disk_paths_in_use()
             if found is None:
+                # the scan said why, and leaves it to be named here
+                failure = last_scan_failure()
                 raise ProvisionError(
+                    f"could not tell which files in the workspace other "
+                    f"domains use, so none of it was removed: {failure}"
+                    if failure else
                     "could not tell which files in the workspace other "
                     "domains use (the in-use scan failed; see the warnings "
                     "above), so none of it was removed")
@@ -1289,9 +1295,11 @@ class FlowsMixin:
         workspace workdir — all but the files another domain still uses,
         directly or as a backing file, which the host-wide in-use scan finds
         once the project's VMs are gone and which stay, named in a warning;
-        a scan that cannot complete keeps the whole workspace and fails the
-        command like an incomplete teardown (#221). Optionally also removes
-        template workdirs when ``--templates`` is passed (not scanned). The
+        a scan that cannot complete keeps the whole workspace, and the
+        storage pools on it, and fails the command like an incomplete
+        teardown, naming the domain and the file that failed it (#221).
+        Optionally also removes template workdirs when ``--templates`` is
+        passed (not scanned). The
         libvirt storage pools on what it removed go too, once their
         directories are confirmed gone (#277). Prompts for confirmation
         unless ``--auto-accept`` is set.
@@ -1547,10 +1555,14 @@ class FlowsMixin:
 
         if not teardown_ok:
             summary = " | ".join(problems)
+            # a kept directory keeps the pool on it (6c), which the in-use
+            # scan reads root-owned files through (#221)
+            pools_kept = (", the libvirt storage pools on them"
+                          if retires_pools else "")
             self.logger.error(
-                "keeping the workspace, template dirs, generated files, "
-                "runtime state and the cache entry so the surviving "
-                "resources stay visible and the teardown can be retried")
+                f"keeping the workspace, template dirs{pools_kept}, generated "
+                f"files, runtime state and the cache entry so the surviving "
+                f"resources stay visible and the teardown can be retried")
             raise ProvisionError(f"destroy did not complete — {summary}")
 
         # 3. tear down the docker runtime (reuses _force_rmtree for the

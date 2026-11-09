@@ -38,7 +38,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from boxman.manager import BoxmanManager
-from boxman.providers.libvirt import revert_locks
+from boxman.providers.libvirt import disk_cleanup, revert_locks
 
 # ---------------------------------------------------------------------------
 # Captured logs — attach caplog to boxman's module-level singleton
@@ -108,6 +108,17 @@ def _revert_locks_on_a_clock_of_their_own(
 
     monkeypatch.setattr(revert_locks, "_now", lambda: now[0])
     monkeypatch.setattr(revert_locks, "_wait", wait)
+
+
+@pytest.fixture(autouse=True)
+def _no_scan_failure_from_another_test() -> None:
+    """
+    Start each test with no in-use scan failure on record in its thread
+    (``disk_cleanup.last_scan_failure``): one a previous test's scan left
+    there would be named by a caller this test hands a failed scan of its
+    own making.
+    """
+    disk_cleanup.record_scan_failure(None)
 
 
 # ---------------------------------------------------------------------------

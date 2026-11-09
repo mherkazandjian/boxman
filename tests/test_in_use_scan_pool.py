@@ -12,6 +12,7 @@ one the listing order gives.
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import threading
@@ -21,6 +22,7 @@ from unittest.mock import patch
 import pytest
 
 from boxman.providers.libvirt import scan_pool
+from boxman.providers.libvirt.disk_cleanup import last_scan_failure
 from boxman.providers.libvirt.scan_pool import InOrder, OnceEach
 from boxman.providers.libvirt.session import LibVirtSession, _ChainReads
 from conftest import domain_listing, domain_uuid
@@ -339,6 +341,289 @@ class TestADomainGoneOrRenamedMidScan:
             lambda: (host.rename("vm-b", "vm-x"), host.fail.add(
                 "snapshot-list")))
         assert _scan(host, method="memory_images_recorded") is None
+
+
+class TestAFailedScanSaysWhy:
+    """A scan that fails closed says why once, as a warning, whichever of
+    its threads read what failed it: which domain, which file, why (the
+    failing command's error), that every file is kept, and how to get past
+    it; and it leaves that for the callers that keep files to name (#294,
+    finding 3; #219). A source it could not read is probed for absence as
+    qemu-img ran: through ``sudo -n`` where qemu-img got sudo."""
+
+    #: another user's 0700 home: only root may search it
+    HOME = "/u/other"
+
+    def _host(self, *foreign: str, there: bool = True) -> Host:
+        """vm-a, whose disk anyone reads, and each of *foreign*, a shut-off
+        domain whose disk is in :attr:`HOME` -- unless not *there*: it was
+        deleted, and the domain still names it."""
+        host = _host(("vm-a", ["/ws/a.qcow2"]))
+        host.hidden.add(self.HOME)
+        for name in foreign:
+            disk = self._disk(name)
+            if there:
+                host.add(disk, readable=True)
+            host.define_domain(name, ("file", "disk", "vda", disk))
+        return host
+
+    def _disk(self, domain: str) -> str:
+        return f"{self.HOME}/vms/{domain}.qcow2"
+
+    @staticmethod
+    def _scan(host: Host, provider: dict | None = None):
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=host.run):
+            return LibVirtSession(config={"provider": {
+                "libvirt": provider or {}}}).disk_paths_in_use()
+
+    @staticmethod
+    def _warnings(captured_logs) -> list[str]:
+        return [record.getMessage() for record in captured_logs.records
+                if record.levelno == logging.WARNING]
+
+    def test_an_unreadable_disk_is_named_with_its_domain_and_why(
+            self, captured_logs):
+        """No sudo: qemu-img cannot look in the home, and neither can the
+        absence probe, so the disk may be there: the scan fails on it."""
+        host = self._host("vm-foreign")
+        disk = self._disk("vm-foreign")
+
+        assert self._scan(host) is None
+
+        (warning,) = self._warnings(captured_logs)
+        assert (f"could not read the backing chain of {disk}, a disk of "
+                f"domain vm-foreign (Could not open '{disk}': Permission "
+                f"denied), and whether that file is there cannot be told"
+                ) in warning
+        assert "every file this command would remove is kept" in warning
+        # it may not be there: it is not asked to be made readable
+        assert warning.endswith(
+            f"— fix or undefine domain vm-foreign, make the directories on "
+            f"the way to {disk} readable, or set use_sudo: true")
+        assert str(last_scan_failure()) in warning
+
+    def test_a_file_the_user_sees_is_asked_to_be_made_readable(
+            self, captured_logs):
+        """The user sees the file and qemu-img, as root, may not read it --
+        a FUSE mount of the user's, without allow_root: there, and not to
+        be taken for absent by anyone."""
+        host = _host(("vm-a", ["/ws/a.qcow2"]))
+        disk = host.add("/u/me/remote/disk.qcow2", readable=True)
+        host.fuse.add("/u/me/remote")
+        host.define_domain("vm-fuse", ("file", "disk", "vda", disk))
+
+        assert self._scan(host, {"use_sudo": True}) is None
+
+        assert host.identities("absence-probe") == {"user"}
+        (warning,) = self._warnings(captured_logs)
+        assert (f"a disk of domain vm-fuse (Could not open '{disk}': "
+                f"Permission denied):") in warning
+        assert warning.endswith(f"— make {disk} readable, or fix or undefine "
+                                f"domain vm-fuse")
+
+    def test_it_warns_once_however_many_reads_fail(self, captured_logs):
+        """Three domains fail, read side by side, the last listed first:
+        the first listed is named, once, as one after another named it."""
+        host = self._host("vm-f1", "vm-f2", "vm-f3")
+        overlap = _Overlap(host, "vm-f1", then="vm-f3")
+
+        assert self._scan(host) is None
+
+        assert overlap.overlapped, "vm-f3 was not read alongside vm-f1"
+        assert (self._disk("vm-f3"),) in host.asked("qemu-img")
+        (warning,) = self._warnings(captured_logs)
+        assert "domain vm-f1" in warning
+        assert "vm-f2" not in warning and "vm-f3" not in warning
+
+    def test_with_use_sudo_a_deleted_disk_in_the_home_is_absent(self):
+        """qemu-img ran as root and found no file; the user cannot list the
+        home, root can, and does not find it there; a shut-off domain holds
+        nothing of a disk that is gone (#294)."""
+        host = self._host("vm-foreign", there=False)
+
+        in_use = self._scan(host, {"use_sudo": True})
+
+        assert in_use == {"/ws/a.qcow2": "vm-a"}
+        assert [(who, args) for who, what, args in host.log
+                if what == "absence-probe"] == [
+            ("user", (self._disk("vm-foreign"),)),
+            ("root", (self._disk("vm-foreign"),))]
+        assert last_scan_failure() is None
+
+    def test_a_disk_in_a_mount_root_is_refused_is_never_absent(
+            self, captured_logs):
+        """Another user's home holds their FUSE mount, without allow_root:
+        root is refused the mount, and the user the home. A lookup that
+        fails is no missing file: the mount is listed in the home, so what
+        is in it cannot be told, and the scan fails (#294 review)."""
+        host = self._host()
+        host.fuse.add(f"{self.HOME}/remote")
+        disk = host.add(f"{self.HOME}/remote/disk.qcow2", readable=True)
+        host.define_domain("vm-fuse", ("file", "disk", "vda", disk))
+
+        assert self._scan(host, {"use_sudo": True}) is None
+
+        assert host.identities("absence-probe") == {"user", "root"}
+        (warning,) = self._warnings(captured_logs)
+        assert (f"{disk}, a disk of domain vm-fuse (Could not open '{disk}': "
+                f"Permission denied), and whether that file is there cannot "
+                f"be told") in warning
+
+    def test_a_deleted_disk_in_a_pool_the_user_only_searches_is_absent(
+            self):
+        """A pool directory the user may search and not list (0711, as
+        /var/lib/libvirt/images often is): not listed, a lookup of the disk
+        fails with ENOENT, and that is absence -- without sudo, as before
+        #294 (review round 2)."""
+        host = _host(("vm-a", ["/ws/a.qcow2"]))
+        host.unlisted.add("/pool")
+        host.add("/pool/kept.qcow2", readable=True)
+        host.define_domain("vm-gone", ("file", "disk", "vda",
+                                       "/pool/gone.qcow2"))
+
+        assert self._scan(host) == {"/ws/a.qcow2": "vm-a"}
+        assert host.identities("absence-probe") == {"user"}
+
+    def test_a_mount_refused_in_such_a_directory_is_never_absent(
+            self, captured_logs):
+        """Another user's FUSE mount in a directory the user only searches:
+        looking into it is refused -- EACCES, not ENOENT -- so what is in it
+        cannot be told, and the scan fails."""
+        host = _host(("vm-a", ["/ws/a.qcow2"]))
+        host.unlisted.add("/u/other")
+        host.refused.add("/u/other/remote")
+        disk = host.add("/u/other/remote/disk.qcow2", readable=True)
+        host.define_domain("vm-fuse", ("file", "disk", "vda", disk))
+
+        assert self._scan(host) is None
+
+        (warning,) = self._warnings(captured_logs)
+        assert (f"a disk of domain vm-fuse (Could not open '{disk}': "
+                f"Permission denied), and whether that file is there cannot "
+                f"be told") in warning
+
+    def test_one_the_user_can_tell_is_gone_needs_no_sudo(self):
+        """A deleted seed ISO in a directory the user lists: told absent as
+        before, where sudoers names qemu-img and virsh but not sh (#294
+        review)."""
+        host = _host(("vm-a", ["/ws/a.qcow2"]))
+        host.define_domain("vm-iso", ("file", "cdrom", "sda", "/ws/seed.iso"))
+        host.sudo_refuses.add("sh")
+
+        in_use = self._scan(host, {"use_sudo": True})
+
+        assert in_use == {"/ws/a.qcow2": "vm-a"}
+        assert host.identities("absence-probe") == {"user"}
+        assert not any(command.startswith("sudo -n sh")
+                       for command in host.commands)
+
+    def test_without_use_sudo_it_cannot_be_told_and_is_named(
+            self, captured_logs):
+        host = self._host("vm-foreign", there=False)
+
+        assert self._scan(host) is None
+
+        assert host.identities("absence-probe") == {"user"}
+        (warning,) = self._warnings(captured_logs)
+        assert f"{self._disk('vm-foreign')}, a disk of domain vm-foreign" \
+            in warning
+
+    def test_a_probe_sudo_refuses_proves_nothing(self, captured_logs):
+        """A sudoers rule that lets qemu-img run as root, and not sh, and a
+        user who cannot tell: sudo -n refuses the probe rather than prompt,
+        a probe that does not run proves nothing, and the scan fails --
+        saying sudo refused it, not asking for a file that may be gone to
+        be made readable, and not offering use_sudo, already on."""
+        host = self._host("vm-foreign", there=False)
+        host.sudo_refuses.add("sh")
+        disk = self._disk("vm-foreign")
+
+        assert self._scan(host, {"use_sudo": True}) is None
+
+        assert any(command.startswith("sudo -n sh -c ")
+                   for command in host.commands)
+        (warning,) = self._warnings(captured_logs)
+        assert (f"a disk of domain vm-foreign (Could not open '{disk}': No "
+                f"such file or directory), and whether that file is there "
+                f"cannot be told (sudo -n would not run the probe: sudo: a "
+                f"password is required)") in warning
+        assert warning.endswith(
+            f"— fix or undefine domain vm-foreign, or make the directories "
+            f"on the way to {disk} readable")
+
+    def test_a_scan_that_passes_leaves_no_failure_on_record(self):
+        assert self._scan(self._host("vm-foreign")) is None
+        assert last_scan_failure() is not None
+
+        assert self._scan(self._host("vm-foreign"), {"use_sudo": True}) == {
+            "/ws/a.qcow2": "vm-a",
+            self._disk("vm-foreign"): "vm-foreign"}
+        assert last_scan_failure() is None
+
+    def test_a_failed_domain_list_is_named_too(self, captured_logs):
+        host = self._host()
+        host.fail.add("list")
+
+        assert self._scan(host) is None
+
+        (warning,) = self._warnings(captured_logs)
+        assert "could not read the domain list (virsh list: error: list " \
+            "failed)" in warning
+
+    def test_a_domain_whose_disks_cannot_be_listed_is_named(
+            self, captured_logs):
+        host = self._host()
+        host.fail.add("domblklist")
+
+        assert self._scan(host) is None
+
+        (warning,) = self._warnings(captured_logs)
+        assert ("could not list the disks of domain vm-a (virsh domblklist: "
+                "error: domblklist failed)") in warning
+        assert warning.endswith("— fix or undefine domain vm-a")
+
+    def test_files_in_use_hands_the_failure_on(self, tmp_path):
+        """``files_in_use`` answers None, as before, and the failure is on
+        record for the caller that keeps the files to name."""
+        host = self._host("vm-foreign")
+
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=host.run):
+            assert _session().files_in_use([str(tmp_path / "x")]) is None
+
+        assert "domain vm-foreign" in str(last_scan_failure())
+
+
+class TestASnapshotScanThatFails:
+    """What the snapshots of every domain record: one that fails says so
+    once, whichever of its threads met it, and says what that keeps -- the
+    files a snapshot could record, not every file (#294 review)."""
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")
+    def test_it_warns_once_saying_what_it_keeps(self, tmp_path,
+                                                captured_logs):
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        host = _host(("vm-a", ["/ws/a.qcow2"]), ("vm-b", ["/ws/b.qcow2"]))
+        host.snapshots = {
+            name: {"s1": _snapshot_xml("s1", str(locked / f"{name}.raw"))}
+            for name in ("vm-a", "vm-b")}
+        overlap = _Overlap(host, host.uuid("vm-a"), then=host.uuid("vm-b"),
+                           command="snapshot-list")
+        locked.chmod(0)
+        try:
+            assert _scan(host, method="memory_images_recorded") is None
+        finally:
+            locked.chmod(0o700)
+
+        assert overlap.overlapped
+        warnings = [record.getMessage() for record in captured_logs.records
+                    if record.levelno == logging.WARNING]
+        (warning,) = warnings
+        assert f"could not read the identity of {locked}/vm-a.raw" in warning
+        assert ("every file this command would remove that a snapshot could "
+                "record is kept") in warning
 
 
 class TestSnapshotScansInListingOrder:

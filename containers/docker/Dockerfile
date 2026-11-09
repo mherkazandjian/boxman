@@ -27,6 +27,7 @@ RUN dnf install -y epel-release && \
         rsync \
         guestfs-tools \
         zstd \
+        findutils \
     && dnf clean all
 
 # Rocky 9.6's qemu-kvm only ships /usr/libexec/qemu-kvm — the

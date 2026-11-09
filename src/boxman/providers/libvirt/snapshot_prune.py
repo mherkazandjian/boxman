@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from xml.etree import ElementTree as ET
 
-from .disk_cleanup import FilesInUse, remove_if_unchanged
+from .disk_cleanup import FilesInUse, ScanFailure, remove_if_unchanged
 from .snapshot import SnapshotManager
 
 REMOVABLE = "removable"
@@ -240,6 +240,9 @@ class Scans:
     #: (``pending_overlays``), by path and by identity: never prune's to
     #: remove, but the take's, the teardown's, or prune's drain of them
     pending: FilesInUse = field(default_factory=FilesInUse)
+    #: why G1 failed, when the in-use scan behind it failed and said why
+    #: (``disk_cleanup.last_scan_failure``)
+    held_failure: ScanFailure | None = None
 
 
 def owner_of(name: str, vms: dict[str, VmFacts],
@@ -658,8 +661,11 @@ def scan_failures(listing: Listing, scans: Scans) -> list[str]:
     failures += [f"{path} could not be listed ({why})"
                  for path, why in sorted(listing.unreadable.items())]
     if scans.held is None:
-        failures.append("what the domains use could not be told (see the "
-                        "warnings above)")
+        failures.append(
+            f"what the domains use could not be told: {scans.held_failure}"
+            if scans.held_failure else
+            "what the domains use could not be told (see the warnings "
+            "above)")
     if scans.references is None:
         failures.append("what the snapshots of every domain name could not "
                         "be told (see the warnings above)")
