@@ -28,17 +28,20 @@ as root, which reads every file, and searches every directory, unless
 :attr:`FakeHost.root_reads` is off (a container root without
 ``CAP_DAC_OVERRIDE``). The user may not search the directories in
 :attr:`FakeHost.hidden` (another user's 0700 home): what is below one the
-user can neither read nor tell is there. Root may not look into the mounts
-in :attr:`FakeHost.fuse` (the user's FUSE mounts, without ``allow_root``):
-it is refused the mount point and everything below it, though the mount
-point's name is listed in the directory above, as a real one is. Every
-command is logged, in order, in :attr:`FakeHost.log` as
-``(identity, what, args)``.
+user can neither read nor tell is there. The user may search, and not
+list, those in :attr:`FakeHost.unlisted` (mode 0711). Root may not look
+into the mounts in :attr:`FakeHost.fuse` (the user's FUSE mounts, without
+``allow_root``), and neither may the user into those in
+:attr:`FakeHost.refused` (another user's): each is refused the mount point
+and everything below it -- EACCES, not ENOENT -- though the mount point's
+name is listed in the directory above, as a real one is. Every command is
+logged, in order, in :attr:`FakeHost.log` as ``(identity, what, args)``.
 
 The absence probe is answered as the real one decides
 (``session._absence_probe``): present when the path can be looked up, or
 its name is listed; absent only when the nearest ancestor that can be
-looked up can be listed, and the next name on the way is not in it.
+looked up can be listed, and the next name on the way is not in it -- or
+can only be searched, and looking that name up is not refused.
 """
 
 from __future__ import annotations
@@ -109,6 +112,10 @@ class FakeHost:
         self.hidden: set[str] = set()
         #: FUSE mounts root may not look into (see the module docstring)
         self.fuse: set[str] = set()
+        #: FUSE mounts neither the user nor root may look into
+        self.refused: set[str] = set()
+        #: directories the user may search but not list (0711)
+        self.unlisted: set[str] = set()
         #: whether ``sudo`` is refused (a password would be needed)
         self.sudo_refused = False
         #: the commands ``sudo`` refuses, where it runs the others (a
@@ -218,9 +225,9 @@ class FakeHost:
     def _reached(self, root: bool, path: str) -> bool:
         """Whether *path* can be looked up: the user, below no directory of
         :attr:`hidden`; root, unless :attr:`root_reads` is off, everywhere
-        but in a mount of :attr:`fuse`."""
-        if root and any(path == mount or self._below(path, mount)
-                        for mount in self.fuse):
+        but in a mount of :attr:`fuse`; neither, in one of :attr:`refused`."""
+        if any(path == mount or self._below(path, mount)
+               for mount in self.refused | (self.fuse if root else set())):
             return False
         return (root and self.root_reads) or not any(
             self._below(path, directory) for directory in self.hidden)
@@ -228,10 +235,11 @@ class FakeHost:
     def _names(self) -> set[str]:
         """Every path this host knows of: its files, and the directories
         it was told of."""
-        return set(self.files) | self.hidden | self.fuse
+        return (set(self.files) | self.hidden | self.fuse | self.refused
+                | self.unlisted)
 
     def _is_dir(self, path: str) -> bool:
-        return (path == "/" or path in self.hidden or path in self.fuse
+        return (path == "/" or path in self._names() - set(self.files)
                 or any(self._below(name, path) for name in self._names()))
 
     def _entries(self, directory: str) -> set[str]:
@@ -288,7 +296,12 @@ class FakeHost:
         while (parent := os.path.dirname(child)) != child:
             if self._reached(root, parent) and self._is_dir(parent):
                 if not (root and self.root_reads) and parent in self.hidden:
-                    return Result()       # it may not list it
+                    return Result()       # it may not search it
+                if not (root and self.root_reads) and parent in self.unlisted:
+                    # searched, not listed: only ENOENT tells
+                    there = child in self.files or self._is_dir(child)
+                    return Result(stdout="" if there or not self._reached(
+                        root, child) else f"{_ABSENT}\n")
                 entries = self._entries(parent)
                 if os.path.basename(child) in entries:
                     return Result(stdout=f"{_PRESENT}\n" if child == path

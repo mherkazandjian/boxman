@@ -470,6 +470,39 @@ class TestAFailedScanSaysWhy:
                 f"Permission denied), and whether that file is there cannot "
                 f"be told") in warning
 
+    def test_a_deleted_disk_in_a_pool_the_user_only_searches_is_absent(
+            self):
+        """A pool directory the user may search and not list (0711, as
+        /var/lib/libvirt/images often is): not listed, a lookup of the disk
+        fails with ENOENT, and that is absence -- without sudo, as before
+        #294 (review round 2)."""
+        host = _host(("vm-a", ["/ws/a.qcow2"]))
+        host.unlisted.add("/pool")
+        host.add("/pool/kept.qcow2", readable=True)
+        host.define_domain("vm-gone", ("file", "disk", "vda",
+                                       "/pool/gone.qcow2"))
+
+        assert self._scan(host) == {"/ws/a.qcow2": "vm-a"}
+        assert host.identities("absence-probe") == {"user"}
+
+    def test_a_mount_refused_in_such_a_directory_is_never_absent(
+            self, captured_logs):
+        """Another user's FUSE mount in a directory the user only searches:
+        looking into it is refused -- EACCES, not ENOENT -- so what is in it
+        cannot be told, and the scan fails."""
+        host = _host(("vm-a", ["/ws/a.qcow2"]))
+        host.unlisted.add("/u/other")
+        host.refused.add("/u/other/remote")
+        disk = host.add("/u/other/remote/disk.qcow2", readable=True)
+        host.define_domain("vm-fuse", ("file", "disk", "vda", disk))
+
+        assert self._scan(host) is None
+
+        (warning,) = self._warnings(captured_logs)
+        assert (f"a disk of domain vm-fuse (Could not open '{disk}': "
+                f"Permission denied), and whether that file is there cannot "
+                f"be told") in warning
+
     def test_one_the_user_can_tell_is_gone_needs_no_sudo(self):
         """A deleted seed ISO in a directory the user lists: told absent as
         before, where sudoers names qemu-img and virsh but not sh (#294

@@ -809,10 +809,11 @@ tell whether a disk is still there, boxman then asks again through
 password; without one, the warning says sudo would not run it. A disk
 deleted from such a directory is then confirmed gone, and holds nothing in
 a domain that is shut off. A file counts as gone only when its name is
-missing from its directory's listing, never because looking it up failed:
-root is refused a user's FUSE mount that was not mounted with `allow_root`,
-and the files in one are kept. `destroy` keeps the storage pools on a
-workspace it keeps.
+missing from its directory's listing, or, in a directory that can be
+searched but not read (a 0711 pool directory), when looking it up finds no
+such file. A lookup that is refused proves nothing: root is refused a
+user's FUSE mount that was not mounted with `allow_root`, and the files in
+one are kept. `destroy` keeps the storage pools on a workspace it keeps.
 
 On a host with many domains this scan costs a few `virsh` and `qemu-img`
 calls per domain. boxman reads up to 8 domains at once, and up to 8 disks of

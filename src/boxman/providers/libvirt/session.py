@@ -194,23 +194,25 @@ def _absence_probe(path: str) -> str:
     It prints :data:`_PRESENT` when *path* has a directory entry: it can be
     looked up (``-e`` follows a symlink, so ``-L`` catches a dangling one),
     or its name is listed in its directory. It prints :data:`_ABSENT` only
-    when there is none: the nearest ancestor that can be looked up is a
-    directory the probe can search and list, and the next name on the way
-    to *path* is not in that listing. Anything else prints nothing: an
-    ancestor it cannot list, one on the way that is not a directory, a
-    listing that failed, or a directory on the way whose name is listed
-    but that cannot be looked up.
+    when there is none. The nearest ancestor that can be looked up must be
+    a directory the probe can search, and then either it can read it and
+    the next name on the way to *path* is not in its listing, or it cannot
+    and looking that name up fails with ENOENT (:func:`_enoent_probe`).
+    Anything else prints nothing: one on the way that is not a directory,
+    a listing that failed, a lookup that failed otherwise, or a directory
+    on the way whose name is listed but that cannot be looked up.
 
-    A lookup that fails does not tell "no such file" from "not allowed".
-    Root is refused a user's FUSE mount that was not mounted with
-    ``allow_root``, and anyone can be refused by an LSM or a network
-    filesystem, though the name is there. So a failed lookup proves
-    nothing; only a listing that does not hold the name does. The listing
+    A lookup that fails is not, of itself, a missing file. Root is refused
+    a user's FUSE mount that was not mounted with ``allow_root``, and
+    anyone can be refused by an LSM or a network filesystem, though the
+    name is there: EACCES, where a missing name gives ENOENT. The listing
     is ``find``'s, matching the name literally (``\\``, ``*``, ``?`` and
     ``[`` escaped, in the C locale). A name it prints is listed, whatever
     else failed; a listing without it proves absence only when ``find``
-    succeeded, as it does not on a directory it cannot read, nor on an
-    entry it cannot look up (that FUSE mount).
+    succeeded, as it does not on an entry it cannot look up (that FUSE
+    mount). A directory it may search and not read is not listed (mode
+    0711, as ``/var/lib/libvirt/images`` often is), and only ENOENT proves
+    absence there.
     """
     def exists(p: str) -> str:
         return f"[ -e {shlex.quote(p)} ] || [ -L {shlex.quote(p)} ]"
@@ -226,14 +228,35 @@ def _absence_probe(path: str) -> str:
         steps.append(
             f"if {exists(parent)}; then "
             f"if [ -d {quoted} ] && [ -x {quoted} ]; then "
+            f"if [ -r {quoted} ]; then "
             f"found=$(LC_ALL=C find {shlex.quote(os.path.join(parent, '.'))} "
             f"-mindepth 1 -maxdepth 1 -name {shlex.quote(name)} -print "
             f"2>/dev/null); listing=$?; "
             f"if [ -n \"$found\" ]; then {listed}; "
             f"elif [ \"$listing\" -eq 0 ]; then echo {_ABSENT}; fi; "
+            f"else {_enoent_probe(child)}; fi; "
             f"fi; exit 0; fi")
         child = parent
     return "; ".join(steps)
+
+
+#: how ``stat`` ends what it says of a lookup that failed with ENOENT, in
+#: the C locale: strerror's text, last
+_ENOENT = ": No such file or directory"
+
+
+def _enoent_probe(path: str) -> str:
+    """
+    The part of :func:`_absence_probe` that prints :data:`_ABSENT` only
+    when looking *path* up (``stat``, which does not follow a final
+    symlink) fails with ENOENT: ``stat`` fails, and what it says ends with
+    :data:`_ENOENT`. The name comes before strerror's text, quoted, so no
+    name can end it. EACCES (a FUSE mount root is refused), ENOTDIR,
+    ENAMETOOLONG, any other failure, or none, prints nothing.
+    """
+    return (f"why=$(LC_ALL=C stat -- {shlex.quote(path)} 2>&1 >/dev/null); "
+            f"if [ $? -ne 0 ]; then case \"$why\" in "
+            f"*{shlex.quote(_ENOENT)}) echo {_ABSENT};; esac; fi")
 
 
 def _probe_answer(result) -> str:
@@ -1926,8 +1949,9 @@ class LibVirtSession(SessionConfigMixin):
         inferred from ``qemu-img``'s error text. Only a path with no
         directory entry at all is absent (:func:`_absence_probe`): its name
         is not in the listing of the nearest directory on its way the probe
-        can look up, search and read. Only an absolute, normalised path is
-        probed, so the directories checked are the ones it resolves
+        can look up and search, or, where it may not read that directory,
+        looking the name up fails with ENOENT. Only an absolute, normalised
+        path is probed, so the directories checked are the ones it resolves
         through.
 
         Asked as the user first, as before. Only when that cannot tell, and
@@ -1958,8 +1982,8 @@ class LibVirtSession(SessionConfigMixin):
         """
         Whether *path* positively does not exist where this session's
         libvirt sees it (:meth:`_source_absent`): its name is not listed in
-        the directory it would be in, asked through the runtime's wrapper
-        and without ``sudo``. Anything else is not absent, a path not
+        the directory it would be in, or not found there (ENOENT), asked
+        through the runtime's wrapper and without ``sudo``. Anything else is not absent, a path not
         absolute and normalised included. ``destroy`` retires a storage pool
         only once its target is (#277).
         """

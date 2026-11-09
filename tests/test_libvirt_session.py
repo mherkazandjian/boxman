@@ -38,6 +38,7 @@ from boxman.providers.libvirt.session import (
     _PRESENT,
     LibVirtSession,
     _command_error,
+    _enoent_probe,
     _ScanFailedError,
 )
 from conftest import domain_listing, domain_uuid
@@ -2134,40 +2135,116 @@ class TestTheProbeInARealShell:
         with patch.object(commands, "_shell_run", side_effect=run):
             yield state
 
+    @staticmethod
+    def _searched_only(directory):
+        """Make *directory* one the user may search and write, but not
+        read (0311): it is not listed, and files can still be made in it."""
+        if os.geteuid() == 0:
+            pytest.skip("root reads every directory")
+        directory.mkdir()
+        directory.chmod(0o311)
+        return directory
+
+    @pytest.mark.parametrize("where", ["listed", "searched only"])
     @pytest.mark.parametrize("through_sudo", [False, True],
                              ids=["as the user", "through sudo -n sh -c"])
-    def test_each_name_is_only_a_name(self, tmp_path, shell, through_sudo):
+    def test_each_name_is_only_a_name(self, tmp_path, shell, through_sudo,
+                                      where):
+        """In a directory it lists, and in one it may only search, where
+        only a lookup that fails with ENOENT proves absence."""
         shell.user_cannot_tell = through_sudo
+        directory = (tmp_path if where == "listed" else
+                     self._searched_only(tmp_path / "searched"))
         session = _session({"use_sudo": True})
-        for name in self.NAMES:
-            path = os.path.join(tmp_path, name)
-            assert session._probe_source(path, sudo=True) == (_ABSENT, ""), \
-                name
-            Path(path).write_bytes(b"there")
-            assert session._probe_source(path, sudo=True) == (_PRESENT, ""), \
-                name
-            os.remove(path)
-            below = os.path.join(path, "disk.qcow2")
-            assert session._probe_source(below, sudo=True)[0] == _ABSENT, \
-                name
+        try:
+            for name in self.NAMES:
+                path = os.path.join(directory, name)
+                assert session._probe_source(path, sudo=True) == (
+                    _ABSENT, ""), name
+                Path(path).write_bytes(b"there")
+                assert session._probe_source(path, sudo=True) == (
+                    _PRESENT, ""), name
+                os.remove(path)
+                below = os.path.join(path, "disk.qcow2")
+                assert session._probe_source(below, sudo=True)[0] \
+                    == _ABSENT, name
+        finally:
+            directory.chmod(0o700)
         assert not [f for f in os.listdir(tmp_path) if f.startswith("pw")]
         assert any(command.startswith("sh -c ") for command in shell.ran) \
             == through_sudo
 
-    def test_a_directory_it_cannot_read_tells_nothing(self, tmp_path, shell):
-        """Searchable, so a lookup in it fails only for a file that is not
-        there -- or one the lookup is refused (a FUSE mount): without its
-        listing, which of the two cannot be told."""
+    def test_a_name_that_reads_like_enoent_is_not_enoent(self, tmp_path,
+                                                         shell):
+        """Too long to be a name (ENAMETOOLONG), and ending as stat ends
+        ENOENT: stat puts strerror's text last, so the name cannot pass
+        for it."""
+        directory = self._searched_only(tmp_path / "searched")
+        try:
+            path = os.path.join(directory,
+                                "x" * 240 + ": No such file or directory")
+            assert _session({})._probe_source(path) == ("", "")
+        finally:
+            directory.chmod(0o700)
+
+
+class TestTheProbeTrustsWhatTheToolsSay:
+    """What ``find`` and ``stat`` say decides the probe, and only that
+    (#294 review): each is replaced on ``PATH`` by a stand-in that says
+    something else."""
+
+    @pytest.fixture
+    def tool(self, tmp_path, monkeypatch):
+        """Put a stand-in for a command on ``PATH`` that prints *stdout*
+        and *stderr* and exits *code*."""
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+        def make(name, stdout="", stderr="", code=0):
+            stand_in = bindir / name
+            stand_in.write_text(
+                f"#!/bin/sh\nprintf '%s' {shlex.quote(stdout)}\n"
+                f"printf '%s' {shlex.quote(stderr)} >&2\nexit {code}\n")
+            stand_in.chmod(0o755)
+        return make
+
+    @pytest.mark.parametrize("prints, code, answer", [
+        ("/x/./seed.iso\n", 0, _PRESENT),
+        ("/x/./seed.iso\n", 1, _PRESENT),
+        ("", 0, _ABSENT),
+        ("", 1, ""),
+    ], ids=["listed", "listed, though find failed", "not listed",
+            "find failed"])
+    def test_a_name_find_prints_is_listed(self, tmp_path, tool, prints,
+                                          code, answer):
+        tool("find", stdout=prints, code=code)
+        assert _session({})._probe_source(
+            str(tmp_path / "seed.iso")) == (answer, "")
+
+    @pytest.mark.parametrize("says, code, answer", [
+        ("stat: cannot statx 'x': No such file or directory\n", 1, _ABSENT),
+        ("stat: cannot statx 'x': Permission denied\n", 1, ""),
+        ("stat: cannot statx 'x': Not a directory\n", 1, ""),
+        ("stat: cannot statx 'x: No such file or directory': Permission "
+         "denied\n", 1, ""),
+        ("", 1, ""),
+        ("stat: cannot statx 'x': No such file or directory\n", 0, ""),
+    ], ids=["ENOENT", "EACCES, a FUSE mount refused", "ENOTDIR",
+            "a name that says ENOENT", "nothing said", "stat succeeded"])
+    def test_in_a_directory_it_only_searches_enoent_alone_is_absence(
+            self, tmp_path, tool, says, code, answer):
         if os.geteuid() == 0:
             pytest.skip("root reads every directory")
-        locked = tmp_path / "locked"
-        locked.mkdir()
-        locked.chmod(0o111)
+        tool("stat", stderr=says, code=code)
+        searched = tmp_path / "searched"
+        searched.mkdir()
+        searched.chmod(0o111)
         try:
             assert _session({})._probe_source(
-                str(locked / "seed.iso")) == ("", "")
+                str(searched / "seed.iso")) == (answer, "")
         finally:
-            locked.chmod(0o700)
+            searched.chmod(0o700)
 
 
 @pytest.mark.integration
@@ -2227,6 +2304,16 @@ class TestTheProbeOnARealFuseMount:
                 str(mount.parent / "gone.qcow2"), sudo=True) == ("", "")
         assert session._probe_source(str(mount / "disk.qcow2"),
                                      sudo=True) == (_PRESENT, "")
+
+    def test_roots_lookup_in_the_mount_is_refused_not_missing(self, mount):
+        """Where the probe may search a directory but not read it, only a
+        lookup that fails with ENOENT is absence: root's lookups in the
+        mount, of a file there or one that is not, fail with EACCES."""
+        for name in ("disk.qcow2", "gone.qcow2"):
+            probe = _enoent_probe(str(mount / name))
+            result = commands._shell_run(
+                f"sudo -n sh -c {shlex.quote(probe)}", hide=True, warn=True)
+            assert result.ok and result.stdout.strip() == "", name
 
 
 class TestCommandError:
