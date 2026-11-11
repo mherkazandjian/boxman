@@ -2123,11 +2123,26 @@ class SnapshotManager:
         :meth:`_parse_snapshot_xml` (``description`` / ``parent`` /
         ``creation_time``, when present) plus the raw ``xml`` (``None``
         when the dumpxml failed, so callers can skip those entries).
+        Empty too when ``snapshot-list`` fails: see
+        :meth:`_read_snapshot_graph` to tell the two apart.
+        """
+        return self._read_snapshot_graph(vm_name) or {}
+
+    def _read_snapshot_graph(self, vm_name: str,
+                             why: list[str] | None = None
+                             ) -> dict[str, dict] | None:
+        """
+        :meth:`_snapshot_graph`, but ``None`` when ``snapshot-list`` itself
+        fails, with its error appended to *why* when given -- so a report
+        never says a VM has no snapshots when that was not established.
         """
         list_result = self.virsh.execute(
             "snapshot-list", vm_name, "--name", warn=True)
         if not list_result.ok:
-            return {}
+            if why is not None:
+                why.append((list_result.stderr or "").strip()
+                           or "virsh snapshot-list failed")
+            return None
 
         graph: dict[str, dict] = {}
         # exact names, newline-delimited: see _strict_overlay_inventory
@@ -2275,28 +2290,51 @@ class SnapshotManager:
 
         return len(errors) == 0, errors
 
-    def list_snapshots(self, vm_name: str) -> list[dict[str, str]]:
+    def list_snapshots(self, vm_name: str, strict: bool = False
+                       ) -> list[dict[str, str]] | None:
         """
         List all snapshots for a vm.
 
         Args:
             vm_name: Name of the vm
+            strict: For a report: ``None``, with an error naming the cause,
+                when the snapshot list cannot be read (otherwise that reads
+                as an empty list); and an error naming each snapshot whose
+                description cannot be read, which is then returned as
+                ``{'name': ..., 'unreadable': True}`` rather than left out,
+                so an incomplete list is never taken for a complete one.
 
         Returns:
             list: List of snapshot info dictionaries
         """
         try:
             # fetch the available snapshots and their descriptions
-            graph = self._snapshot_graph(vm_name)
+            why: list[str] = []
+            graph = self._read_snapshot_graph(vm_name, why)
+            if graph is None:
+                if strict:
+                    self.logger.error(
+                        f"could not list the snapshots of vm {vm_name}: "
+                        f"{why[0]}")
+                    return None
+                graph = {}
+            unreadable = [name for name, info in graph.items()
+                          if info['xml'] is None]
+            if strict and unreadable:
+                self.logger.error(
+                    f"could not read snapshot(s) {', '.join(unreadable)} "
+                    f"of vm {vm_name}; left out of the list")
             return [
                 {'name': name, 'description': info.get('description', ''),
                  'disk_only': self._holds_no_memory(info)}
+                if info['xml'] is not None else
+                {'name': name, 'unreadable': True}
                 for name, info in graph.items()
-                if info['xml'] is not None
+                if strict or info['xml'] is not None
             ]
         except Exception as exc:
             self.logger.error(f"error listing snapshots for vm {vm_name}: {exc}")
-            return []
+            return None if strict else []
 
     def _get_snapshot_overlay_files(self, vm_name: str) -> dict[str, str]:
         """

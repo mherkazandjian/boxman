@@ -395,9 +395,13 @@ class SnapshotsMixin:
         # Ensure provider configs reflect runtime settings
         self._update_sessions_with_runtime()
 
+        unread = []
         for full_vm_name, cluster_name, _vm_name, _workdir in (
                 self._select_vm_targets(cli_args)):
-            self.session_for_cluster(cluster_name).snapshot_list(full_vm_name)
+            listed = self.session_for_cluster(cluster_name).snapshot_list(
+                full_vm_name)
+            if listed is None:
+                unread.append(full_vm_name)
         # docker-compose clusters (docker commit-backed, D3)
         for cname, cluster in self._select_dc_clusters(cli_args):
             snaps = self.session_for_cluster(cname).snapshot_list_cluster(cname, cluster)
@@ -411,6 +415,10 @@ class SnapshotsMixin:
                     f"{snap.get('description', '')}".rstrip())
                 for box, tag in (snap.get('boxes') or {}).items():
                     self.logger.status(f"      {box}: {tag}")
+        if unread:
+            raise SnapshotError(
+                f"could not list the snapshots of {', '.join(unread)} "
+                f"(see the errors above)")
 
     def snapshot_log(self, cli_args):
         """

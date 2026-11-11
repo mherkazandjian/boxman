@@ -82,6 +82,40 @@ def test_down_reports_an_already_down_vm(cli, monkeypatch, state, notice, args):
     _visible(out, quiet, notice, "infrastructure is down")
 
 
+@pytest.mark.parametrize("args,method,line", [
+    ((), "save_vm", "state saved"),
+    (("--suspend",), "suspend_vm", "suspended"),
+], ids=["save", "suspend"])
+def test_down_reports_each_running_vm_it_brings_down(cli, monkeypatch, args, method, line):
+    run, quiet = cli
+    monkeypatch.setattr(BoxmanManager, "_get_vm_states", lambda self: {VM: "running"})
+    monkeypatch.setattr(BoxmanManager, "_run_parallel", _run_parallel)
+    monkeypatch.setattr(LibVirtSession, method, lambda *a: True)
+    out = run("down", *args)
+    _visible(out, quiet, f"VM '{VM}' {line}", "infrastructure is down")
+
+
+def _run_parallel_collecting(self, tasks, **kwargs):
+    results, failures = {}, {}
+    for name, target, args in tasks:
+        try:
+            results[name] = target(*args)
+        except Exception as exc:  # what the real runner does
+            failures[name] = exc
+    return results, failures
+
+
+def test_down_announces_nothing_for_a_vm_it_could_not_save(cli, monkeypatch):
+    run, _quiet = cli
+    monkeypatch.setattr(BoxmanManager, "_get_vm_states", lambda self: {VM: "running"})
+    monkeypatch.setattr(BoxmanManager, "_run_parallel", _run_parallel_collecting)
+    monkeypatch.setattr(LibVirtSession, "save_vm", lambda *a: False)
+    out = run("down", expected_exit=2)
+    assert "state saved" not in out
+    assert "infrastructure is down" not in out
+    assert f"could not bring down 1 VM(s) ({VM})" in out
+
+
 @pytest.mark.parametrize("empty", [False, True], ids=["rows", "empty"])
 def test_storage_df_prints_its_report(cli, tmp_path, monkeypatch, empty):
     run, quiet = cli
@@ -102,11 +136,42 @@ def test_storage_df_prints_its_report(cli, tmp_path, monkeypatch, empty):
 @pytest.mark.parametrize("empty", [False, True], ids=["rows", "empty"])
 def test_snapshot_list_prints_vm_and_snapshots(cli, monkeypatch, empty):
     run, quiet = cli
-    monkeypatch.setattr(SnapshotManager, "list_snapshots", lambda *a: [] if empty else [
+    monkeypatch.setattr(SnapshotManager, "list_snapshots", lambda *a, **k: [] if empty else [
         {"name": "s1", "description": "before update", "disk_only": True}])
     out = run("snapshot", "list")
     _visible(out, quiet, VM,
              "(no snapshots)" if empty else "Snapshot: s1 - Description: before update (disk only)")
+
+
+def test_snapshot_list_never_reports_an_unread_list_as_empty(cli, monkeypatch):
+    run, _quiet = cli
+
+    def failed(self, vm_name, why=None):
+        why.append("error: failed to get domain")
+        return None
+
+    monkeypatch.setattr(SnapshotManager, "_read_snapshot_graph", failed)
+    out = run("snapshot", "list", expected_exit=2)
+    assert "(no snapshots)" not in out
+    assert out.count(f"could not list the snapshots of vm {VM}: "
+                     "error: failed to get domain") == 1
+    assert f"could not list the snapshots of {VM} (see the errors above)" in out
+
+
+@pytest.mark.parametrize("readable", [True, False], ids=["some-read", "none-read"])
+def test_snapshot_list_names_a_snapshot_it_could_not_read(cli, monkeypatch, readable):
+    run, quiet = cli
+    graph = {"s1": {"xml": None}}
+    if readable:
+        graph["s2"] = {"xml": "<domainsnapshot/>", "description": "kept"}
+    monkeypatch.setattr(SnapshotManager, "_read_snapshot_graph", lambda *a, **k: graph)
+    out = run("snapshot", "list", expected_exit=2)
+    assert out.count(f"could not read snapshot(s) s1 of vm {VM}; "
+                     "left out of the list") == 1
+    assert "(no snapshots)" not in out
+    assert "Snapshot: s1 " not in out
+    if readable and not quiet:
+        assert out.count("Snapshot: s2 - Description: kept") == 1
 
 
 @pytest.mark.parametrize("empty", [False, True], ids=["rows", "empty"])
