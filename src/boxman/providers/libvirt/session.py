@@ -2612,20 +2612,27 @@ class LibVirtSession(SessionConfigMixin):
             vm_name (str, optional): Name of the VM. If None, all VMs in cluster(s).
 
         Returns:
-            dict: Dictionary of snapshots per VM
+            list: The VM's snapshots, or ``None`` when they could not be
+            read (an error says why; nothing claims it has none).
         """
-        self.logger.info(f"list the snapshots for the vm: {vm_name}")
+        self.logger.status(f"list the snapshots for the vm: {vm_name}")
         snapshot_mgr = SnapshotManager(self.provider_config)
-        snapshots = snapshot_mgr.list_snapshots(vm_name)
-        for snapshot in snapshots:
+        snapshots = snapshot_mgr.list_snapshots(vm_name, strict=True)
+        if snapshots is None:
+            return None
+        if not snapshots:
+            self.logger.status("  (no snapshots)")
+        readable = [s for s in snapshots if not s.get('unreadable')]
+        for snapshot in readable:
             # restoring a snapshot that saved no memory leaves the vm shut
             # off, which is worth knowing before restoring it
             kind = " (disk only)" if snapshot.get('disk_only') else ""
-            self.logger.info(
+            self.logger.status(
                 f"  Snapshot: {snapshot['name']} - Description: "
                 f"{snapshot['description']}{kind}")
 
-        return snapshots
+        # an incomplete list is a failed one (the error names what is missing)
+        return readable if len(readable) == len(snapshots) else None
 
     def snapshot_has_memory(self, vm_name: str,
                             snapshot_name: str) -> bool | None:

@@ -413,7 +413,7 @@ class TestStorageDf:
         mgr.provider.snapshot_memory_images.return_value = (
             None if unreadable else recorded or {})
         mgr.storage_df(types.SimpleNamespace(vms="all", cluster=None))
-        lines = [str(c.args[0]) for c in mgr.logger.info.call_args_list]
+        lines = [str(c.args[0]) for c in mgr.logger.status.call_args_list]
         return next(line for line in lines if line.startswith(VM))
 
     def test_both_directories_are_counted(self, tmp_path, monkeypatch):

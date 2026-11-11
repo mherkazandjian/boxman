@@ -619,7 +619,7 @@ class FlowsMixin:
         vm_list = self._control_vm_targets(cli_args)
 
         if not vm_list and not self._compose_clusters:
-            self.logger.info("no VMs found in configuration")
+            self.logger.status("no VMs found in configuration")
             return
 
         use_suspend = getattr(cli_args, 'suspend', False)
@@ -644,7 +644,7 @@ class FlowsMixin:
                 self.logger.info(f"suspending VM '{vm_name}'...")
                 if not self.session_for_vm(vm_name).suspend_vm(vm_name):
                     raise ProvisionError(f"could not suspend vm '{vm_name}'")
-                self.logger.info(f"VM '{vm_name}' suspended")
+                self.logger.status(f"VM '{vm_name}' suspended")
 
             processes = [
                 (vm_name, _suspend, (vm_name,))
@@ -665,7 +665,7 @@ class FlowsMixin:
                 if not self.session_for_vm(vm_name).save_vm(vm_name, workdir):
                     raise ProvisionError(
                         f"could not save vm '{vm_name}' to '{workdir}'")
-                self.logger.info(f"VM '{vm_name}' state saved")
+                self.logger.status(f"VM '{vm_name}' state saved")
 
             processes = [
                 (vm_name, _save, (vm_name, workdir, states.get(vm_name)))
@@ -696,7 +696,7 @@ class FlowsMixin:
                 f"{'; '.join(problems)} — see the preceding errors for "
                 f"the cause.")
 
-        self.logger.info("infrastructure is down")
+        self.logger.status("infrastructure is down")
 
     def _already_down(self, vm_name: str, state: str | None,
                       use_suspend: bool) -> bool:
@@ -720,7 +720,7 @@ class FlowsMixin:
             what = 'suspended'
         else:
             return False
-        self.logger.info(
+        self.logger.status(
             f"VM '{vm_name}' is already {what}; leaving it as it is")
         return True
 

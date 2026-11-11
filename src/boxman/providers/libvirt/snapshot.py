@@ -2161,11 +2161,26 @@ class SnapshotManager:
         :meth:`_parse_snapshot_xml` (``description`` / ``parent`` /
         ``creation_time``, when present) plus the raw ``xml`` (``None``
         when the dumpxml failed, so callers can skip those entries).
+        Empty too when ``snapshot-list`` fails: see
+        :meth:`_read_snapshot_graph` to tell the two apart.
+        """
+        return self._read_snapshot_graph(vm_name) or {}
+
+    def _read_snapshot_graph(self, vm_name: str,
+                             why: list[str] | None = None
+                             ) -> dict[str, dict] | None:
+        """
+        :meth:`_snapshot_graph`, but ``None`` when ``snapshot-list`` itself
+        fails, with its error appended to *why* when given -- so a report
+        never says a VM has no snapshots when that was not established.
         """
         list_result = self.virsh.execute(
             "snapshot-list", vm_name, "--name", warn=True)
         if not list_result.ok:
-            return {}
+            if why is not None:
+                why.append((list_result.stderr or "").strip()
+                           or "virsh snapshot-list failed")
+            return None
 
         graph: dict[str, dict] = {}
         # exact names, newline-delimited: see _strict_overlay_inventory
@@ -2313,28 +2328,51 @@ class SnapshotManager:
 
         return len(errors) == 0, errors
 
-    def list_snapshots(self, vm_name: str) -> list[dict[str, str]]:
+    def list_snapshots(self, vm_name: str, strict: bool = False
+                       ) -> list[dict[str, str]] | None:
         """
         List all snapshots for a vm.
 
         Args:
             vm_name: Name of the vm
+            strict: For a report: ``None``, with an error naming the cause,
+                when the snapshot list cannot be read (otherwise that reads
+                as an empty list); and an error naming each snapshot whose
+                description cannot be read, which is then returned as
+                ``{'name': ..., 'unreadable': True}`` rather than left out,
+                so an incomplete list is never taken for a complete one.
 
         Returns:
             list: List of snapshot info dictionaries
         """
         try:
             # fetch the available snapshots and their descriptions
-            graph = self._snapshot_graph(vm_name)
+            why: list[str] = []
+            graph = self._read_snapshot_graph(vm_name, why)
+            if graph is None:
+                if strict:
+                    self.logger.error(
+                        f"could not list the snapshots of vm {vm_name}: "
+                        f"{why[0]}")
+                    return None
+                graph = {}
+            unreadable = [name for name, info in graph.items()
+                          if info['xml'] is None]
+            if strict and unreadable:
+                self.logger.error(
+                    f"could not read snapshot(s) {', '.join(unreadable)} "
+                    f"of vm {vm_name}; left out of the list")
             return [
                 {'name': name, 'description': info.get('description', ''),
                  'disk_only': self._holds_no_memory(info)}
+                if info['xml'] is not None else
+                {'name': name, 'unreadable': True}
                 for name, info in graph.items()
-                if info['xml'] is not None
+                if strict or info['xml'] is not None
             ]
         except Exception as exc:
             self.logger.error(f"error listing snapshots for vm {vm_name}: {exc}")
-            return []
+            return None if strict else []
 
     def _get_snapshot_overlay_files(self, vm_name: str) -> dict[str, str]:
         """
@@ -4840,7 +4878,7 @@ class SnapshotManager:
         drop_set, kept = plan
 
         if not drop_set:
-            self.logger.info(
+            self.logger.status(
                 f"no snapshot is built on '{target_name}' on vm {vm_name}; "
                 f"nothing to collapse")
             return True
@@ -4855,7 +4893,7 @@ class SnapshotManager:
         keeps = self._collapse_keeps(vm_name, kept, disks)
 
         if dry_run:
-            self.logger.info(
+            self.logger.status(
                 f"[dry-run] {vm_name}: would drop {len(drop_set)} snapshot(s) "
                 f"({drop_set}), the line from '{target_name}' to the one the "
                 f"VM runs on; would keep {kept}")
@@ -4866,7 +4904,7 @@ class SnapshotManager:
                 new_base, same, why = self._collapse_base(
                     vm_name, target_name, disk_target, source)
                 if same:
-                    self.logger.info(
+                    self.logger.status(
                         f"[dry-run]   {source} is the overlay of "
                         f"'{target_name}' itself; nothing to rebase")
                 elif new_base is None:
@@ -4880,14 +4918,14 @@ class SnapshotManager:
                         f"be told where qemu-img runs; the collapse would "
                         f"stop here")
                 else:
-                    self.logger.info(
+                    self.logger.status(
                         f"[dry-run]   would rebase {source} onto {new_base}")
                     stranded = self._stranded_overlay(
                         vm_name, target_name, disk_target, new_base)
                     if stranded:
                         moved[disk_target] = (source, stranded)
                         retiring.append(stranded)
-                        self.logger.info(
+                        self.logger.status(
                             f"[dry-run]   '{target_name}' would record "
                             f"{source} as its overlay of {disk_target}, in "
                             f"place of {stranded}")
@@ -4906,10 +4944,10 @@ class SnapshotManager:
                     told.add(overlay)
                     reason = self._collapse_keep_reason(overlay, keeps)
                     if reason:
-                        self.logger.info(
+                        self.logger.status(
                             f"[dry-run]   would keep {overlay}: {reason}")
                     else:
-                        self.logger.info(f"[dry-run]   would remove {overlay}")
+                        self.logger.status(f"[dry-run]   would remove {overlay}")
             retiring = [p for p in dict.fromkeys(retiring)
                         if p not in told and os.path.isfile(p)]
             # what is left once the target records the heads (_settle_target)
@@ -4920,7 +4958,7 @@ class SnapshotManager:
             ) if retiring else None
             for path in retiring:
                 reason = self._collapse_keep_reason(path, settled)
-                self.logger.info(
+                self.logger.status(
                     f"[dry-run]   would keep {path}: {reason}" if reason
                     else f"[dry-run]   would remove {path}, merged into the "
                          f"head")
