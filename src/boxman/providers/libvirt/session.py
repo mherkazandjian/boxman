@@ -63,6 +63,10 @@ from .virsh_parse import (
 #: has no directory entry at all
 _ABSENT = "boxman-source-absent"
 
+#: held while a session records which in-use scan failures it has named
+#: (:meth:`LibVirtSession._name_blocker`)
+_BLOCKERS_LOCK = threading.Lock()
+
 
 #: a domain's UUID, as ``virsh list --uuid`` prints it
 _UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
@@ -207,6 +211,25 @@ _JOB_RETRY_DELAY = 1.0
 _MAX_CHAIN_DEPTH = 256
 
 
+def _qemu_img_info(path: str) -> str:
+    """The ``qemu-img`` command that reads the backing chain of *path*
+    (:meth:`LibVirtSession._read_backing_chain`)."""
+    return (f"qemu-img info --backing-chain --output=json -U "
+            f"{shlex.quote(path)}")
+
+
+def _failure_text(result) -> str:
+    """What a failed command said: its last line on stderr, else its exit
+    status."""
+    lines = [line.strip() for line in (result.stderr or "").splitlines()
+             if line.strip()]
+    if lines:
+        return lines[-1]
+    code = getattr(result, "return_code", None)
+    return (f"it exited {code} without a message"
+            if isinstance(code, int) else "it failed without a message")
+
+
 def _unreadable_probe(path: str) -> str:
     """
     The shell probe behind :meth:`LibVirtSession._source_unreadable`: it
@@ -295,6 +318,17 @@ class _ChainReads:
         self._pool_targets: Any = self._UNREAD
         #: held while the pools' targets are read, the first time only
         self._pool_targets_read = threading.Lock()
+        #: source -> why its chain could not be read, the last time it was
+        #: not (:meth:`LibVirtSession._read_backing_chain`)
+        self._failures: dict[str, str] = {}
+
+    def failed(self, source: str, why: str) -> None:
+        """Record *why* the chain of *source* could not be read."""
+        self._failures[source] = why
+
+    def why(self, source: str) -> str:
+        """Why the chain of *source* could not be read, as recorded."""
+        return self._failures.get(source, "no reason was recorded")
 
     def refresh(self, pool: str, refreshed: dict[str, bool]) -> bool:
         """Refresh *pool* unless *refreshed* — one chain's refreshes — holds
@@ -1216,6 +1250,10 @@ class LibVirtSession(SessionConfigMixin):
         listing = virsh.execute("list", "--all", "--uuid", "--name",
                                 warn=True)
         if not listing.ok:
+            self._name_blocker(
+                f"could not list the domains (virsh list --all --uuid "
+                f"--name: {_failure_text(listing)}), so no teardown can tell "
+                f"which files other domains use, and each keeps them all")
             return None
         domains = _listed_domains(listing.stdout)
         if domains is None:
@@ -1239,17 +1277,21 @@ class LibVirtSession(SessionConfigMixin):
         # listing order like its files, so the first listed keeps a source
         seen: list[dict[str, str] | None] = [
             None if media is None else {} for _ in domains]
+        # why each domain's read failed, where no warning said so yet: named
+        # only for the domain that decides the scan
+        whys: list[list[str]] = [[] for _ in domains]
 
         def read(index: int) -> FilesInUse | None:
             domain, uuid = domains[index]
             return self._files_used_by(virsh, reads, domain, uuid,
-                                       domain in active, media=seen[index])
+                                       domain in active, media=seen[index],
+                                       why=whys[index])
 
         in_use = FilesInUse()
         with InOrder(read, range(len(domains)),
                       self._scan_workers()) as outcomes:
-            for (domain, _uuid), its_media, outcome in zip(
-                    domains, seen, outcomes, strict=True):
+            for (domain, _uuid), its_media, its_why, outcome in zip(
+                    domains, seen, whys, outcomes, strict=True):
                 try:
                     used = outcome.result()
                 except _DomainGoneError:
@@ -1272,9 +1314,30 @@ class LibVirtSession(SessionConfigMixin):
                         f"and each keeps them all — retry")
                     return None
                 if used is None:
+                    for why in its_why:
+                        self._name_blocker(
+                            f"could not tell which files domain {domain} "
+                            f"uses: {why}. Until that can be told, no "
+                            f"teardown can tell which files other domains "
+                            f"use, and each keeps them all")
                     return None
                 _merge_in_use(in_use, used)
         return in_use
+
+    def _name_blocker(self, message: str) -> None:
+        """
+        Warn *message*, why an in-use scan failed, once per session: a
+        command that scans several times -- a teardown per VM, say -- names
+        the same cause once, the repeats going to the debug log.
+        """
+        with _BLOCKERS_LOCK:
+            named = self.__dict__.setdefault("_blockers_named", set())
+            first = message not in named
+            named.add(message)
+        if first:
+            self.logger.warning(message)
+        else:
+            self.logger.debug(message)
 
     def _scan_workers(self) -> int:
         """How many domains a host-wide scan reads at once
@@ -1312,7 +1375,8 @@ class LibVirtSession(SessionConfigMixin):
 
     def _files_used_by(self, virsh, reads: _ChainReads, domain: str,
                        uuid: str, active: bool,
-                       media: dict[str, str] | None = None
+                       media: dict[str, str] | None = None,
+                       why: list[str] | None = None
                        ) -> FilesInUse | None:
         """
         What *domain*, whose UUID is *uuid*, uses, as
@@ -1320,8 +1384,18 @@ class LibVirtSession(SessionConfigMixin):
         scan's *reads* — and its block jobs too when it is *active*. Its
         CD-ROM and floppy sources go into *media* as well, when given.
 
+        A source whose chain cannot be read uses nothing only once it is
+        proved absent (:meth:`_proved_absent`: through ``sudo`` too, where
+        ``qemu-img`` read it so); otherwise what *domain* uses cannot be
+        told. A domain shut off is no exception: it uses its disks on its
+        next start.
+
         Returns:
-            The map, or ``None`` when it cannot be told.
+            The map, or ``None`` when it cannot be told. Then, when no
+            warning has said why, *why* (when given) gets the reason: the
+            source, the error that kept its chain from being read, and
+            that its absence was not proved either; or that its block
+            devices could not be listed.
 
         Raises:
             _DomainGoneError, _DomainRenamedError: What it uses could not be
@@ -1331,6 +1405,12 @@ class LibVirtSession(SessionConfigMixin):
         rows = self.vm_storage_devices(domain)
         if rows is None:
             self._raise_if_gone(virsh, domain, uuid)
+            if why is not None:
+                why.append(
+                    "its disks and media could not be listed (virsh "
+                    "domblklist --details, live or --inactive, or the path "
+                    "of a volume it names, could not be read, or a source "
+                    "is of a type the scan does not know)")
             return None
         sources = {row.source for row in rows
                    if row.type not in REMOTE_SOURCE_TYPES
@@ -1350,11 +1430,13 @@ class LibVirtSession(SessionConfigMixin):
             for source, outcome in zip(ordered, chains, strict=True):
                 chain = outcome.result()
                 if chain is None:
-                    if not self._source_absent(source):
+                    if not self._proved_absent(reads, source):
                         # not proved absent — which a source spelled
                         # otherwise than normalised never is — so possibly
                         # there
                         self._raise_if_gone(virsh, domain, uuid)
+                        if why is not None:
+                            why.append(self._unproved_source(reads, source))
                         return None
                     held = self._held_below(virsh, domain, uuid, source,
                                             source in volumes, live)
@@ -1386,6 +1468,24 @@ class LibVirtSession(SessionConfigMixin):
             if not self._record_in_use(used, domain, jobs):
                 return None
         return used
+
+    @staticmethod
+    def _unproved_source(reads: _ChainReads, source: str) -> str:
+        """Why what uses *source* cannot be told: its chain could not be
+        read (:meth:`_ChainReads.why`), nor its absence proved -- and what
+        would let the scan tell."""
+        unread = (f"the backing chain of its disk {source} could not be "
+                  f"read ({reads.why(source)})")
+        if reads.cmd.sudo_prefix(_qemu_img_info(source)):
+            return (f"{unread}, and that file could not be proved absent, "
+                    f"even through sudo -n -- check it as root: sudo -n "
+                    f"must run qemu-img and sh without a password, and root "
+                    f"must be able to search every directory on the way")
+        return (f"{unread}, and that file could not be proved absent as "
+                f"this user, who may not search a directory on the way or "
+                f"read the file -- use_sudo: true reads it, and probes its "
+                f"absence, through sudo; if it was deleted, the domain's "
+                f"definition is stale (undefine it, or ask its owner to)")
 
     def _raise_if_gone(self, virsh, domain: str, uuid: str) -> None:
         """
@@ -1481,27 +1581,34 @@ class LibVirtSession(SessionConfigMixin):
             OSError: The identity cannot be read, other than for naming no
                 file, and no sudo read stands in for it — sudo is not this
                 provider's for ``stat``, or the read through it failed or
-                answered something other than two numbers. Through sudo a
-                file that is not there fails too: a missing file is not told
-                from an unreadable one by ``stat``'s error text.
+                answered something other than two numbers. A missing file
+                is never told from an unreadable one by ``stat``'s error
+                text: where the read through sudo fails, *path* names no
+                file only once the absence probe, run through sudo as well,
+                proves it (:meth:`_absent_through_sudo`) — a file a
+                snapshot of another user's domain names, deleted from that
+                user's 0700 home.
         """
         try:
             st = os.stat(path)
         except FileNotFoundError:
             return None
         except PermissionError as refused:
-            return path, self._identity_through_sudo(path, refused)
+            identity = self._identity_through_sudo(path, refused)
+            return None if identity is None else (path, identity)
         try:
             name = os.path.realpath(path, strict=True)
         except OSError:
             name = path         # best effort only: the identity decides
         return name, (st.st_dev, st.st_ino)
 
-    def _identity_through_sudo(self, path: str,
-                               refused: PermissionError) -> tuple[int, int]:
+    def _identity_through_sudo(self, path: str, refused: PermissionError
+                               ) -> tuple[int, int] | None:
         """
         :meth:`_identify` for *path*, as it was named, which the boxman
-        process was *refused*: ``sudo -n stat -L``, on this host.
+        process was *refused*: ``sudo -n stat -L``, on this host; ``None``
+        when that read fails and the absence probe, through sudo too, then
+        proves *path* names no file (:meth:`_absent_through_sudo`).
 
         Raises:
             OSError: *refused* itself when sudo may not stand in, or one
@@ -1516,6 +1623,8 @@ class LibVirtSession(SessionConfigMixin):
         answer = (result.stdout or "").strip() if result.ok else ""
         identity = re.fullmatch(r"(\d+) (\d+)", answer)
         if identity is None:
+            if not result.ok and self._absent_through_sudo(cmd, path):
+                return None
             why = (f"it answered {answer!r}" if result.ok
                    else (result.stderr or "").strip() or "it failed")
             raise OSError(
@@ -1699,10 +1808,12 @@ class LibVirtSession(SessionConfigMixin):
         and nothing below it to protect — a seed ISO still attached after
         it was deleted, which boxman tolerates elsewhere — and is left out.
         Any other source whose chain cannot be read makes the whole answer
-        ``None``: an existing image that cannot be read may depend on
-        anything. One the user may not read is read through libvirt
-        (:meth:`_read_backing_chain`), after a refresh of each pool that
-        chain reads.
+        ``None`` (logged, with why, at debug level: a caller may expect
+        it): an existing image that cannot be read may depend on anything.
+        Where ``qemu-img`` read it through ``sudo``, its absence is probed
+        through sudo too (:meth:`_proved_absent`). One the user may not
+        read is read through libvirt (:meth:`_read_backing_chain`), after a
+        refresh of each pool that chain reads.
 
         Returns:
             ``{source: chain}`` for every source that is there, or ``None``
@@ -1714,8 +1825,12 @@ class LibVirtSession(SessionConfigMixin):
         for source in sources:
             images = self._read_backing_chain(reads, source)
             if images is None:
-                if self._source_absent(source):
+                if self._proved_absent(reads, source):
                     continue
+                self.logger.debug(
+                    f"could not read the backing chain of {source} "
+                    f"({reads.why(source)}), and it could not be proved "
+                    f"absent: what is built under it cannot be told")
                 return None
             chain: list[str] = []
             seen: set[str] = set()
@@ -1801,7 +1916,9 @@ class LibVirtSession(SessionConfigMixin):
         search holds the same entries for everyone, and one it cannot
         search proves nothing. Only an absolute, normalised path is
         probed, so the directories checked are the ones it resolves
-        through.
+        through. Where a read through ``sudo`` failed, the scans ask
+        :meth:`_proved_absent` instead, which repeats this probe through
+        ``sudo -n`` when this one proves nothing.
         """
         if not os.path.isabs(path) or os.path.normpath(path) != path:
             return False
@@ -1809,6 +1926,48 @@ class LibVirtSession(SessionConfigMixin):
                                    provider_config=self.provider_config)
         result = probe.execute_shell(_absence_probe(path), warn=True)
         return bool(result.ok) and (result.stdout or "").strip() == _ABSENT
+
+    @staticmethod
+    def _absent_through_sudo(probe: LibVirtCommandBase, path: str) -> bool:
+        """
+        :meth:`_source_absent`'s probe for *path*, run as root: ``sudo -n
+        sh -c``, through *probe*'s wrapper, which adds no ``sudo`` of its
+        own. Asked only where this provider read *path* through ``sudo``
+        already and that read failed (:meth:`_proved_absent`,
+        :meth:`_identity_through_sudo`): root can see that a disk of
+        another user's domain was deleted from that user's 0700 home, which
+        the user cannot tell from a file it may not read.
+        ``-n``: sudo never prompts, it fails, and a probe that fails proves
+        nothing. Only its own positive answer is absence, as for
+        :meth:`_source_absent`; a path not absolute and normalised never
+        is.
+        """
+        if not os.path.isabs(path) or os.path.normpath(path) != path:
+            return False
+        result = probe.execute_shell(
+            f"sudo -n sh -c {shlex.quote(_absence_probe(path))}", warn=True)
+        return bool(result.ok) and (result.stdout or "").strip() == _ABSENT
+
+    def _proved_absent(self, reads: _ChainReads, source: str) -> bool:
+        """
+        Whether *source*, whose chain *reads* could not read, positively
+        does not exist: :meth:`_source_absent`, and — only where
+        ``qemu-img`` read it through ``sudo``, as ``use_sudo`` (or
+        ``qemu-img`` in ``force_sudo_commands``) has it — the same probe
+        through sudo (:meth:`_absent_through_sudo`). Without that, a
+        directory the user may not search keeps proving nothing, and the
+        caller fails closed.
+        """
+        return (self._source_absent(source)
+                or self._absent_where_sudo_read(reads, source))
+
+    def _absent_where_sudo_read(self, reads: _ChainReads,
+                                source: str) -> bool:
+        """:meth:`_proved_absent`'s probe through sudo alone: False where
+        ``qemu-img`` does not read *source* through ``sudo``."""
+        if not reads.cmd.sudo_prefix(_qemu_img_info(source)):
+            return False
+        return self._absent_through_sudo(reads.probe, source)
 
     def path_absent(self, path: str) -> bool:
         """
@@ -1837,29 +1996,41 @@ class LibVirtSession(SessionConfigMixin):
         libvirt-qemu, and reads it as root (#221). A failure for any other
         reason — the file is readable, or ``qemu-img`` ran as root through
         ``sudo`` — is not second-guessed, and neither is an answer that does
-        not parse: ``None``, as before.
+        not parse: ``None``, as before. Why it is ``None`` is recorded in
+        *reads* (:meth:`_ChainReads.why`), for the warning that names it.
         """
-        qemu_img = (f"qemu-img info --backing-chain --output=json -U "
-                    f"{shlex.quote(source)}")
+        qemu_img = _qemu_img_info(source)
         result = reads.cmd.execute_shell(qemu_img, warn=True)
         if not result.ok:
-            if (not reads.cmd.sudo_prefix(qemu_img)
-                    and self._source_unreadable(reads, source)):
-                return self._libvirt_backing_chain(reads, source)
+            prefix = reads.cmd.sudo_prefix(qemu_img)
+            if not prefix and self._source_unreadable(reads, source):
+                chain = self._libvirt_backing_chain(reads, source)
+                if chain is None:
+                    reads.failed(source, (
+                        f"this user may not read it, and libvirt could not "
+                        f"describe its chain either ({_failure_text(result)})"))
+                return chain
+            reads.failed(source, f"{prefix}qemu-img info: "
+                                 f"{_failure_text(result)}")
             return None
+        unparsed = "qemu-img info gave no backing chain it could parse"
         try:
             chain = json.loads(result.stdout)
         except json.JSONDecodeError:
+            reads.failed(source, unparsed)
             return None
         if isinstance(chain, dict):
             chain = [chain]
         if not isinstance(chain, list) or not chain:
+            reads.failed(source, unparsed)
             return None
         for image in chain:
             if not isinstance(image, dict):
+                reads.failed(source, unparsed)
                 return None
             filename = image.get('filename')
             if not isinstance(filename, str) or not filename:
+                reads.failed(source, unparsed)
                 return None
         return chain
 
@@ -3119,7 +3290,8 @@ class LibVirtSession(SessionConfigMixin):
                         self.logger.warning(
                             f"the backing chain of {path}, which snapshot "
                             f"'{name}' of domain {domain} names, could not be "
-                            f"read, so what is built under it cannot be told")
+                            f"read ({reads.why(path)}), so what is built "
+                            f"under it cannot be told")
                         return None
                     paths += chain
                 if not self._record_named(
@@ -3255,12 +3427,16 @@ class LibVirtSession(SessionConfigMixin):
     def _chain_or_none(self, reads: _ChainReads,
                        path: str) -> list[str] | None:
         """The images below *path*, as :meth:`_backing_chain_files` names
-        them; none for a file confirmed absent, a ``.raw.zst`` that is not
-        there, or one that is no image; ``None`` when they cannot be
-        read."""
+        them; none for a file confirmed absent — through sudo too, where
+        ``qemu-img`` read it so (:meth:`_proved_absent`) — a ``.raw.zst``
+        that is not there, or one that is no image; ``None`` when they
+        cannot be read."""
         if path.endswith(".zst") or self._source_absent(path):
             return []
-        return self._backing_chain_files(reads, path)
+        chain = self._backing_chain_files(reads, path)
+        if chain is None and self._absent_where_sudo_read(reads, path):
+            return []
+        return chain
 
     def _record_named(self, scan: FilesInUse, who: str,
                       paths: list[str]) -> bool:
@@ -3326,7 +3502,8 @@ class LibVirtSession(SessionConfigMixin):
             if chain is None:
                 self.logger.warning(
                     f"the backing chain of {path}, which {who} holds, could "
-                    f"not be read, so which files it holds cannot be told")
+                    f"not be read ({reads.why(path)}), so which files it "
+                    f"holds cannot be told")
                 return False
             named += chain
         return self._record_named(held, who, named)
