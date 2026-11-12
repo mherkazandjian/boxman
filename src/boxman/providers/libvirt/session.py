@@ -319,16 +319,23 @@ class _ChainReads:
         #: held while the pools' targets are read, the first time only
         self._pool_targets_read = threading.Lock()
         #: source -> why its chain could not be read, the last time it was
-        #: not (:meth:`LibVirtSession._read_backing_chain`)
-        self._failures: dict[str, str] = {}
+        #: not, and whether the file was found to be there
+        #: (:meth:`LibVirtSession._read_backing_chain`)
+        self._failures: dict[str, tuple[str, bool]] = {}
 
-    def failed(self, source: str, why: str) -> None:
-        """Record *why* the chain of *source* could not be read."""
-        self._failures[source] = why
+    def failed(self, source: str, why: str, there: bool = False) -> None:
+        """Record *why* the chain of *source* could not be read, and
+        whether a probe found the file *there*."""
+        self._failures[source] = (why, there)
 
     def why(self, source: str) -> str:
         """Why the chain of *source* could not be read, as recorded."""
-        return self._failures.get(source, "no reason was recorded")
+        return self._failures.get(source, ("no reason was recorded",))[0]
+
+    def there(self, source: str) -> bool:
+        """Whether the file *source*, whose chain could not be read, was
+        found to be there."""
+        return self._failures.get(source, ("", False))[1]
 
     def refresh(self, pool: str, refreshed: dict[str, bool]) -> bool:
         """Refresh *pool* unless *refreshed* — one chain's refreshes — holds
@@ -1481,6 +1488,10 @@ class LibVirtSession(SessionConfigMixin):
                     f"even through sudo -n -- check it as root: sudo -n "
                     f"must run qemu-img and sh without a password, and root "
                     f"must be able to search every directory on the way")
+        if reads.there(source):
+            return (f"{unread}; the file is there, so only reading it can "
+                    f"tell -- use_sudo: true reads it through sudo, or make "
+                    f"it readable to this user")
         return (f"{unread}, and that file could not be proved absent as "
                 f"this user, who may not search a directory on the way or "
                 f"read the file -- use_sudo: true reads it, and probes its "
@@ -2007,8 +2018,10 @@ class LibVirtSession(SessionConfigMixin):
                 chain = self._libvirt_backing_chain(reads, source)
                 if chain is None:
                     reads.failed(source, (
-                        f"this user may not read it, and libvirt could not "
-                        f"describe its chain either ({_failure_text(result)})"))
+                        f"qemu-img info: {_failure_text(result)}; the file is "
+                        f"there and this user may not read it, and libvirt "
+                        f"could not describe its chain either: "
+                        f"{reads.why(source)}"), there=True)
                 return chain
             reads.failed(source, f"{prefix}qemu-img info: "
                                  f"{_failure_text(result)}")
@@ -2074,12 +2087,16 @@ class LibVirtSession(SessionConfigMixin):
         while path is not None:
             if (len(chain) == _MAX_CHAIN_DEPTH
                     or any(image["filename"] == path for image in chain)):
-                self.logger.debug(
-                    f"the backing chain of {source} loops or runs deeper "
-                    f"than {_MAX_CHAIN_DEPTH} layers at {path}")
+                why = (f"the backing chain of {source} loops or runs deeper "
+                       f"than {_MAX_CHAIN_DEPTH} layers at {path}")
+                self.logger.debug(why)
+                reads.failed(source, why)
                 return None
             image = self._libvirt_image(reads, path, refreshed)
             if image is None:
+                if path != source:
+                    reads.failed(source, f"its backing file {path}: "
+                                         f"{reads.why(path)}")
                 return None
             chain.append(image)
             path = image.get("full-backing-filename")
@@ -2111,16 +2128,22 @@ class LibVirtSession(SessionConfigMixin):
         if pool is None:
             self.logger.debug(
                 f"{path} is not a storage-pool volume libvirt lists")
+            reads.failed(path, "libvirt lists it in no storage pool")
             return None
         if not reads.refresh(pool, refreshed):
             self.logger.debug(f"could not refresh storage pool {pool}, "
                               f"which holds {path}")
+            reads.failed(path, f"storage pool {pool}, which holds it, could "
+                               f"not be refreshed")
             return None
         dumped = reads.virsh.execute("vol-dumpxml", path, warn=True)
         image = _volume_image(dumped.stdout or "", path) if dumped.ok else None
         if image is None:
             self.logger.debug(f"libvirt gave no description of {path}: "
                               f"{(dumped.stderr or '').strip()}")
+            reads.failed(path, "virsh vol-dumpxml gave no description of it"
+                         + (f" ({_failure_text(dumped)})" if not dumped.ok
+                            else ""))
         return image
 
     def _backing_chain_files(self, reads: _ChainReads,

@@ -73,6 +73,10 @@ def _virsh(domains: dict[str, list[str]], running=(), calls=None):
         if args[0] == "domstate":
             return _result(stdout=("running" if args[1] in running
                                    else "shut off") + "\n")
+        if args[0] == "vol-pool":
+            return _result(ok=False, stderr="error: no storage vol")
+        if args[0] == "pool-list":
+            return _result(stdout="")
         raise AssertionError(f"unexpected virsh call: {args}")
     return execute
 
@@ -96,7 +100,8 @@ class FakeShell:
     """
 
     def __init__(self, chains=None, errors=None, absent=(),
-                 absent_as_root=(), stat_as_root=None):
+                 absent_as_root=(), stat_as_root=None, unreadable=()):
+        self.unreadable = set(unreadable)
         self.chains = chains or {}
         self.errors = errors or {}
         self.absent = set(absent)
@@ -111,7 +116,9 @@ class FakeShell:
             proved = path in (self.absent_as_root if as_root else self.absent)
             return _result(stdout=_ABSENT if proved else "")
         if "boxman-source-unreadable" in command:
-            return _result(stdout="")       # nothing it can see
+            path = shlex.split(command)[3]
+            return _result(stdout="boxman-source-unreadable"
+                           if path in self.unreadable else "")
         if command.startswith("sudo -n stat "):
             path = shlex.split(command)[-1]
             ok, out, err = self.stat_as_root.get(
@@ -179,6 +186,22 @@ class TestUnreadableWithoutSudo:
         assert "Permission denied" in warning
         assert "could not be proved absent as this user" in warning
         assert "use_sudo: true" in warning
+
+    def test_a_file_that_is_there_is_not_called_deleted(self, captured_logs):
+        """A 0600 disk of another user's: the probe finds it there, and
+        libvirt, asked instead (#221), lists it in no pool. The warning
+        says so, and does not suggest the disk was deleted."""
+        shell = FakeShell(chains={OWN: OWN_CHAIN},
+                          errors={FOREIGN: "Permission denied"},
+                          unreadable={FOREIGN})
+        answer = _scan({}, {"mine01": [OWN], "foreign01": [FOREIGN]}, shell)
+        assert answer is None
+        (warning,) = _warnings(captured_logs)
+        assert "domain foreign01" in warning and FOREIGN in warning
+        assert "the file is there" in warning
+        assert "libvirt lists it in no storage pool" in warning
+        assert "use_sudo: true reads it" in warning
+        assert "deleted" not in warning and "stale" not in warning
 
     def test_nothing_runs_through_sudo(self, captured_logs):
         _, shell, _ = self._run(captured_logs)
