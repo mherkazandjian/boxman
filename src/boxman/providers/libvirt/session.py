@@ -1,5 +1,6 @@
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import time
 from multiprocessing import Lock, Process, Queue
+from multiprocessing.sharedctypes import RawArray
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -63,9 +65,69 @@ from .virsh_parse import (
 #: has no directory entry at all
 _ABSENT = "boxman-source-absent"
 
-#: held while a session records which in-use scan failures it has named
-#: (:meth:`LibVirtSession._name_blocker`)
-_BLOCKERS_LOCK = threading.Lock()
+
+
+class _NamedOnce:
+    """
+    Which in-use scan failures this command has named already
+    (:meth:`LibVirtSession._name_blocker`), by a 64-bit hash of the message.
+
+    Kept in anonymous shared memory made when this module is imported, so
+    the processes the command forks afterwards -- a teardown's per-VM
+    workers (``_run_parallel``) -- share it with it and with each other: a
+    cause is named once per command, not once per worker and again by the
+    workspace removal. Under a ``spawn`` start method a worker imports this
+    module anew and shares nothing: once per process, then. When every slot
+    is taken, or the shared memory cannot be had, a message is named again
+    rather than never.
+    """
+
+    SLOTS = 256
+
+    def __init__(self) -> None:
+        try:
+            self._hashes = RawArray('Q', self.SLOTS)
+            self._lock = Lock()
+        except OSError:
+            self._hashes = None
+            self._lock = threading.Lock()
+            self._local: set[int] = set()
+
+    @staticmethod
+    def _key(message: str) -> int:
+        digest = hashlib.blake2b(message.encode(), digest_size=8).digest()
+        return int.from_bytes(digest, "big") or 1
+
+    def first(self, message: str) -> bool:
+        """Whether *message* is named here for the first time, recording
+        it."""
+        key = self._key(message)
+        with self._lock:
+            if self._hashes is None:
+                seen = key in self._local
+                self._local.add(key)
+                return not seen
+            for slot in range(self.SLOTS):
+                held = self._hashes[slot]
+                if held == key:
+                    return False
+                if held == 0:
+                    self._hashes[slot] = key
+                    return True
+        return True
+
+    def clear(self) -> None:
+        """Forget every message (a test's fresh start)."""
+        with self._lock:
+            if self._hashes is None:
+                self._local.clear()
+            else:
+                for slot in range(self.SLOTS):
+                    self._hashes[slot] = 0
+
+
+#: the in-use scan failures this command has named (:class:`_NamedOnce`)
+_NAMED = _NamedOnce()
 
 
 #: a domain's UUID, as ``virsh list --uuid`` prints it
@@ -1333,15 +1395,12 @@ class LibVirtSession(SessionConfigMixin):
 
     def _name_blocker(self, message: str) -> None:
         """
-        Warn *message*, why an in-use scan failed, once per session: a
-        command that scans several times -- a teardown per VM, say -- names
-        the same cause once, the repeats going to the debug log.
+        Warn *message*, why an in-use scan failed, once per command: a
+        teardown scans once per VM, in a worker process each, and again for
+        the workspace, and names the same cause once (:class:`_NamedOnce`);
+        the repeats go to the debug log.
         """
-        with _BLOCKERS_LOCK:
-            named = self.__dict__.setdefault("_blockers_named", set())
-            first = message not in named
-            named.add(message)
-        if first:
+        if _NAMED.first(message):
             self.logger.warning(message)
         else:
             self.logger.debug(message)

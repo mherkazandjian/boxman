@@ -22,6 +22,7 @@ clean scan warns about nothing.
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import os
 import shlex
 import shutil
@@ -30,10 +31,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.providers.libvirt import session as session_module
 from boxman.providers.libvirt.session import _ABSENT, LibVirtSession, _ChainReads
 from conftest import domain_listing
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _nothing_named_yet():
+    """Each test starts as a fresh command: no cause named yet."""
+    session_module._NAMED.clear()
+    yield
+    session_module._NAMED.clear()
 
 HEADER = (" Type   Device   Target   Source\n"
           "------------------------------------\n")
@@ -215,9 +225,9 @@ class TestUnreadableWithoutSudo:
         assert answer is None
         assert not [c for c in calls if c[0] == "domstate"]
 
-    def test_named_once_however_often_the_session_scans(self, captured_logs):
-        """A teardown scans per VM; the cause is warned about once, the
-        repeats go to the debug log."""
+    def test_named_once_however_often_the_command_scans(self, captured_logs):
+        """A teardown scans per VM and for the workspace; the cause is
+        warned about once, the repeats go to the debug log."""
         answer, _, _ = self._run(captured_logs, times=3)
         assert answer is None
         assert len(_warnings(captured_logs)) == 1
@@ -444,3 +454,22 @@ class TestOnRealFiles:
         assert "domain stale01" in warning and hidden in warning
         assert "Permission denied" in warning
         assert "use_sudo: true" in warning
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(),
+                    reason="needs the fork start method")
+def test_a_cause_a_forked_worker_named_is_not_named_again(captured_logs):
+    """``deprovision`` and ``destroy`` tear each VM down in a forked worker
+    (``_run_parallel``), then remove the workspace in the parent, each with
+    its own scan: the cause one of them named is not warned about again."""
+    message = "could not tell which files domain foreign01 uses: test"
+    ctx = multiprocessing.get_context("fork")
+    worker = ctx.Process(target=session_module._NAMED.first, args=(message,))
+    worker.start()
+    worker.join(10)
+    assert worker.exitcode == 0
+    _session({})._name_blocker(message)
+    assert _warnings(captured_logs) == []
+    assert any(r.getMessage() == message for r in captured_logs.records)
+    _session({})._name_blocker(message + " (another cause)")
+    assert len(_warnings(captured_logs)) == 1
