@@ -713,12 +713,13 @@ class LibVirtSession(SessionConfigMixin):
             raise ConfigError(f"network {name}: {ownership_conflict}")
 
         # When moving from an external bridge to an auto-named managed
-        # nat/route network, reserve the replacement name while the old network
-        # is still visible. Otherwise removal may make an external ``virbr0``
-        # look available and the new managed network will try to claim it.
+        # nat/route/isolated network, reserve the replacement name while the
+        # old network is still visible. Otherwise removal may make an external
+        # ``virbr0`` look available and the new managed network will try to
+        # claim it.
         if (plan['action'] == 'recreate'
                 and actual.get('mode') == 'bridge'
-                and desired.get('mode') in {'nat', 'route'}
+                and desired.get('mode') in net_reconcile.MANAGED_BRIDGE_MODES
                 and network.pinned_bridge_name is None):
             replacement = Network(
                 name=name,

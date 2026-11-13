@@ -209,10 +209,12 @@ clusters:
 
     networks:
       <network_name>:
-        mode: nat | route | bridge      # exactly these three
+        mode: nat | route | bridge | isolated   # exactly these four
         bridge: { name: virbr9, stp: 'on', delay: '0' }   # name optional -> first free virbrX
                                         # under mode: bridge, name is REQUIRED and
                                         # stp/delay (and ip/mac) are rejected
+                                        # under mode: isolated, ip/dhcp/ipv6 are
+                                        # rejected (address-free, no libvirt DHCP)
         mac: '52:54:00:...'
         ip:
           address: '192.168.X.1'
@@ -443,7 +445,7 @@ If `boxman ssh` says *"GATEWAYHOST is not set in the workspace environment"*,
 
 ---
 
-## Networking — the five ways to attach a NIC
+## Networking — the six ways to attach a NIC
 
 Picking the wrong one is the single most common networking mistake. What
 separates them is **who owns the L2 domain**:
@@ -453,11 +455,12 @@ separates them is **who owns the L2 domain**:
 | `mode: nat` | `clusters.<c>.networks` | yes | yes | yes | yes |
 | `mode: route` | `clusters.<c>.networks` | yes | yes | yes | **no** (DHCP only) |
 | `mode: bridge` | `clusters.<c>.networks` | the libvirt network only | the libvirt network only | yes | depends on the bridge |
+| `mode: isolated` | `clusters.<c>.networks` | yes | yes | yes | **no host address** |
 | `shared_networks:` | top level | yes (the Linux bridge) | **no** | **no** | depends on the bridge |
 | `is_global: true` | on the adapter | no | no | no | depends |
 
-`mode:` accepts exactly `nat`, `route`, `bridge`; anything else is rejected
-with `unsupported forward mode`.
+`mode:` accepts exactly `nat`, `route`, `bridge`, `isolated`; anything else is
+rejected with `unsupported forward mode`.
 
 ### Namespacing
 
@@ -548,10 +551,37 @@ networks:
 - Use it when several hypervisors should map one stable network name onto their
   own local bridge — what live migration wants. Use `shared_networks:` instead
   when boxman should *create* the bridge here.
-- ⚠ Moving a network between `nat`/`route` and `bridge` crosses bridge
-  ownership: libvirt deletes a bridge it manages and preserves one it does not.
+- ⚠ Moving a network between `nat`/`route`/`isolated` and `bridge` crosses
+  bridge ownership: libvirt deletes a bridge it manages and preserves one it does not.
   Use different bridge names across that transition, or omit the managed side's
   `bridge.name` so boxman reserves a fresh automatic one.
+
+### `mode: isolated` — an address-free lab segment
+
+No `<forward>` and no `<ip>`: libvirt creates (and deletes) the bridge, the
+host holds no address on it, and libvirt serves no DHCP or DNS. Guests talk to
+each other and address themselves (static, or a DHCP server in a guest).
+
+```yaml
+networks:
+  test:
+    mode: isolated
+    bridge: { stp: 'off', delay: '0' }   # name optional
+```
+
+- `ip` (even an empty `ip:`), `dhcp` and `ipv6` are **rejected**, all named in
+  one error. `bridge.name` must be a valid bridge name, `bridge.delay` a
+  non-negative integer and `mac` six colon-separated hex groups. libvirt's addressed "isolated" (host-only) network and
+  `<network ipv6='yes'>` are not supported.
+- boxman installs **no firewall rules** for it. An address-free bridge is not
+  by itself containment: the host may still accept a frame aimed at one of its
+  other addresses, so a lab that relies on it must check the host.
+- The host cannot SSH in over it, and `provision`/`up` can learn a VM's address
+  only from the qemu guest agent (no lease, no host ARP entry). Without the agent
+  the IP wait times out with a warning and `ssh_config`/inventory stay partial.
+- A live network without `<forward>` reads back as `isolated`; one that also
+  holds an `<ip>`, or has `<network ipv6='yes'>`, is drift. Changing to or from
+  `isolated` is a recreate.
 
 ### `shared_networks:` — host bridges for hybrid labs
 

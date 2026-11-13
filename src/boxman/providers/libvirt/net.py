@@ -27,7 +27,26 @@ class Network:
     """
     Class to define libvirt networks by creating XML definitions and using virsh commands.
     """
-    SUPPORTED_FORWARD_MODES = frozenset({'nat', 'route', 'bridge'})
+    #: ``isolated`` is boxman's address-free lab network: no ``<forward>`` and
+    #: no ``<ip>``, so the host has no address on it and libvirt serves no
+    #: DHCP. It is not libvirt's general "isolated" network, which may carry a
+    #: host address; that variant is not supported.
+    SUPPORTED_FORWARD_MODES = frozenset({'nat', 'route', 'bridge', 'isolated'})
+
+    #: Modes whose ``ip`` block is never read: bridge mode takes its addressing
+    #: from the host bridge, isolated mode has none.
+    _NO_IP_MODES = frozenset({'bridge', 'isolated'})
+
+    #: Keys an ``isolated`` network rejects, each with the reason shown to the
+    #: user. ``ip`` covers the address, the netmask and every DHCP setting.
+    _ISOLATED_FORBIDDEN_KEYS = {
+        'ip': "an isolated network has no host address and no libvirt "
+              "DHCP; use mode nat or route for an addressed network",
+        'dhcp': "an isolated network runs no libvirt DHCP; serve DHCP from "
+                "a guest on the network if one is needed",
+        'ipv6': "guest-to-guest IPv6 (<network ipv6='yes'>) is not "
+                "supported on isolated networks yet",
+    }
 
     def __init__(self,
                 name: str,
@@ -152,15 +171,17 @@ class Network:
         # `or {}` throughout: yaml turns an empty or explicitly null block
         # (`ip:`, `dhcp: null`) into None rather than into a missing key, and a
         # bare .get() default does not cover that
-        # Every ``ip`` field is forbidden in bridge mode, so do not descend
-        # into a malformed nested value before validation can report the
-        # useful bridge-mode error.
-        ip_info = ({} if self.forward_mode == 'bridge'
-                   else info.get('ip') or {})
+        # Every ``ip`` field is forbidden in bridge and isolated mode, so do
+        # not descend into a malformed nested value before validation can
+        # report the useful mode-specific error. Neither mode gets the default
+        # address either: it would be rendered nowhere, but cached and
+        # compared as if the host held it.
+        no_ip = self.forward_mode in self._NO_IP_MODES
+        ip_info = {} if no_ip else info.get('ip') or {}
 
-        self.ip_address = (None if self.forward_mode == 'bridge' else
+        self.ip_address = (None if no_ip else
                            ip_info.get('address', '192.168.254.1'))
-        self.netmask = (None if self.forward_mode == 'bridge' else
+        self.netmask = (None if no_ip else
                         ip_info.get('netmask', '255.255.255.0'))
 
         dhcp_conf = ip_info.get('dhcp') or {}
@@ -171,7 +192,7 @@ class Network:
         # a reservation may sit inside or outside the dynamic range: dnsmasq
         # excludes reserved addresses from the pool either way. keeping them
         # outside is still the clearer convention
-        self.dhcp_hosts = ([] if self.forward_mode == 'bridge' else
+        self.dhcp_hosts = ([] if no_ip else
                            self._parse_dhcp_hosts(dhcp_conf.get('hosts') or []))
 
         #: bool: whether the network should be enabled
@@ -196,6 +217,10 @@ class Network:
                 and not isinstance(self._raw_bridge_info, dict)):
             raise ConfigError(
                 f"network {self.name}: bridge must be a mapping")
+
+        if self.forward_mode == 'isolated':
+            self._validate_isolated()
+            return
 
         if self.forward_mode != 'bridge':
             return
@@ -225,6 +250,48 @@ class Network:
                 f"network {self.name}: mode 'bridge' uses addressing and "
                 "link settings from the existing host bridge; remove: "
                 + ', '.join(forbidden))
+
+    def _validate_isolated(self) -> None:
+        """Reject settings that contradict an address-free network.
+
+        Presence is what counts, not the value: ``ip:`` with nothing under it
+        (None to yaml) still says the author expected an address, and quietly
+        dropping it would define a network that is not what they wrote.
+        Every offending key is reported at once.
+        """
+        offending = [key for key in self._ISOLATED_FORBIDDEN_KEYS
+                     if key in self.info]
+        if offending:
+            raise ConfigError(
+                f"network {self.name}: mode 'isolated' is address-free (no "
+                "<forward> and no <ip>); remove "
+                + '; '.join(f"{key} ({self._ISOLATED_FORBIDDEN_KEYS[key]})"
+                            for key in offending))
+
+        # The accepted keys are rendered as XML attributes, so each must be
+        # the plain value libvirt expects. The template escapes them as well,
+        # but a value outside these shapes is a typo at best, and a value
+        # carrying markup could add the very <forward> and <ip> this mode
+        # exists to leave out.
+        invalid = []
+        name = self.pinned_bridge_name
+        if name is not None and (not isinstance(name, str)
+                                 or not BRIDGE_NAME_RE.fullmatch(name)):
+            invalid.append(
+                f"bridge.name {name!r} (must match {BRIDGE_NAME_RE.pattern})")
+        delay = (self._raw_bridge_info or {}).get('delay', '0')
+        if (isinstance(delay, bool)
+                or not re.fullmatch(r'[0-9]+', str(delay))):
+            invalid.append(
+                f"bridge.delay {delay!r} (must be a non-negative integer)")
+        if 'mac' in self.info and not is_mac_like(self.info['mac']):
+            invalid.append(
+                f"mac {self.info['mac']!r} (must be six colon-separated "
+                "hex groups)")
+        if invalid:
+            raise ConfigError(
+                f"network {self.name}: mode 'isolated' has invalid values: "
+                + '; '.join(invalid))
 
     def validate_runtime_prerequisites(self) -> None:
         """Verify runtime-owned resources needed by this definition exist.
@@ -1219,9 +1286,10 @@ class Network:
         """Diagnose bridge-mode reuse of a libvirt-managed Linux bridge.
 
         Sharing is legal and can be intentional, so this is not a conflict.
-        It does couple lifecycles, though: destroying a nat/route owner removes
-        its Linux bridge underneath this bridge-mode network. Keep the probe
-        debug-gated because it needs one ``net-dumpxml`` per network.
+        It does couple lifecycles, though: destroying a nat, route or isolated
+        owner removes its Linux bridge underneath this bridge-mode network.
+        Keep the probe debug-gated because it needs one ``net-dumpxml`` per
+        network.
         """
         if not self.logger.isEnabledFor(logging.DEBUG):
             return
@@ -1244,7 +1312,7 @@ class Network:
             except (ET.ParseError, ValueError):
                 continue
             if (state.get('bridge_name') == self.bridge_name
-                    and state.get('mode') in {'nat', 'route'}):
+                    and state.get('mode') in net_reconcile.MANAGED_BRIDGE_MODES):
                 owners.append(f"{network_name} ({state['mode']})")
 
         if owners:

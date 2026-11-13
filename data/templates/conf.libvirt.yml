@@ -62,6 +62,17 @@ clusters:
       #     name: br-migration
       #   enable: True
       #   autostart: True
+      # lab:
+      #   # Address-free lab network: no <forward> and no <ip>. libvirt creates
+      #   # the bridge, but the host holds no address on it and libvirt serves
+      #   # no DHCP; guests configure their own addresses (static, or a DHCP
+      #   # server running in a guest). ip, dhcp and ipv6 are rejected here,
+      #   # and boxman installs no firewall rules for it.
+      #   mode: isolated
+      #   bridge:
+      #     stp: 'off'
+      #     delay: '0'
+      #   enable: True
 
     vms:
       boxman01:
