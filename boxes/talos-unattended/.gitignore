@@ -1,0 +1,6 @@
+# site inputs and anything generated from them; never commit
+inputs.env
+nodes.txt
+state/
+*.iso
+conf.rendered.yml

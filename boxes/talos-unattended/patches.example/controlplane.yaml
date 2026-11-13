@@ -1,0 +1,11 @@
+# Example patch for the control planes (TALOS_PATCH_DIR/controlplane.yaml).
+# KubeAPIServerConfig exists only in control-plane configs, so this patch
+# belongs here and not in all.yaml: on a worker it would add a document,
+# which the config check rejects.
+#
+# Extra names for the Kubernetes API serving certificate, e.g. a DNS name
+# that points at the VIP. Talos already adds the node's own addresses.
+apiVersion: v1alpha1
+kind: KubeAPIServerConfig
+certExtraSANs:
+  - kubernetes.talos-lab.example

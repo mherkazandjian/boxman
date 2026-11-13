@@ -1,0 +1,6 @@
+# Example patch for one node (TALOS_PATCH_DIR/<node>.yaml), applied after
+# worker.yaml: label maps merge, so worker-01 carries both labels.
+apiVersion: v1alpha1
+kind: KubeNodeConfig
+labels:
+  topology.kubernetes.io/zone: zone-a

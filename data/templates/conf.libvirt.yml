@@ -159,6 +159,14 @@ clusters:
 workspace:
   path: ~/workspaces/boxmandev/minimal
 
+# optional: tasks that 'boxman up' runs before and after itself (doc/hooks.md).
+# pre_up runs before up changes anything; post_up after an up that
+# succeeded, with BOXMAN_UP_RECORD naming a record of the domains and
+# networks this up created. A hook that fails stops up with an error.
+#hooks:
+#  pre_up: [ping]
+#  post_up: [site]
+
 # tasks for 'boxman run <task>'
 # commands have access to env vars from the workspace env_file
 tasks:

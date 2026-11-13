@@ -173,6 +173,11 @@ class NetworksMixin:
             if outcome == 'failed':
                 results[full_name] = 'failed'
 
+        # a hooked `up` records the networks it created (manager_parts/hooks.py)
+        created = getattr(self, '_networks_created', None)
+        if created is not None and not dry_run:
+            created.update(name for name, outcome in results.items()
+                           if outcome in ('created', 'recreated', 'partial'))
         return results
 
     def _reconcile_network_isolation(

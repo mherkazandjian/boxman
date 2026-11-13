@@ -1,0 +1,13 @@
+# Example site patch for every node (TALOS_PATCH_DIR/all.yaml). The order is
+# all.yaml, then <role>.yaml, then <node>.yaml, then the node patch that
+# gen-config.sh generates, which always wins.
+#
+# A patch may change documents the generated config already has. It may not
+# add or delete a document, or touch cluster identity and trust, install
+# inputs, CIDRs or the node's hostname, link, DHCP and VIP; see README.md.
+#
+# Boot waits for NTP sync by default with no time limit. Bound that wait in a
+# lab whose time source may be slow to answer; NTP keeps syncing afterwards.
+apiVersion: v1alpha1
+kind: TimeSyncConfig
+bootTimeout: 2m0s

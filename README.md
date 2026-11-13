@@ -23,6 +23,8 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
 - **`boxman update`**: incrementally apply config changes to a running project — add/remove VMs, adjust CPU/memory, grow and detach disks; changes that need a guest restart are deferred unless `--restart` is given
 - **Windows guests (experimental)**: an unattended Windows Server install through the ISO-boot path, reachable over WinRM and OpenSSH — findings, gaps and design in [Windows guests](doc/windows-guests.md), proof of concept in [`boxes/windows-server-2022-iso-boot`](boxes/windows-server-2022-iso-boot)
+- **`up` hooks**: `hooks: {pre_up: [...], post_up: [...]}` runs named tasks before `boxman up` changes anything and after it succeeded, handing the `post_up` tasks a record of the domains and networks that `up` created — see [`doc/hooks.md`](doc/hooks.md)
+- **Talos Linux lab (work in progress)**: three control planes, three workers (or a 1+1 smoke profile) and an Ubuntu control VM; a plain `boxman up` installs the cluster unattended through its hooks (preflight, then config delivery, a once-only etcd bootstrap and health checks), with Flux opt-in — see [`boxes/talos-unattended`](boxes/talos-unattended)
 - **Disk reclaim and storage hygiene**: `boxman storage` inspects qcow2 footprint, runs guest-side fstrim, compacts qcow2 files, and compresses snapshot memory dumps with zstd — see [Disk Reclaim and Storage](doc/storage.md)
 
 ## Quick Start
@@ -1129,6 +1131,20 @@ tasks:
 > `$GATEWAYHOST` use shell variable syntax so they are resolved at task
 > execution time (after `env_file` is sourced). Using `{{ env("VAR") }}`
 > would resolve at config-render time, before env.sh is loaded.
+
+### Hooks: tasks around `boxman up`
+
+`hooks:` names tasks that `boxman up` runs itself: `pre_up` before it
+changes anything, `post_up` after it succeeded, each list in order. A hook
+that fails stops `up` with an error. The `post_up` tasks get
+`BOXMAN_UP_RECORD`, a record of the libvirt domains and networks this `up`
+created. Without `hooks:`, `up` is unchanged. Details: [doc/hooks.md](doc/hooks.md).
+
+```yaml
+hooks:
+  pre_up: [check]
+  post_up: [configure]
+```
 
 ### Usage examples
 

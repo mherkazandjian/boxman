@@ -42,6 +42,9 @@ class FlowsMixin:
         merely kept its template's identity raises out of the clone step, and
         the degraded clone would otherwise never reach the closing summary.
         """
+        # what a hooked `up` attributes to itself: only resources that a
+        # provision of this run created (manager_parts/hooks.py)
+        self._provision_ran = True
         try:
             self._provision(cli_args)
         finally:
@@ -256,6 +259,17 @@ class FlowsMixin:
                 f"the cause.")
 
     def up(self, cli_args):
+        """
+        Bring up the infrastructure, between the project's ``hooks:``.
+
+        With no ``hooks:`` configured this is exactly :meth:`_up`. Otherwise
+        the ``pre_up`` hooks run before anything changes, and the ``post_up``
+        hooks after an ``up`` that succeeded, with a record of what it
+        created (:meth:`~boxman.manager_parts.hooks.HooksMixin.up_with_hooks`).
+        """
+        return self.up_with_hooks(cli_args, self._up)
+
+    def _up(self, cli_args):
         """
         Bring up the infrastructure.
 
