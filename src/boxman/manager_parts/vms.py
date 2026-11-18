@@ -893,7 +893,8 @@ class VMsMixin:
         try:
             outcome = remove_vm_storage(
                 inventory, self._cluster_workdirs(), paths_in_use,
-                memory_dirs=self._cluster_memory_snapshot_dirs(),
+                memory_dirs=[*self._cluster_memory_snapshot_dirs(),
+                             *self._split_workdirs()],
                 recorded_in_use=lambda: session.snapshot_files_in_use(
                     overlays_too=bool(overlay_dirs)),
                 overlay_dirs=overlay_dirs)
@@ -1010,7 +1011,8 @@ class VMsMixin:
                     f"{full_vm_name}: left {path} in place because {why} — "
                     f"{what}; remove it by hand")
 
-        for memory_dir in self._cluster_memory_snapshot_dirs():
+        for memory_dir in [*self._cluster_memory_snapshot_dirs(),
+                           *self._split_workdirs()]:
             try:
                 found = memory_image_candidates(memory_dir, full_vm_name)
             except OSError as exc:

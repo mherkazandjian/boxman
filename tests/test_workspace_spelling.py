@@ -439,3 +439,97 @@ class TestAWorkspaceSplitByAnEarlierBoxman:
 
         assert mgr.logger.warning.call_args_list == []
         assert not (ws / 'id_ed25519_boxman').exists()
+
+
+class TestTheUpgradeCopyIsCareful:
+    """Second review of the upgrade copy (#294 finding 4)."""
+
+    def test_a_symlinked_key_is_copied_through_the_link(self, tmp_path):
+        """generate_ssh_keys() used a symlinked key as it was; a new key
+        made in its place would lock the running VMs out."""
+        written, lexical, kernel = _split(tmp_path)
+        real_key = _file(tmp_path / 'keys' / 'real', b'the trusted key')
+        os.chmod(real_key, 0o600)
+        kernel.mkdir(parents=True)
+        (kernel / 'id_ed25519_boxman').symlink_to(real_key)
+        _file(lexical / 'cluster_1' / f'{VM}.qcow2')
+
+        _loaded(_config(written))
+
+        copy = lexical / 'id_ed25519_boxman'
+        assert not copy.is_symlink()
+        assert copy.read_bytes() == b'the trusted key'
+        assert (os.stat(copy).st_mode & 0o777) == 0o600
+
+    def test_a_compose_cluster_dir_not_there_yet_is_made(self, tmp_path):
+        """A compose cluster all of whose services come from compose_extra
+        left nothing in its new workdir; the workspace says it was made."""
+        written, lexical, kernel = _split(tmp_path)
+        manifest = _file(kernel / 'dc1' / 'docker-compose.yml', b'services: {}')
+        _file(lexical / 'env.sh')
+        config = {'project': 'demo', 'workspace': {'path': written},
+                  'clusters': {'dc1': {'provider': 'docker-compose',
+                                       'boxes': {'web': {'image': 'nginx'}}}}}
+
+        _loaded(config)
+
+        assert (lexical / 'dc1' / 'docker-compose.yml').read_bytes() == (
+            manifest.read_bytes())
+
+    def test_a_failed_copy_leaves_nothing_under_the_name(self, tmp_path,
+                                                         monkeypatch):
+        written, lexical, kernel = _split(tmp_path)
+        _file(kernel / 'id_ed25519_boxman', b'the trusted key')
+        _file(lexical / 'cluster_1' / f'{VM}.qcow2')
+
+        def full(_fd):
+            raise OSError(28, 'No space left on device')
+
+        monkeypatch.setattr(os, 'fsync', full)
+        mgr = _loaded(_config(written))
+
+        assert sorted(p.name for p in lexical.iterdir()) == ['cluster_1']
+        assert any(str(c.args[0]).startswith('could not copy')
+                   for c in mgr.logger.warning.call_args_list)
+
+        monkeypatch.undo()
+        _loaded(_config(written))
+
+        assert (lexical / 'id_ed25519_boxman').read_bytes() == (
+            b'the trusted key')
+        assert not list(lexical.glob('.boxman-copy.*'))
+
+
+class TestMemoryImagesOfASplitWorkspace:
+    """A boxman before the fix wrote snapshot memory images to the workdir
+    as written, where the kernel resolves it. The teardown looks there as in
+    a memory_snapshot_dir: the ones its snapshots recorded go, any other
+    named as its memory image is named."""
+
+    def test_recorded_ones_are_removed_and_others_named(self, tmp_path):
+        written, lexical, kernel = _split(tmp_path)
+        boot = _file(lexical / 'cluster_1' / f'{VM}.qcow2')
+        recorded = _file(kernel / 'cluster_1' / f'{VM}_snapshot_s1.raw')
+        unrecorded = _file(kernel / 'cluster_1' / f'{VM}_snapshot_s0.raw')
+        t = _Teardown(lexical / 'cluster_1', disks=[boot], records=[],
+                      memory_images={'s1': str(recorded)})
+        config = _config(written)
+        t.mgr.config = config
+        t.mgr.resolve_workspace_defaults()
+
+        cluster = config['clusters']['cluster_1']
+        t.mgr._destroy_vm_and_disks('cluster_1', cluster, 'web',
+                                    cluster['vms']['web'])
+
+        assert not boot.exists() and not recorded.exists()
+        assert unrecorded.exists()
+        assert (f"left {written}/cluster_1/{unrecorded.name} in place "
+                f"because none of its snapshots") in t.warnings
+        assert str(recorded) not in t.warnings
+
+    def test_a_fresh_project_has_no_such_directory(self, tmp_path):
+        written, lexical, _kernel = _split(tmp_path)
+        mgr = _loaded(_config(written))
+
+        # named, but absent: a teardown finds nothing there and says nothing
+        assert mgr._split_workdirs() == [f"{written}/cluster_1"]

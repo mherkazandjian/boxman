@@ -4,6 +4,7 @@
 
 
 
+import contextlib
 import os
 import stat
 
@@ -120,18 +121,47 @@ class WorkspaceMixin:
                         found.append(entry)
         return found
 
+    def _split_workdirs(self) -> list[str]:
+        """
+        Each VM cluster's workdir as a boxman before #294's fix spelled it,
+        where the kernel resolves that to another directory than the one
+        boxman now uses: it wrote the memory images of snapshots there
+        (``cluster_memory_snapshot_dir`` took the workdir as written), so
+        a teardown looks there for them as in a ``memory_snapshot_dir``.
+        """
+        config = self.config or {}
+        as_written = getattr(self, '_workdirs_as_written', None) or {}
+        found: list[str] = []
+        for name, cluster in (config.get('clusters') or {}).items():
+            if not isinstance(cluster, dict) or self._is_compose_cluster(name):
+                continue
+            directory = cluster.get('workdir')
+            for written in as_written.get(directory, []):
+                old_dir = os.path.expanduser(written)
+                if (os.path.realpath(old_dir) != os.path.realpath(directory)
+                        and old_dir not in found):
+                    found.append(old_dir)
+        return found
+
     def _adopt_files_left_by_split(self) -> None:
         """
         Copy each file :meth:`_split_files` names into the directory boxman
-        now uses, where it is missing there and that directory exists (a
-        project made before the fix): its running VMs trust that key pair,
-        and a compose cluster is torn down by that file. Copied, never
-        moved: the original, outside the workspace, may be in use; it stays,
-        and is named at teardown (:meth:`_name_files_left_by_split`).
+        now uses, where it is missing there, for a project made before the
+        fix -- that directory, or the workspace, exists: its running VMs
+        trust that key pair, and a compose cluster is torn down by that
+        file. A symlink there is read through, as boxman used it.
+
+        Copied, never moved: the original, outside the workspace, may be in
+        use; it stays, and is named at teardown
+        (:meth:`_name_files_left_by_split`). The copy is made under a
+        private name and published with ``link``, so a failed one is never
+        left under the file's name, and nothing already there is replaced.
         """
+        ws_path = ((self.config or {}).get('workspace') or {}).get('path')
         for directory, name, old_dir in self._split_files():
             new, old = os.path.join(directory, name), os.path.join(old_dir, name)
-            if not os.path.isdir(directory):
+            if not (os.path.isdir(directory)
+                    or (ws_path and os.path.isdir(ws_path))):
                 continue
             try:
                 os.lstat(new)
@@ -141,18 +171,26 @@ class WorkspaceMixin:
             except OSError:
                 continue
             try:
-                st = os.lstat(old)
+                st = os.stat(old)
             except OSError:
                 continue
             if not stat.S_ISREG(st.st_mode):
                 continue
+            staged = None
             try:
+                os.makedirs(os.path.dirname(new), exist_ok=True)
                 with open(old, 'rb') as src:
                     data = src.read()
-                fd = os.open(new, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                staged = os.path.join(
+                    os.path.dirname(new),
+                    f".boxman-copy.{os.getpid()}.{os.path.basename(new)}")
+                fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                              | os.O_NOFOLLOW, stat.S_IMODE(st.st_mode))
                 with os.fdopen(fd, 'wb') as dst:
                     dst.write(data)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                os.link(staged, new)
             except OSError as exc:
                 self.logger.warning(
                     f"could not copy {old} to {new} ({exc.strerror or exc}): "
@@ -160,6 +198,10 @@ class WorkspaceMixin:
                     f"the workdir as written, and boxman now uses "
                     f"{directory}; copy it there by hand")
                 continue
+            finally:
+                if staged is not None:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(staged)
             self.logger.warning(
                 f"copied {old} ({_as_opened(old)}) to {new}: an earlier "
                 f"boxman wrote it where the kernel resolves the workdir as "
