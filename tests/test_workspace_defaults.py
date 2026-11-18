@@ -28,8 +28,9 @@ class TestWorkdirResolution:
             },
         }
         _make_manager(config)
+        # in the one spelling every writer uses (#294 finding 4)
         assert config['clusters']['web']['workdir'] == os.path.join(
-            '~/workspaces/myproject', 'web'
+            os.path.expanduser('~/workspaces/myproject'), 'web'
         )
 
     def test_explicit_workdir_takes_precedence(self):
@@ -44,7 +45,8 @@ class TestWorkdirResolution:
             },
         }
         _make_manager(config)
-        assert config['clusters']['db']['workdir'] == '~/custom/db-workdir'
+        assert config['clusters']['db']['workdir'] == os.path.expanduser(
+            '~/custom/db-workdir')
 
     def test_multiple_clusters_get_own_workdir(self):
         """Each cluster gets its own subdirectory under workspace.path."""

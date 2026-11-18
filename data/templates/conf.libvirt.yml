@@ -150,6 +150,11 @@ clusters:
 #
 # if a cluster defines an explicit 'workdir', that takes precedence.
 #
+# both are read once: '~' expanded, made absolute, and '..' folded as
+# written, so 'ws/link/../vms' is 'ws/vms' even when 'ws/link' is a symlink
+# (the kernel would open '<link target>/../vms'). Every file, disk and pool
+# boxman makes, and every teardown, uses that one path.
+#
 # auto-generated in workspace.path (unless explicitly defined in workspace.files):
 #   - env.sh                  (INVENTORY, SSH_CONFIG, GATEWAYHOST, ANSIBLE_CONFIG, etc.)
 #   - inventory/01-hosts.yml  (from the VMs defined across all clusters)

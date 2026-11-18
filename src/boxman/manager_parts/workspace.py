@@ -4,15 +4,240 @@
 
 
 
+import contextlib
 import os
+import stat
 
 from boxman import log
 from boxman.utils.hostnames import ssh_alias
-from boxman.utils.io import write_files
+from boxman.utils.io import mkstemp_in, write_files
 from boxman.utils.retained_tree import identity
 
 
+def workdir_spelling(path: str) -> str:
+    """
+    The one spelling of a configured ``workspace.path`` or cluster
+    ``workdir`` that boxman writes to and records (#294 finding 4): ``~``
+    expanded, made absolute, and ``.``/``..`` folded as written, by
+    ``os.path.abspath`` -- not resolved through symlinks, as the kernel
+    would open the path.
+
+    Lexical, because every other path boxman derives from it was already
+    spelled so: the disks (``libvirt_disk_source``; virt-install's own
+    paths), the cluster files (``write_files``), the workdir pools, and the
+    tree ``destroy`` removes. Only the SSH key pair and ``ssh_config``, and
+    a docker-compose cluster's ``docker-compose.yml`` and ``snapshots.json``,
+    took the path as given, so through ``link/..`` they went to another
+    directory, where nothing tore them down. With no ``..`` after a
+    symlink the two spellings name the same directory.
+    """
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _as_opened(path: str) -> str:
+    """*path* as the kernel opens it, for a message only: its directory
+    with symlinks resolved, or as written if that cannot be told."""
+    try:
+        directory = os.path.realpath(os.path.dirname(path), strict=True)
+    except OSError:
+        return path
+    return os.path.join(directory, os.path.basename(path))
+
+
 class WorkspaceMixin:
+
+    def _settle_workdir_spellings(self, workspace: dict,
+                                  clusters: dict) -> None:
+        """
+        Respell ``workspace.path`` and each explicit cluster ``workdir`` in
+        the config as :func:`workdir_spelling` gives it, once, as the
+        config is loaded, so every writer and teardown reads the same one.
+
+        Every spelling as written that differs from its new one is kept, by
+        the new one, and so is the one a workdir derived from
+        ``workspace.path`` had: a boxman before this fix wrote some files
+        by it, where the kernel resolves it (:meth:`_split_files`).
+        """
+        as_written: dict[str, list[str]] = {}
+
+        def keep(spelled, path):
+            if path != spelled and path not in as_written.get(spelled, []):
+                as_written.setdefault(spelled, []).append(path)
+
+        def settle(path):
+            if not isinstance(path, str) or not path:
+                return path
+            spelled = workdir_spelling(path)
+            keep(spelled, path)
+            return spelled
+
+        written_ws = None
+        if isinstance(workspace, dict) and workspace.get('path'):
+            written_ws = workspace['path']
+            workspace['path'] = settle(written_ws)
+        for name, cluster in (clusters or {}).items():
+            if not isinstance(cluster, dict):
+                continue
+            if cluster.get('workdir'):
+                cluster['workdir'] = settle(cluster['workdir'])
+            elif isinstance(written_ws, str):
+                # derived from workspace.path in resolve_workspace_defaults
+                keep(os.path.join(workspace['path'], name),
+                     os.path.join(written_ws, name))
+        self._workdirs_as_written = as_written
+
+    def _split_files(self) -> list[tuple[str, str, str]]:
+        """
+        ``(directory, name, old directory)`` for each file a boxman before
+        #294's fix wrote by a workdir's spelling as written, where the
+        kernel resolves it, when that is another directory than the one
+        boxman now uses: the SSH key pair and ``ssh_config`` of the VMs'
+        clusters, and a docker-compose cluster's ``docker-compose.yml`` and
+        ``snapshots.json``. Everything else it wrote was already spelled
+        with ``..`` folded.
+        """
+        config = self.config or {}
+        as_written = getattr(self, '_workdirs_as_written', None) or {}
+        ws_path = (config.get('workspace') or {}).get('path')
+        found: list[tuple[str, str, str]] = []
+        for name, cluster in (config.get('clusters') or {}).items():
+            if not isinstance(cluster, dict):
+                continue
+            if self._is_compose_cluster(name):
+                directory = cluster.get('workdir')
+                names = ['docker-compose.yml', 'snapshots.json']
+            else:
+                directory = ws_path or cluster.get('workdir')
+                key = cluster.get('admin_key_name', 'id_ed25519_boxman')
+                names = [key, f"{key}.pub",
+                         cluster.get('ssh_config', 'ssh_config')]
+            for written in as_written.get(directory, []):
+                old_dir = os.path.expanduser(written)
+                if os.path.realpath(old_dir) == os.path.realpath(directory):
+                    continue
+                for fname in names:
+                    entry = (directory, fname, old_dir)
+                    if entry not in found:
+                        found.append(entry)
+        return found
+
+    def _split_workdirs(self) -> list[str]:
+        """
+        Each VM cluster's workdir as a boxman before #294's fix spelled it,
+        where the kernel resolves that to another directory than the one
+        boxman now uses: it wrote the memory images of snapshots there
+        (``cluster_memory_snapshot_dir`` took the workdir as written), so
+        a teardown looks there for them as in a ``memory_snapshot_dir``.
+        """
+        config = self.config or {}
+        as_written = getattr(self, '_workdirs_as_written', None) or {}
+        found: list[str] = []
+        for name, cluster in (config.get('clusters') or {}).items():
+            if not isinstance(cluster, dict) or self._is_compose_cluster(name):
+                continue
+            directory = cluster.get('workdir')
+            for written in as_written.get(directory, []):
+                old_dir = os.path.expanduser(written)
+                if (os.path.realpath(old_dir) != os.path.realpath(directory)
+                        and old_dir not in found):
+                    found.append(old_dir)
+        return found
+
+    def _adopt_files_left_by_split(self) -> None:
+        """
+        Copy each file :meth:`_split_files` names into the directory boxman
+        now uses, where it is missing there, for a project made before the
+        fix -- that directory, or the workspace, exists: its running VMs
+        trust that key pair, and a compose cluster is torn down by that
+        file. A symlink there is read through, as boxman used it.
+
+        Copied, never moved: the original, outside the workspace, may be in
+        use; it stays, and is named at teardown
+        (:meth:`_name_files_left_by_split`). The copy is made under a
+        private name and published with ``link``, so a failed one is never
+        left under the file's name, and nothing already there is replaced.
+        """
+        ws_path = ((self.config or {}).get('workspace') or {}).get('path')
+        for directory, name, old_dir in self._split_files():
+            new, old = os.path.join(directory, name), os.path.join(old_dir, name)
+            if not (os.path.isdir(directory)
+                    or (ws_path and os.path.isdir(ws_path))):
+                continue
+            try:
+                os.lstat(new)
+                continue
+            except FileNotFoundError:
+                pass
+            except OSError:
+                continue
+            try:
+                st = os.stat(old)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            staged = None
+            try:
+                os.makedirs(os.path.dirname(new), exist_ok=True)
+                with open(old, 'rb') as src:
+                    data = src.read()
+                # a name of its own, made here: only a file this call
+                # created is ever removed below
+                fd, staged = mkstemp_in(os.path.dirname(new),
+                                        prefix='.boxman-copy.')
+                with os.fdopen(fd, 'wb') as dst:
+                    os.fchmod(dst.fileno(), stat.S_IMODE(st.st_mode))
+                    dst.write(data)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                os.link(staged, new)
+            except OSError as exc:
+                self.logger.warning(
+                    f"could not copy {old} to {new} ({exc.strerror or exc}): "
+                    f"an earlier boxman wrote it where the kernel resolves "
+                    f"the workdir as written, and boxman now uses "
+                    f"{directory}; copy it there by hand")
+                continue
+            finally:
+                if staged is not None:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(staged)
+            self.logger.warning(
+                f"copied {old} ({_as_opened(old)}) to {new}: an earlier "
+                f"boxman wrote it where the kernel resolves the workdir as "
+                f"written, and boxman now uses {directory} (.. folded as "
+                f"written, #294). The original stays, and is named when the "
+                f"project is torn down")
+
+    def _name_files_left_by_split(self) -> list[str]:
+        """
+        The warnings naming each file :meth:`_split_files` names that is
+        still where an earlier boxman wrote it. They are named, not
+        removed: that directory is outside the workspace, and may be
+        another project's.
+        """
+        warnings = []
+        for directory, name, old_dir in self._split_files():
+            old = os.path.join(old_dir, name)
+            try:
+                os.lstat(old)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                warnings.append(
+                    f"could not tell whether {old} is there "
+                    f"({exc.strerror or exc}); an earlier boxman may have "
+                    f"written it there, where the kernel resolves the "
+                    f"workdir as written (boxman now uses {directory}); if "
+                    f"it is there and no other project uses it, remove it "
+                    f"by hand")
+                continue
+            warnings.append(
+                f"left {old} ({_as_opened(old)}) in place: an earlier boxman "
+                f"wrote it there, where the kernel resolves the workdir as "
+                f"written, and boxman now uses {directory} (.. folded as "
+                f"written); remove it by hand if no other project uses it")
+        return warnings
 
     def resolve_workspace_defaults(self) -> None:
         """
@@ -31,8 +256,9 @@ class WorkspaceMixin:
         """
         config = self.config
         workspace = config.get('workspace', {})
-        workspace_path = workspace.get('path', '')
         clusters = config.get('clusters', {})
+        self._settle_workdir_spellings(workspace, clusters)
+        workspace_path = workspace.get('path', '')
 
         # workspace-level files (written to workspace.path)
         ws_files = workspace.setdefault('files', {})
@@ -78,6 +304,9 @@ class WorkspaceMixin:
                         f"cluster '{cluster_name}' has no workdir and "
                         f"workspace.path is not set"
                     )
+        # a project made before #294's fix keeps its key pair and compose
+        # files, which went where the kernel resolves the spelling as written
+        self._adopt_files_left_by_split()
 
         # --- inventory generation ---
         # Project-wide host ordering, once, so a host's boxman_alias is
@@ -602,6 +831,9 @@ class WorkspaceMixin:
                     log.info(f'removed empty directory {cluster_workdir}')
                 except OSError:
                     pass
+
+        for warning in self._name_files_left_by_split():
+            self.logger.warning(warning)
 
     @staticmethod
     def _spared(fpath: str, scan) -> bool:

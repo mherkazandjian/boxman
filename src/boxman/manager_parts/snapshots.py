@@ -114,10 +114,12 @@ class SnapshotsMixin:
     def cluster_memory_snapshot_dir(self, cluster_name: str) -> str:
         """
         Where ``snapshot take`` writes the memory images of *cluster_name*'s
-        VMs: its ``memory_snapshot_dir``, else its ``workdir`` — ``~``
-        expanded, and otherwise as written: ``..`` after a symlink is the
-        parent of where the symlink points, which only the filesystem can
-        tell, so neither is folded by its spelling.
+        VMs: its ``memory_snapshot_dir`` -- ``~`` expanded, and otherwise as
+        written: ``..`` after a symlink is the parent of where the symlink
+        points, which only the filesystem can tell -- else its ``workdir``,
+        in the one spelling the config load gave it (``workdir_spelling``,
+        #294 finding 4). A boxman before that wrote them to the workdir as
+        written; a teardown looks there too (``_split_workdirs``).
 
         Only the memory images (``<vm>_snapshot_<name>.raw``, and the
         ``.raw.zst`` that compression leaves) go there. A disk snapshot is

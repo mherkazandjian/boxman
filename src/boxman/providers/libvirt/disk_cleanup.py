@@ -731,6 +731,10 @@ def _regular_file_refusal(path: str) -> str | None:
 _MEDIA = "it is a CD-ROM or other media source of the vm"
 _UNDER_MEDIA = "it backs a CD-ROM or other media source of the vm"
 _OUTSIDE = "it is outside every cluster workdir of the project"
+#: a disk of its own, under its names, in a cluster workdir that is not the
+#: directory its boot disk was looked for in
+_NOT_LISTED = ("it is not in the directory its boot disk was looked for in, "
+               "where a teardown finds the files under its names")
 _CHAINS_UNREAD = ("the backing chains of the vm's disks could not be read, "
                   "so whether a CD-ROM is built on it cannot be told")
 
@@ -928,6 +932,12 @@ class _Admission:
         """Admitted under this name, or under another name of its file."""
         return bool(self._same_file(path))
 
+    def is_refused_as(self, path: str) -> bool:
+        """Refused under this name, or under another name of its file."""
+        return (os.path.realpath(path) in self.refused
+                or not self._refused_ids.isdisjoint(
+                    self._identities.of(path)))
+
 
 def _refuse_incomplete_chains(chains: dict[str, list[str]],
                               admission: _Admission) -> None:
@@ -1026,6 +1036,10 @@ def remove_vm_storage(
        disks, by name. A VM gone from conf.yml keeps them, and so does a
        domain already undefined when inventoried (a retried teardown):
        its record, if it had one, is gone.
+
+    A disk of the VM's under its own names (``<vm>.``) that none of these
+    admits — its boot disk, where no directory listed in 1 holds it — is
+    kept, and named with the reason.
 
     Every admitted file must be a regular file, not a symlink, inside one
     of the cluster *workdirs* once symlinks are resolved (a recorded memory
@@ -1319,6 +1333,19 @@ def remove_vm_storage(
                            for layer in layers):
                     for layer in layers:
                         admission.admit(layer)
+
+    # -- 2c. a disk under its names that no rule above decided ------------
+    # its boot disk where no directory its boot disk was looked for in
+    # holds it (a workdir spelled otherwise when it was made, #294 finding
+    # 4): kept, as it always was, but never without a word. After every
+    # route that admits, so a file one of them admits is not refused here
+    for path in unique(inventory.disk_sources):
+        if (not os.path.basename(path).startswith(f"{vm}.")
+                or not _may_exist(path)
+                or admission.is_admitted_as(path)
+                or admission.is_refused_as(path)):
+            continue
+        admission.refuse(path, static_refusal(path) or _NOT_LISTED)
 
     # -- dependencies across the whole inventory ---------------------------
     # an overlay only a snapshot records is held up by its chain as a disk
