@@ -499,6 +499,22 @@ class TestTheUpgradeCopyIsCareful:
             b'the trusted key')
         assert not list(lexical.glob('.boxman-copy.*'))
 
+    def test_a_staging_file_already_there_is_left_alone(self, tmp_path):
+        """A name a killed copy left (or another process uses) is neither
+        reused nor removed: the copy stages under a name of its own."""
+        written, lexical, kernel = _split(tmp_path)
+        _file(kernel / 'id_ed25519_boxman', b'the trusted key')
+        _file(lexical / 'cluster_1' / f'{VM}.qcow2')
+        other = _file(lexical / f'.boxman-copy.{os.getpid()}.id_ed25519_boxman',
+                      b'not ours')
+
+        _loaded(_config(written))
+
+        assert other.read_bytes() == b'not ours'
+        assert (lexical / 'id_ed25519_boxman').read_bytes() == (
+            b'the trusted key')
+        assert [p.name for p in lexical.glob('.boxman-copy.*')] == [other.name]
+
 
 class TestMemoryImagesOfASplitWorkspace:
     """A boxman before the fix wrote snapshot memory images to the workdir
@@ -533,3 +549,4 @@ class TestMemoryImagesOfASplitWorkspace:
 
         # named, but absent: a teardown finds nothing there and says nothing
         assert mgr._split_workdirs() == [f"{written}/cluster_1"]
+

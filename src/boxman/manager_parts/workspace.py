@@ -10,7 +10,7 @@ import stat
 
 from boxman import log
 from boxman.utils.hostnames import ssh_alias
-from boxman.utils.io import write_files
+from boxman.utils.io import mkstemp_in, write_files
 from boxman.utils.retained_tree import identity
 
 
@@ -181,12 +181,12 @@ class WorkspaceMixin:
                 os.makedirs(os.path.dirname(new), exist_ok=True)
                 with open(old, 'rb') as src:
                     data = src.read()
-                staged = os.path.join(
-                    os.path.dirname(new),
-                    f".boxman-copy.{os.getpid()}.{os.path.basename(new)}")
-                fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                             | os.O_NOFOLLOW, stat.S_IMODE(st.st_mode))
+                # a name of its own, made here: only a file this call
+                # created is ever removed below
+                fd, staged = mkstemp_in(os.path.dirname(new),
+                                        prefix='.boxman-copy.')
                 with os.fdopen(fd, 'wb') as dst:
+                    os.fchmod(dst.fileno(), stat.S_IMODE(st.st_mode))
                     dst.write(data)
                     dst.flush()
                     os.fsync(dst.fileno())
