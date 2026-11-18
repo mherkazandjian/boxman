@@ -96,9 +96,11 @@ class TestDecidedOnceAtLoad:
         assert config['clusters']['cluster_1']['workdir'] == str(
             lexical / 'cluster_1')
         assert mgr._cluster_workdirs() == [str(lexical / 'cluster_1')]
-        # the spelling as written is kept, for naming what an earlier
-        # boxman left where the kernel resolves it
-        assert mgr._workdirs_as_written == {str(lexical): written}
+        # the spellings as written are kept, for what an earlier boxman
+        # left where the kernel resolves them
+        assert mgr._workdirs_as_written == {
+            str(lexical): [written],
+            str(lexical / 'cluster_1'): [f"{written}/cluster_1"]}
 
     def test_an_explicit_cluster_workdir_is_respelled(self, tmp_path):
         written, lexical, _kernel = _split(tmp_path)
@@ -108,13 +110,23 @@ class TestDecidedOnceAtLoad:
 
         assert config['clusters']['cluster_1']['workdir'] == str(
             lexical / 'c1')
-        assert mgr._workdirs_as_written[str(lexical / 'c1')] == (
-            f"{written}/c1")
+        assert mgr._workdirs_as_written[str(lexical / 'c1')] == [
+            f"{written}/c1"]
 
     def test_a_path_already_in_its_spelling_records_nothing(self, tmp_path):
         mgr = _loaded(_config(str(tmp_path / 'ws')))
 
         assert mgr._workdirs_as_written == {}
+
+    def test_two_spellings_of_one_directory_are_both_kept(self, tmp_path):
+        """workspace.path and a cluster workdir that settle to one path:
+        neither spelling as written hides the other's."""
+        written, lexical, _kernel = _split(tmp_path)
+        root = lexical.parent.parent
+        mgr = _loaded(_config(written, workdir=f"{root}/ws/./vms"))
+
+        assert mgr._workdirs_as_written[str(lexical)] == [
+            written, f"{root}/ws/./vms"]
 
 
 class TestEveryWriterUsesIt:
@@ -271,6 +283,22 @@ class TestABootDiskNoRuleDecided:
 
         assert outcome.removed == [str(boot)] and outcome.kept == []
 
+    def test_a_legacy_disk_under_its_names_is_still_removed(self, tmp_path):
+        """A config-declared disk whose name folds to ``<vm>.<x>``
+        (``x/../<vm>.data``) is admitted by the legacy route (3); the
+        fallback runs after it and leaves it to that route."""
+        workdir = tmp_path / 'wd'
+        disk = _file(workdir / f'{VM}.data.qcow2')
+        inventory = _inventory(
+            disk_sources=[str(disk)], boot_family=[str(disk)],
+            legacy_disks=[str(disk)],
+            identities=disk_cleanup.file_identities([str(disk)]))
+
+        outcome = disk_cleanup.remove_vm_storage(
+            inventory, [str(workdir)], lambda: {})
+
+        assert outcome.removed == [str(disk)] and outcome.kept == []
+
     def test_another_vms_disk_is_not_its_to_name(self, tmp_path):
         """Only a disk under its own names: an adopted or attached one is
         decided by the extra-disk rules."""
@@ -289,31 +317,117 @@ class TestABootDiskNoRuleDecided:
 
 
 class TestAWorkspaceSplitByAnEarlierBoxman:
-    """A workspace made before the fix has its key pair and ssh_config where
-    the kernel resolves the spelling as written. They are named at teardown,
-    not removed: that directory is outside the workspace, and may be
-    another project's."""
+    """A workspace made before the fix has its key pair and ssh_config (a
+    compose cluster: its docker-compose.yml and snapshots.json) where the
+    kernel resolves the spelling as written. Loading the config copies each
+    missing one into the directory boxman now uses, if that exists; the
+    originals stay, and are named at teardown, not removed: that directory
+    is outside the workspace, and may be another project's."""
 
-    def _destroy_files(self, tmp_path):
+    SSH = ('id_ed25519_boxman', 'id_ed25519_boxman.pub', 'ssh_config')
+
+    def _made_before_the_fix(self, tmp_path, new_dir=True):
         written, lexical, kernel = _split(tmp_path)
-        old = [_file(kernel / name, b'old') for name in
-               ('id_ed25519_boxman', 'id_ed25519_boxman.pub', 'ssh_config')]
-        new = [_file(lexical / name, b'new') for name in
-               ('id_ed25519_boxman', 'id_ed25519_boxman.pub', 'ssh_config')]
+        old = [_file(kernel / name, f'old {name}'.encode()) for name in
+               self.SSH]
+        os.chmod(old[0], 0o600)
+        if new_dir:
+            _file(lexical / 'cluster_1' / f'{VM}.qcow2')  # its disks
+        return written, lexical, kernel, old
+
+    @staticmethod
+    def _warnings(mgr):
+        return [str(c.args[0]) for c in mgr.logger.warning.call_args_list]
+
+    def test_loading_copies_the_key_pair_and_ssh_config(self, tmp_path):
+        written, lexical, kernel, old = self._made_before_the_fix(tmp_path)
+
         mgr = _loaded(_config(written))
+
+        for path in old:
+            new = lexical / path.name
+            assert new.read_bytes() == path.read_bytes()
+            assert path.exists()
+            assert (os.stat(new).st_mode & 0o777) == (
+                os.stat(path).st_mode & 0o777)
+        assert (os.stat(lexical / 'id_ed25519_boxman').st_mode & 0o777) == 0o600
+        warnings = self._warnings(mgr)
+        assert len(warnings) == 3
+        assert all(w.startswith(f"copied {written}/") for w in warnings)
+
+    def test_the_copied_key_pair_is_the_one_used(self, tmp_path):
+        """``up`` on running VMs only rewrites ssh_config: the IdentityFile
+        it names is the key the VMs trust, not a missing one."""
+        written, lexical, _kernel, old = self._made_before_the_fix(tmp_path)
+        mgr = _loaded(_config(written))
+
+        with patch('boxman.manager_parts.ssh.run') as keygen:
+            assert mgr.generate_ssh_keys()
+
+        keygen.assert_not_called()
+        assert (lexical / 'id_ed25519_boxman').read_bytes() == old[0].read_bytes()
+
+    def test_a_file_already_there_is_never_overwritten(self, tmp_path):
+        written, lexical, _kernel, _old = self._made_before_the_fix(tmp_path)
+        _file(lexical / 'id_ed25519_boxman', b'mine')
+
+        mgr = _loaded(_config(written))
+
+        assert (lexical / 'id_ed25519_boxman').read_bytes() == b'mine'
+        assert not any('id_ed25519_boxman ' in w or
+                       w.startswith(f"copied {written}/id_ed25519_boxman to")
+                       for w in self._warnings(mgr))
+
+    def test_nothing_is_copied_into_a_project_not_made_yet(self, tmp_path):
+        written, lexical, _kernel, _old = self._made_before_the_fix(
+            tmp_path, new_dir=False)
+
+        mgr = _loaded(_config(written))
+
+        assert not lexical.exists()
+        assert self._warnings(mgr) == []
+
+    def test_a_compose_clusters_files_are_copied(self, tmp_path):
+        written, lexical, kernel = _split(tmp_path)
+        old = [_file(kernel / 'dc1' / name, f'old {name}'.encode())
+               for name in ('docker-compose.yml', 'snapshots.json')]
+        (lexical / 'dc1').mkdir(parents=True)
+        config = {'project': 'demo', 'workspace': {'path': written},
+                  'clusters': {'dc1': {'provider': 'docker-compose',
+                                       'boxes': {'web': {'image': 'nginx'}}}}}
+
+        _loaded(config)
+
+        assert config['clusters']['dc1']['workdir'] == str(lexical / 'dc1')
+        for path in old:
+            # where the compose session's teardown looks for it
+            assert (lexical / 'dc1' / path.name).read_bytes() == (
+                path.read_bytes())
+
+    def test_teardown_names_the_originals_once_and_keeps_them(self, tmp_path):
+        written, lexical, _kernel, old = self._made_before_the_fix(tmp_path)
+        mgr = _loaded(_config(written))
+        mgr.logger.reset_mock()
+
         mgr.deprovision_files()
-        warnings = [str(c.args[0]) for c in mgr.logger.warning.call_args_list]
-        return written, lexical, old, new, warnings
 
-    def test_the_old_ones_are_named_once_and_kept(self, tmp_path):
-        written, lexical, old, new, warnings = self._destroy_files(tmp_path)
-
-        assert not any(path.exists() for path in new)
-        assert all(path.read_bytes() == b'old' for path in old)
+        assert not any((lexical / name).exists() for name in self.SSH)
+        assert all(path.exists() for path in old)
+        warnings = self._warnings(mgr)
         assert len(warnings) == 3
         for path, warning in zip(old, warnings, strict=True):
             assert warning.startswith(f"left {written}/{path.name} in place")
             assert str(lexical) in warning
+
+    def test_two_spellings_of_one_directory_still_name_them(self, tmp_path):
+        written, lexical, _kernel, old = self._made_before_the_fix(tmp_path)
+        root = lexical.parent.parent
+        mgr = _loaded(_config(written, workdir=f"{root}/ws/./vms"))
+        mgr.logger.reset_mock()
+
+        mgr.deprovision_files()
+
+        assert len(self._warnings(mgr)) == 3
 
     def test_nothing_is_named_when_there_is_no_split(self, tmp_path):
         ws = tmp_path / 'ws'
