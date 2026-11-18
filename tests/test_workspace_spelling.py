@@ -405,7 +405,7 @@ class TestAWorkspaceSplitByAnEarlierBoxman:
                 path.read_bytes())
 
     def test_teardown_names_the_originals_once_and_keeps_them(self, tmp_path):
-        written, lexical, _kernel, old = self._made_before_the_fix(tmp_path)
+        written, lexical, kernel, old = self._made_before_the_fix(tmp_path)
         mgr = _loaded(_config(written))
         mgr.logger.reset_mock()
 
@@ -416,7 +416,8 @@ class TestAWorkspaceSplitByAnEarlierBoxman:
         warnings = self._warnings(mgr)
         assert len(warnings) == 3
         for path, warning in zip(old, warnings, strict=True):
-            assert warning.startswith(f"left {written}/{path.name} in place")
+            assert warning.startswith(
+                f"left {written}/{path.name} ({kernel / path.name}) in place")
             assert str(lexical) in warning
 
     def test_two_spellings_of_one_directory_still_name_them(self, tmp_path):

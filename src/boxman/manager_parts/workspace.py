@@ -33,6 +33,16 @@ def workdir_spelling(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
+def _as_opened(path: str) -> str:
+    """*path* as the kernel opens it, for a message only: its directory
+    with symlinks resolved, or as written if that cannot be told."""
+    try:
+        directory = os.path.realpath(os.path.dirname(path), strict=True)
+    except OSError:
+        return path
+    return os.path.join(directory, os.path.basename(path))
+
+
 class WorkspaceMixin:
 
     def _settle_workdir_spellings(self, workspace: dict,
@@ -151,11 +161,11 @@ class WorkspaceMixin:
                     f"{directory}; copy it there by hand")
                 continue
             self.logger.warning(
-                f"copied {old} to {new}: an earlier boxman wrote it where "
-                f"the kernel resolves the workdir as written, and boxman "
-                f"now uses {directory} (.. folded as written, #294). The "
-                f"original stays, and is named when the project is torn "
-                f"down")
+                f"copied {old} ({_as_opened(old)}) to {new}: an earlier "
+                f"boxman wrote it where the kernel resolves the workdir as "
+                f"written, and boxman now uses {directory} (.. folded as "
+                f"written, #294). The original stays, and is named when the "
+                f"project is torn down")
 
     def _name_files_left_by_split(self) -> list[str]:
         """
@@ -181,10 +191,10 @@ class WorkspaceMixin:
                     f"by hand")
                 continue
             warnings.append(
-                f"left {old} in place: an earlier boxman wrote it there, "
-                f"where the kernel resolves the workdir as written, and "
-                f"boxman now uses {directory} (.. folded as written); "
-                f"remove it by hand if no other project uses it")
+                f"left {old} ({_as_opened(old)}) in place: an earlier boxman "
+                f"wrote it there, where the kernel resolves the workdir as "
+                f"written, and boxman now uses {directory} (.. folded as "
+                f"written); remove it by hand if no other project uses it")
         return warnings
 
     def resolve_workspace_defaults(self) -> None:
