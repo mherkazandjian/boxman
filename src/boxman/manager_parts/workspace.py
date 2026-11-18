@@ -12,7 +12,94 @@ from boxman.utils.io import write_files
 from boxman.utils.retained_tree import identity
 
 
+def workdir_spelling(path: str) -> str:
+    """
+    The one spelling of a configured ``workspace.path`` or cluster
+    ``workdir`` that boxman writes to and records (#294 finding 4): ``~``
+    expanded, made absolute, and ``.``/``..`` folded as written, by
+    ``os.path.abspath`` -- not resolved through symlinks, as the kernel
+    would open the path.
+
+    Lexical, because every other path boxman derives from it was already
+    spelled so: the disks (``libvirt_disk_source``; virt-install's own
+    paths), the cluster files (``write_files``), the workdir pools, and the
+    tree ``destroy`` removes. Only the SSH key pair and ``ssh_config`` took
+    the path as given, so through ``link/..`` they went to another
+    directory, where nothing tore them down. With no ``..`` after a
+    symlink the two spellings name the same directory.
+    """
+    return os.path.abspath(os.path.expanduser(path))
+
+
 class WorkspaceMixin:
+
+    def _settle_workdir_spellings(self, workspace: dict,
+                                  clusters: dict) -> None:
+        """
+        Respell ``workspace.path`` and each explicit cluster ``workdir`` in
+        the config as :func:`workdir_spelling` gives it, once, as the
+        config is loaded, so every writer and teardown reads the same one.
+
+        The spelling as written is kept, by the new one, where the two
+        differ: a boxman before this fix put the SSH key pair and
+        ``ssh_config`` where the kernel resolves it
+        (:meth:`_name_files_left_by_split`).
+        """
+        as_written: dict[str, str] = {}
+
+        def settle(path):
+            if not isinstance(path, str) or not path:
+                return path
+            spelled = workdir_spelling(path)
+            if spelled != path:
+                as_written[spelled] = path
+            return spelled
+
+        if isinstance(workspace, dict) and workspace.get('path'):
+            workspace['path'] = settle(workspace['path'])
+        for cluster in (clusters or {}).values():
+            if isinstance(cluster, dict) and cluster.get('workdir'):
+                cluster['workdir'] = settle(cluster['workdir'])
+        self._workdirs_as_written = as_written
+
+    def _name_files_left_by_split(self, base_path: str,
+                                  names: list[str]) -> list[str]:
+        """
+        The warnings naming each of *names* (the SSH key pair and
+        ``ssh_config``) that a boxman before #294's fix left where the
+        kernel resolves the spelling of *base_path* as written, when that
+        is another directory than *base_path*. They are named, not removed:
+        that directory is outside the workspace, and may be another
+        project's.
+        """
+        written = (getattr(self, '_workdirs_as_written', None)
+                   or {}).get(base_path)
+        if not written:
+            return []
+        old_dir = os.path.expanduser(written)
+        if os.path.realpath(old_dir) == os.path.realpath(base_path):
+            return []
+        warnings = []
+        for name in names:
+            old = os.path.join(old_dir, name)
+            try:
+                os.lstat(old)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                warnings.append(
+                    f"could not tell whether {old} is there "
+                    f"({exc.strerror or exc}); an earlier boxman may have "
+                    f"written it there, where the kernel resolves "
+                    f"'{written}' (boxman now uses {base_path}); if it is "
+                    f"there and no other project uses it, remove it by hand")
+                continue
+            warnings.append(
+                f"left {old} in place: an earlier boxman wrote it there, "
+                f"where the kernel resolves '{written}', and boxman now "
+                f"uses {base_path} (.. folded as written); remove it by "
+                f"hand if no other project uses it")
+        return warnings
 
     def resolve_workspace_defaults(self) -> None:
         """
@@ -31,8 +118,9 @@ class WorkspaceMixin:
         """
         config = self.config
         workspace = config.get('workspace', {})
-        workspace_path = workspace.get('path', '')
         clusters = config.get('clusters', {})
+        self._settle_workdir_spellings(workspace, clusters)
+        workspace_path = workspace.get('path', '')
 
         # workspace-level files (written to workspace.path)
         ws_files = workspace.setdefault('files', {})
@@ -572,6 +660,7 @@ class WorkspaceMixin:
                                    scan=scan)
 
         clusters = self.config['clusters']
+        left_by_split: list[str] = []
         for _cluster_name, cluster in clusters.items():
             base_path = workspace_path or cluster.get('workdir', '')
             base_path = os.path.expanduser(base_path)
@@ -593,6 +682,10 @@ class WorkspaceMixin:
             ssh_config_name = cluster.get('ssh_config', 'ssh_config')
             self._remove_files({ssh_config_name: ""}, rootdir=base_path,
                                scan=scan)
+            for warning in self._name_files_left_by_split(
+                    base_path, [*ssh_key_files, ssh_config_name]):
+                if warning not in left_by_split:
+                    left_by_split.append(warning)
 
             # Remove cluster workdir if empty
             cluster_workdir = os.path.expanduser(cluster.get('workdir', ''))
@@ -602,6 +695,9 @@ class WorkspaceMixin:
                     log.info(f'removed empty directory {cluster_workdir}')
                 except OSError:
                     pass
+
+        for warning in left_by_split:
+            self.logger.warning(warning)
 
     @staticmethod
     def _spared(fpath: str, scan) -> bool:
